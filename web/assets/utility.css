@@ -1,0 +1,311 @@
+/* Utility classes — flex/grid/spacing primitives. Global so any component
+   can compose layouts without redefining the same rules. */
+
+.row {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.between {
+  justify-content: space-between;
+}
+.center {
+  align-items: center;
+  justify-content: center;
+}
+.flex-wrap {
+  flex-wrap: wrap;
+}
+.text-center {
+  text-align: center;
+}
+/* Readable column width for body copy. */
+.measure {
+  max-width: 60ch;
+}
+/* For inline `<form>` siblings (e.g., admin row action stacks). */
+.inline-form {
+  display: inline;
+}
+/* Horizontal auto-centering — pairs with a constrained max-width
+   on the same element (.lede, .measure, etc.) to center body copy. */
+.mx-auto {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.gap-8 {
+  gap: 8px;
+}
+.gap-12 {
+  gap: 12px;
+}
+.gap-16 {
+  gap: 16px;
+}
+.gap-24 {
+  gap: 24px;
+}
+.gap-32 {
+  gap: 32px;
+}
+.gap-48 {
+  gap: 48px;
+}
+
+.mt-4 {
+  margin-top: 4px;
+}
+.mt-8 {
+  margin-top: 8px;
+}
+.mt-16 {
+  margin-top: 16px;
+}
+.mt-24 {
+  margin-top: 24px;
+}
+.mt-32 {
+  margin-top: 32px;
+}
+.mt-48 {
+  margin-top: 48px;
+}
+.mt-64 {
+  margin-top: 64px;
+}
+
+.mb-8 {
+  margin-bottom: 8px;
+}
+.mb-16 {
+  margin-bottom: 16px;
+}
+.mb-24 {
+  margin-bottom: 24px;
+}
+.mb-32 {
+  margin-bottom: 32px;
+}
+.mb-48 {
+  margin-bottom: 48px;
+}
+
+.pt-32 {
+  padding-top: 32px;
+}
+.pt-48 {
+  padding-top: 48px;
+}
+
+.ml-8 {
+  margin-left: 8px;
+}
+
+.container {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding-left: var(--pad-x);
+  padding-right: var(--pad-x);
+  width: 100%;
+}
+
+/*
+ * Bleed rule — adds a viewport-wide 1px rule to any positioned element
+ * via pseudo-elements. Replaces the repeated `position:absolute;left:50%;
+ * width:100vw;transform:translateX(-50%)` block scattered through
+ * KpiStrip, CatHero, ListRow's list-bleed-borders, SiteFooter, etc.
+ *
+ *   <section class="bleed-rule" data-bleed="bottom">  → rule at the bottom
+ *   <div class="bleed-rule" data-bleed="both">         → top + bottom
+ */
+.bleed-rule {
+  position: relative;
+}
+.bleed-rule[data-bleed="top"]::before,
+.bleed-rule[data-bleed="both"]::before,
+.bleed-rule[data-bleed="bottom"]::after,
+.bleed-rule[data-bleed="both"]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.bleed-rule[data-bleed="top"]::before,
+.bleed-rule[data-bleed="both"]::before {
+  top: 0;
+}
+.bleed-rule[data-bleed="bottom"]::after,
+.bleed-rule[data-bleed="both"]::after {
+  bottom: 0;
+}
+.section.dark .bleed-rule[data-bleed]::before,
+.section.dark .bleed-rule[data-bleed]::after {
+  background: #1f1f1f;
+}
+
+/*
+ * Label grid — two-column "label/content" row used in submit review,
+ * account form, terms, _404, etc. Default label width 200px; override
+ * per call with `style="--label-w: 240px"`. Collapses on narrow widths.
+ */
+.label-grid {
+  display: grid;
+  grid-template-columns: var(--label-w, 200px) 1fr;
+  gap: 24px;
+}
+@media (max-width: 767px) {
+  .label-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/*
+ * Stack — vertical flex column with a consistent token gap. Avoids
+ * margin-collapse drama by replacing inter-child `mt-*` with the
+ * parent's gap. Override the gap per call with `style="--stack-gap: 48px"`.
+ */
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap, 24px);
+}
+
+/* Hairline dividers */
+.hr {
+  height: 1px;
+  background: var(--rule);
+  border: 0;
+  margin: 0;
+}
+.hr-strong {
+  height: 1px;
+  background: var(--rule-strong);
+  border: 0;
+}
+
+/* Used by the search /categories View-all expander — also serviceable
+   anywhere a `<details>` with a link-styled summary is wanted. */
+.search-view-all > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--link);
+  list-style: none;
+  display: inline-block;
+}
+.search-view-all > summary::-webkit-details-marker {
+  display: none;
+}
+.search-view-all > summary:hover {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+
+/* Section primitives — section is a composable wrapper, used by routes. */
+.section {
+  padding: var(--pad-y) 0;
+}
+.section.tight {
+  padding: 56px 0;
+}
+.section.gray {
+  background: var(--paper-2);
+}
+.section.dark {
+  background: var(--ink);
+  color: var(--paper);
+}
+.section.dark .lede {
+  color: #b5b5af;
+}
+.section.dark .eyebrow {
+  color: var(--paper);
+}
+.section.dark .eyebrow.muted {
+  color: #9a9a93;
+}
+.section.dark .small {
+  color: #9a9a93;
+}
+.section.dark .h1,
+.section.dark .h2,
+.section.dark .h3,
+.section.dark .display {
+  color: var(--paper);
+}
+
+/* Card grid atom — used by home, search, category, link/adjacent. */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+}
+.cards.two {
+  grid-template-columns: repeat(2, 1fr);
+}
+.cards.fluid {
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+@media (max-width: 1023px) {
+  .cards {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 767px) {
+  .cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Bare list atom (unstyled UL with custom rows) */
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* Search-wrap (oversized search input with inline button) — used by
+   homepage hero panel, search hero, and any future "big search" placement. */
+.search-wrap {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  padding: 6px 6px 6px 22px;
+  background: var(--paper);
+  width: 100%;
+  max-width: 640px;
+}
+.search-wrap input {
+  flex: 1;
+  border: 0;
+  outline: 0;
+  font-family: inherit;
+  font-size: 14px;
+  background: transparent;
+  padding: 10px 8px;
+  color: var(--ink);
+}
+.search-wrap input::placeholder {
+  color: var(--muted-2);
+}
+.search-wrap .btn {
+  padding: 12px 20px;
+}
+.search-wrap .icon {
+  color: var(--muted);
+  margin-right: 6px;
+}

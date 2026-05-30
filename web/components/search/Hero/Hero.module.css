@@ -1,0 +1,29 @@
+.hero {
+  padding: 80px 0 48px;
+  border-bottom: 1px solid var(--rule);
+}
+.hero h1 {
+  max-width: 20ch;
+  margin: 16px 0 24px;
+}
+.count {
+  margin-top: 24px;
+  font-size: var(--t-micro);
+  color: var(--muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.count strong {
+  color: var(--ink);
+}
+.cappedHint {
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+}
+/* Override the .search-wrap atom's 640px max-width — the search hero
+   wants the input to stretch to the container. */
+.searchWide {
+  max-width: none;
+}

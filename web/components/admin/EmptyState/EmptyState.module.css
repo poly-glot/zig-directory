@@ -1,0 +1,17 @@
+.wrap {
+  text-align: center;
+  padding: 48px 16px;
+  border: 1px dashed var(--rule);
+  margin: var(--admin-gap) 0;
+}
+
+.title {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 8px 0;
+}
+
+.body {
+  color: var(--muted);
+  margin: 0 0 16px 0;
+}

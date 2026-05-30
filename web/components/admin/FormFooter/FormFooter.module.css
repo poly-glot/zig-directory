@@ -1,0 +1,14 @@
+.footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: var(--admin-gap);
+  margin-top: var(--admin-gap);
+  border-top: 1px solid var(--rule);
+}
+
+.right {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}

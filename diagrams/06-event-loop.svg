@@ -1,0 +1,60 @@
+<svg id="loop-svg" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 550px; background-color: white;" viewBox="0 0 550 480" role="graphics-document document" aria-roledescription="flowchart-v2">
+  <style>
+    #loop-svg { font-family: Arial, sans-serif; font-size: 14px; fill: #000; }
+    .box { fill: #fff; stroke: #000; stroke-width: 2px; }
+    .box-phase { fill: #eef6ff; stroke: #2060a0; stroke-width: 2px; }
+    .label { text-anchor: middle; font-size: 13px; fill: #000; font-weight: bold; }
+    .sublabel { text-anchor: middle; font-size: 11px; fill: #666; }
+    .note { text-anchor: start; font-size: 11px; fill: #555; }
+    .edge { stroke: #000; stroke-width: 2px; fill: none; }
+    .arrow { fill: #000; stroke: #000; stroke-width: 1px; }
+  </style>
+  <defs>
+    <marker id="loop-arrowEnd" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="275" y="25" text-anchor="middle" font-size="16" font-weight="bold" fill="#000">Redis-Style Two-Pass Event Loop</text>
+
+  <!-- epoll_wait -->
+  <rect x="150" y="45" width="250" height="45" rx="4" class="box"/>
+  <text x="275" y="72" class="label">epoll_wait(1000ms)</text>
+
+  <line x1="275" y1="90" x2="275" y2="115" class="edge" marker-end="url(#loop-arrowEnd)"/>
+
+  <!-- Pass 1 label -->
+  <rect x="75" y="120" width="400" height="160" rx="6" class="box-phase"/>
+  <text x="275" y="142" class="label">Pass 1: Read + Parse + Execute</text>
+
+  <!-- accept -->
+  <rect x="95" y="155" width="160" height="35" rx="3" class="box"/>
+  <text x="175" y="177" class="sublabel">accept new connections</text>
+
+  <!-- read + processFrames -->
+  <rect x="95" y="200" width="360" height="35" rx="3" class="box"/>
+  <text x="275" y="222" class="sublabel">read(fd) + processFrames() for each readable fd</text>
+
+  <!-- queue writes -->
+  <rect x="95" y="245" width="360" height="25" rx="3" class="box"/>
+  <text x="275" y="262" class="sublabel">queue fds with pending responses (no write yet)</text>
+
+  <line x1="275" y1="280" x2="275" y2="305" class="edge" marker-end="url(#loop-arrowEnd)"/>
+
+  <!-- Pass 2 label -->
+  <rect x="75" y="310" width="400" height="65" rx="6" class="box-phase"/>
+  <text x="275" y="332" class="label">Pass 2: Flush All Responses</text>
+  <rect x="95" y="345" width="360" height="22" rx="3" class="box"/>
+  <text x="275" y="361" class="sublabel">write() all pending responses, transition back to reading</text>
+
+  <line x1="275" y1="375" x2="275" y2="400" class="edge" marker-end="url(#loop-arrowEnd)"/>
+
+  <!-- Sweep -->
+  <rect x="150" y="405" width="250" height="35" rx="4" class="box"/>
+  <text x="275" y="427" class="sublabel">sweep idle connections</text>
+
+  <!-- Loop back -->
+  <path d="M 275 440 L 275 460 L 510 460 L 510 67 L 400 67" class="edge" marker-end="url(#loop-arrowEnd)"/>
+  <text x="520" y="270" class="note" transform="rotate(90, 520, 270)">loop</text>
+</svg>

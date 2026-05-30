@@ -1,0 +1,22 @@
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 24px;
+  align-items: baseline;
+}
+.label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.chip {
+  font-size: 13px;
+  color: var(--link);
+  text-decoration: none;
+}
+.chip:hover {
+  color: var(--link-hover);
+  text-decoration: underline;
+}

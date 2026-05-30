@@ -1,0 +1,11 @@
+%% Connection State Machine - Mermaid source
+%% Render: https://mermaid.live or `mmdc -i 04-connection-state-machine.mmd -o 04-connection-state-machine.svg`
+
+stateDiagram-v2
+    [*] --> empty
+    empty --> reading_request : accept
+    reading_request --> writing_response : frames parsed + executed
+    writing_response --> reading_request : persistent (keep buffer)
+    writing_response --> closing : error / disconnect
+    reading_request --> closing : error / timeout
+    closing --> empty : fd closed, slot reset

@@ -1,0 +1,10 @@
+.row {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 32px;
+  padding: 16px 0;
+  border-top: 1px solid var(--rule);
+}
+.value {
+  word-break: break-word;
+}

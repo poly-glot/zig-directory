@@ -1,0 +1,177 @@
+.header {
+  border-bottom: 1px solid var(--rule);
+  background: var(--paper);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+.invert {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: #222;
+}
+.wrap {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 32px;
+  align-items: center;
+  height: 72px;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding-left: var(--pad-x);
+  padding-right: var(--pad-x);
+  width: 100%;
+}
+
+.brand {
+  font-weight: 900;
+  font-size: 14px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  color: inherit;
+}
+.dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--ink);
+  border-radius: 50%;
+  margin-right: 10px;
+  vertical-align: middle;
+}
+.invert .dot {
+  background: var(--paper);
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  padding: 0 16px;
+  height: 40px;
+  max-width: 560px;
+  width: 100%;
+  justify-self: center;
+  background: var(--paper);
+  transition: border-color 0.15s ease;
+}
+.search:focus-within {
+  border-color: var(--ink);
+}
+.searchIcon {
+  color: var(--muted);
+  display: inline-flex;
+}
+.searchInput {
+  flex: 1;
+  border: 0;
+  outline: 0;
+  font-family: inherit;
+  font-size: 13px;
+  background: transparent;
+  color: var(--ink);
+  padding: 0;
+}
+.searchInput::placeholder {
+  color: var(--muted-2);
+}
+.kbd {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+  color: var(--muted);
+  border: 1px solid var(--rule-strong);
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--paper-2);
+}
+
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+.navLink {
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+  text-decoration: none;
+}
+.navLink.active {
+  border-bottom: 1px solid currentColor;
+  padding-bottom: 2px;
+}
+.navLink:hover {
+  color: var(--muted);
+}
+
+.skipLink {
+  position: absolute;
+  top: -40px;
+  left: 0;
+  background: var(--ink);
+  color: var(--paper);
+  padding: 8px 16px;
+  z-index: 100;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.skipLink:focus {
+  top: 0;
+}
+
+.submitBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  padding: 10px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+  text-decoration: none;
+  transition: background 0.18s ease;
+}
+.submitBtn:hover {
+  background: var(--hover);
+}
+.arrow {
+  display: inline-block;
+  transition: transform 0.18s ease;
+}
+.submitBtn:hover .arrow {
+  transform: translateX(3px);
+}
+
+@media (max-width: 767px) {
+  .wrap {
+    grid-template-columns: auto auto;
+    height: 56px;
+    gap: 16px;
+  }
+  .search {
+    display: none;
+  }
+  .nav {
+    gap: 16px;
+  }
+  .navLink {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+  }
+}

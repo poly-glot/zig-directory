@@ -1,0 +1,38 @@
+.host {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+}
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+}
+.count {
+  font-weight: 600;
+}
+.spacer {
+  flex: 1;
+}
+.btn {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  padding: 4px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn:hover {
+  background: var(--rule);
+}
+.danger {
+  color: #b00020;
+  border-color: #b00020;
+}
+.divider {
+  width: 1px;
+  height: 18px;
+  background: var(--rule);
+}

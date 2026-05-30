@@ -1,0 +1,20 @@
+%% Redis-Style Two-Pass Event Loop - Mermaid source
+%% Render: https://mermaid.live or `mmdc -i 06-event-loop.mmd -o 06-event-loop.svg`
+
+graph TD
+    A["epoll_wait(1000ms)"] --> B
+
+    subgraph "Pass 1: Read + Parse + Execute"
+        B["Accept new connections"]
+        B --> C["For each readable fd:<br/>read() + processFrames()"]
+        C --> D["Queue fds with pending responses"]
+    end
+
+    D --> E
+
+    subgraph "Pass 2: Flush All Responses"
+        E["write() all pending responses<br/>transition back to reading_request"]
+    end
+
+    E --> F["Sweep idle connections"]
+    F --> A

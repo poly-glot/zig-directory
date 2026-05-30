@@ -1,0 +1,118 @@
+/* Shared styles for LinkRow and CategoryRow — both render <li class="list-row">.
+   Kept as one module imported by both components since the list layout is
+   tightly coupled to the row's grid template. */
+
+.row {
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  gap: 32px;
+  align-items: start;
+  padding: var(--row-pad) 0;
+  border-top: 1px solid var(--rule);
+  list-style: none;
+}
+.row:last-child {
+  border-bottom: 1px solid var(--rule);
+}
+
+/*
+ * When the parent <ul> carries the `list-bleed-borders` class, the row's
+ * top/bottom rules visually extend to the viewport edges while the row's
+ * grid content stays inside the container. The row remains in the
+ * container's normal flow; only the rule lines reach further out.
+ */
+:global(.list-bleed-borders) .row {
+  position: relative;
+  border-top: 0;
+}
+:global(.list-bleed-borders) .row:last-child {
+  border-bottom: 0;
+}
+:global(.list-bleed-borders) .row::before,
+:global(.list-bleed-borders) .row:last-child::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+:global(.list-bleed-borders) .row::before {
+  top: 0;
+}
+:global(.list-bleed-borders) .row:last-child::after {
+  bottom: 0;
+}
+.row:hover {
+  background: rgba(0, 0, 0, 0.015);
+}
+.num {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--muted);
+  padding-top: 4px;
+}
+.title {
+  font-weight: 900;
+  text-transform: uppercase;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+  display: block;
+  color: var(--ink);
+}
+.row a {
+  text-decoration: none;
+  color: inherit;
+}
+.row a:hover .title {
+  color: var(--muted);
+}
+.meta {
+  color: var(--muted);
+  font-size: 13px;
+}
+.right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+.count {
+  color: var(--muted);
+}
+.browseLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-decoration: none;
+}
+.browseLink svg {
+  /* Lock the arrow to the text x-height so it doesn't drift to a
+     separate baseline under text-transform: uppercase. */
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* Within dark sections, recolor */
+:global(.section.dark) .row {
+  border-color: #1f1f1f;
+}
+
+@media (max-width: 767px) {
+  .row {
+    grid-template-columns: 32px 1fr;
+  }
+  .right {
+    grid-column: 1 / -1;
+    text-align: left;
+    padding-left: 32px;
+  }
+}

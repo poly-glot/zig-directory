@@ -1,0 +1,32 @@
+.wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 0 0;
+  /* No bottom border / heavy margin: the filter chips sit directly beneath,
+     so the toolbar → chips → table read as one connected block instead of
+     leaving a lone hairline + dead gap. */
+  margin-bottom: 0;
+}
+.input {
+  flex: 1 1 auto;
+  font-size: 14px;
+  /* Match the pill shape + height of the adjacent "+ New link" button (a
+     999px-radius .btn, ~44px tall) so the toolbar reads as two aligned
+     siblings rather than a square field jammed against a taller pill. */
+  padding: 13px 20px;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper);
+}
+.input:focus {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+  border-color: var(--ink);
+}
+.right {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}

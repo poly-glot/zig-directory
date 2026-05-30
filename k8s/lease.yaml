@@ -1,0 +1,11 @@
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: dmozdb-leader
+  namespace: dmozdb
+spec:
+  holderIdentity: ""
+  leaseDurationSeconds: 15
+  acquireTime: null
+  renewTime: null
+  leaseTransitions: 0

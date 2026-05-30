@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(spec-miner)",
+      "Bash(wc:*)",
+      "Bash(zig build:*)",
+      "Bash(zig version:*)",
+      "Bash(git reset *)",
+      "Bash(GIT_AUTHOR_NAME=\"Junaid Ahmed\" GIT_AUTHOR_EMAIL=\"me@junaid.guru\" GIT_COMMITTER_NAME=\"Junaid Ahmed\" GIT_COMMITTER_EMAIL=\"me@junaid.guru\" git commit *)",
+      "Bash(docker exec *)",
+      "Bash(curl -sS -o /dev/null -w \"HTTP %{http_code} in %{time_total}s\\\\n\" --max-time 5 http://localhost:8080/)",
+      "Bash(python3 *)",
+      "Read(//usr/local/bin/**)",
+      "Bash(mkdir -p /tmp/dmozdb-slice5b)",
+      "Bash(rm -rf /tmp/dmozdb-slice5b/*)",
+      "Bash(/workspaces/zig-directory/zig-out/bin/dmozdb --data-dir /tmp/dmozdb-slice5b --port 18080)",
+      "Bash(echo \"started PID=$!\")",
+      "Bash(bash -n .devcontainer/post-create.sh)",
+      "WebFetch(domain:man7.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(devcontainer exec *)"
+    ]
+  }
+}

@@ -1,0 +1,62 @@
+%% System Architecture - Mermaid source
+%% Render: hand-crafted SVG (see 01-system-architecture.svg)
+
+graph TD
+    A["Binary TCP Clients<br/><i>persistent connections</i>"] --> B
+
+    B["Epoll Server (multi-reactor)<br/><i>epoll.zig</i><br/>Edge-triggered, SO_REUSEPORT, 4096 conns/reactor"]
+    B --> C
+
+    C["Binary Protocol (comptime dispatch)<br/><i>binary_protocol.zig</i><br/>21 ops + ping, inline on epoll thread (Redis model)"]
+    C --> D
+
+    D["Operations<br/><i>operations.zig</i><br/>Validation + ChangeSet compute"]
+    D --> E["db.commit(ChangeSet)<br/><i>database.zig</i>"]
+
+    E --> F["WAL Writer<br/><i>wal.zig</i><br/>group commit, CRC32"]
+    E --> G["apply.zig<br/><i>per-variant effect dispatch</i>"]
+
+    F --> F1[("wal.bin<br/><i>on disk</i>")]
+
+    G --> H["MemTables<br/><i>memtable.zig</i><br/>32 shards x 5 primary trees"]
+
+    H --> I["B+Trees on disk (10 total)<br/><i>btree.zig</i>"]
+
+    subgraph PRIMARY [" 5 PRIMARY "]
+        P1["categories_by_id"]
+        P2["links_by_id"]
+        P3["cat_by_parent"]
+        P4["link_by_category"]
+        P5["link_by_url_hash"]
+    end
+
+    subgraph INDEXING [" 4 INDEXING "]
+        X1["categories_by_slug_path"]
+        X2["categories_by_slug_only"]
+        X3["categories_index_tree"]
+        X4["links_index_tree"]
+    end
+
+    subgraph REPAIR [" 1 REPAIR "]
+        R1["slug_path_repair_queue"]
+    end
+
+    I --- PRIMARY
+    I --- INDEXING
+    I --- REPAIR
+
+    I --> J["Page Cache<br/><i>page_cache.zig</i><br/>sharded LRU, dirty tracking"]
+    J --> K[("dmozdb.dat<br/><i>16 KB pages</i>")]
+
+    %% In-memory caches attached to Operations
+    D -.-> SC["Subtree Cache<br/><i>subtree.zig</i><br/>descendant memoization"]
+    D -.-> BF["Bloom Filter<br/><i>bloom.zig</i><br/>URL deduplication"]
+
+    %% Background threads / auxiliary subsystems
+    F -.-> WF["WAL Flusher<br/><i>drives fdatasync</i>"]
+    H -.-> MF["Memtable Flusher<br/><i>drains shards to B+Tree</i>"]
+    I -.-> VF["Verifier<br/><i>verifier.zig</i><br/>WARN-only drift detector"]
+    R1 -.-> RW["Repair Worker<br/><i>repair_worker.zig</i><br/>drains repair queue"]
+
+    %% Startup recovery
+    WR["WAL Replay<br/><i>wal_replay.zig</i><br/>startup recovery"] -.-> E

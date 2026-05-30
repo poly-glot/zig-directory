@@ -1,0 +1,53 @@
+.heroSection {
+  position: relative;
+}
+.heroSection::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+}
+.headline {
+  max-width: 14ch;
+  margin-left: auto;
+  margin-right: auto;
+}
+.lede {
+  max-width: 60ch;
+  margin-left: auto;
+  margin-right: auto;
+}
+.archGrid {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+}
+.archGrid::before,
+.archGrid::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+}
+.archGrid::before {
+  top: 0;
+}
+.archGrid::after {
+  bottom: 0;
+}
+.archCell {
+  padding: 32px;
+}
+.archCell.bordered {
+  border-right: 1px solid var(--rule);
+}
+.archValue {
+  font-size: 24px;
+}

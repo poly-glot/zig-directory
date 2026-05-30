@@ -1,0 +1,171 @@
+<svg id="search-path-svg" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 820px; background-color: white;" viewBox="0 0 820 1180" role="graphics-document document" aria-roledescription="flowchart-v2">
+  <style>
+    #search-path-svg { font-family: Arial, sans-serif; font-size: 14px; fill: #000; }
+    .box { fill: #fff; stroke: #000; stroke-width: 2px; }
+    .box-muted { fill: #f5f5f5; stroke: #000; stroke-width: 1px; }
+    .label { text-anchor: middle; font-size: 14px; fill: #000; font-weight: bold; }
+    .sublabel { text-anchor: middle; font-size: 12px; fill: #666; }
+    .note { text-anchor: start; font-size: 11px; fill: #555; }
+    .edge { stroke: #000; stroke-width: 2px; fill: none; }
+    .arrow { fill: #000; stroke: #000; stroke-width: 1px; }
+    .group-title { text-anchor: start; font-size: 12px; font-weight: bold; fill: #666; }
+    .edge-label { text-anchor: middle; font-size: 11px; fill: #555; }
+  </style>
+  <defs>
+    <marker id="search-path-arrowEnd" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="410" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#000">Search Path</text>
+
+  <!-- searchLinks entry -->
+  <rect x="245" y="55" width="330" height="70" rx="4" class="box" style="stroke-width: 3px"/>
+  <text x="410" y="78" class="label">searchLinks(query, limit)</text>
+  <text x="410" y="96" class="sublabel">(operations.zig)</text>
+  <text x="410" y="112" class="sublabel">mirror flow for searchCategories</text>
+
+  <line x1="410" y1="125" x2="410" y2="155" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- Tokenise -->
+  <rect x="245" y="160" width="330" height="75" rx="4" class="box"/>
+  <text x="410" y="183" class="label">Tokenise query</text>
+  <text x="410" y="201" class="sublabel">(inverted.TokenIterator)</text>
+  <text x="410" y="217" class="sublabel">lowercase ASCII alphanumeric</text>
+  <text x="410" y="231" class="sublabel">token len in [2, 64]</text>
+
+  <line x1="410" y1="235" x2="410" y2="265" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- Loop decision: more tokens? -->
+  <rect x="295" y="270" width="230" height="55" rx="4" class="box"/>
+  <text x="410" y="295" class="label">more query tokens?</text>
+  <text x="410" y="313" class="sublabel">TokenIterator.next</text>
+
+  <!-- "no" branch: right rail down to hydrate input -->
+  <line x1="525" y1="297" x2="780" y2="297" class="edge"/>
+  <line x1="780" y1="297" x2="780" y2="980" class="edge"/>
+  <line x1="780" y1="980" x2="585" y2="980" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="650" y="291" class="edge-label">no (all tokens processed)</text>
+
+  <!-- "yes" branch: continue down -->
+  <line x1="410" y1="325" x2="410" y2="360" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="425" y="350" class="edge-label" text-anchor="start">yes</text>
+
+  <!-- Build key range -->
+  <rect x="265" y="365" width="290" height="75" rx="4" class="box"/>
+  <text x="410" y="388" class="label">Build key range</text>
+  <text x="410" y="406" class="sublabel">lo = token || 0x00 * 8</text>
+  <text x="410" y="422" class="sublabel">hi = token || 0xFF * 8</text>
+  <text x="410" y="436" class="sublabel">prefix bracket on doc_id (big-endian)</text>
+
+  <line x1="410" y1="440" x2="410" y2="475" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- =========== Per-token range scan subgraph =========== -->
+  <rect x="220" y="455" width="380" height="270" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="6,3"/>
+  <text x="230" y="472" class="group-title">Per-token range scan (on-disk B+Tree)</text>
+
+  <!-- B+Tree rangeScan -->
+  <rect x="245" y="485" width="330" height="60" rx="4" class="box"/>
+  <text x="410" y="508" class="label">B+Tree rangeScan</text>
+  <text x="410" y="526" class="sublabel">links_index_tree (or categories_index_tree)</text>
+  <text x="410" y="540" class="sublabel">(btree.zig)</text>
+
+  <line x1="410" y1="545" x2="410" y2="575" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- Decode trailing 8 bytes -->
+  <rect x="265" y="580" width="290" height="55" rx="4" class="box"/>
+  <text x="410" y="603" class="label">Decode trailing 8 bytes</text>
+  <text x="410" y="621" class="sublabel">doc_id = readInt big-endian</text>
+
+  <line x1="410" y1="635" x2="410" y2="665" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- Append to per-token slice -->
+  <rect x="265" y="670" width="290" height="50" rx="4" class="box"/>
+  <text x="410" y="693" class="label">Append to per-token id slice</text>
+  <text x="410" y="710" class="sublabel">ascending order from range scan</text>
+
+  <!-- =========== End range scan subgraph =========== -->
+
+  <line x1="410" y1="725" x2="410" y2="755" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- First token? decision -->
+  <rect x="295" y="760" width="230" height="55" rx="4" class="box"/>
+  <text x="410" y="785" class="label">first token?</text>
+  <text x="410" y="803" class="sublabel">candidates_full == null</text>
+
+  <!-- "yes" branch: left to seed -->
+  <line x1="295" y1="787" x2="200" y2="787" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="247" y="781" class="edge-label">yes</text>
+
+  <!-- "no" branch: right to AND-intersect -->
+  <line x1="525" y1="787" x2="620" y2="787" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="572" y="781" class="edge-label">no</text>
+
+  <!-- Seed candidate set (left) -->
+  <rect x="60" y="755" width="140" height="65" rx="4" class="box"/>
+  <text x="130" y="778" class="label">Seed candidates</text>
+  <text x="130" y="796" class="sublabel">candidates := ids</text>
+  <text x="130" y="810" class="sublabel">(first token)</text>
+
+  <!-- AND-intersect (right) -->
+  <rect x="620" y="755" width="140" height="65" rx="4" class="box"/>
+  <text x="690" y="778" class="label">AND-intersect</text>
+  <text x="690" y="796" class="sublabel">candidates ∩ ids</text>
+  <text x="690" y="810" class="sublabel">two-pointer merge</text>
+
+  <!-- Seed -> loop back up to "more tokens?" via far-left rail -->
+  <line x1="130" y1="820" x2="130" y2="855" class="edge"/>
+  <line x1="130" y1="855" x2="40" y2="855" class="edge"/>
+  <line x1="40" y1="855" x2="40" y2="297" class="edge"/>
+  <line x1="40" y1="297" x2="295" y2="297" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="50" y="575" class="edge-label" text-anchor="start">loop</text>
+
+  <!-- AND-intersect -> "candidates empty?" decision -->
+  <line x1="690" y1="820" x2="690" y2="872" class="edge"/>
+  <line x1="690" y1="872" x2="525" y2="872" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- candidates empty? decision -->
+  <rect x="295" y="845" width="230" height="55" rx="4" class="box"/>
+  <text x="410" y="870" class="label">candidates empty?</text>
+  <text x="410" y="888" class="sublabel">early exit on AND fail</text>
+
+  <!-- "yes" branch -> Return empty slice (down-left) -->
+  <line x1="295" y1="872" x2="200" y2="872" class="edge"/>
+  <line x1="200" y1="872" x2="200" y2="920" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="247" y="866" class="edge-label">yes</text>
+
+  <!-- Return empty slice -->
+  <rect x="80" y="925" width="240" height="50" rx="4" class="box"/>
+  <text x="200" y="948" class="label">Return empty slice</text>
+  <text x="200" y="964" class="sublabel">no docs match all tokens</text>
+
+  <!-- "no" branch -> loop back up to "more tokens?" via mid-right rail -->
+  <line x1="525" y1="872" x2="610" y2="872" class="edge"/>
+  <line x1="610" y1="872" x2="610" y2="250" class="edge"/>
+  <line x1="610" y1="250" x2="500" y2="250" class="edge"/>
+  <line x1="500" y1="250" x2="500" y2="270" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+  <text x="545" y="866" class="edge-label">no</text>
+
+  <!-- Hydrate: For first `limit` ids -->
+  <rect x="295" y="950" width="290" height="80" rx="4" class="box"/>
+  <text x="440" y="973" class="label">For first `limit` ids:</text>
+  <text x="440" y="991" class="label">getLink(db, id)</text>
+  <text x="440" y="1009" class="sublabel">memtable -> links_by_id B+Tree</text>
+  <text x="440" y="1024" class="sublabel">(operations.zig)</text>
+
+  <line x1="440" y1="1030" x2="440" y2="1060" class="edge" marker-end="url(#search-path-arrowEnd)"/>
+
+  <!-- Return slice -->
+  <rect x="295" y="1065" width="290" height="60" rx="4" class="box" style="stroke-width: 3px"/>
+  <text x="440" y="1090" class="label">Return slice of Link structs</text>
+  <text x="440" y="1108" class="sublabel">buf[0..count]</text>
+
+  <!-- Side note: no in-memory inverted index -->
+  <text x="610" y="500" class="note">No vocabulary scan.</text>
+  <text x="610" y="514" class="note">All token data lives</text>
+  <text x="610" y="528" class="note">on disk; the loop runs</text>
+  <text x="610" y="542" class="note">one rangeScan per</text>
+  <text x="610" y="556" class="note">query token.</text>
+
+</svg>

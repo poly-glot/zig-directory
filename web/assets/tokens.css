@@ -1,0 +1,56 @@
+/* Design system — global because CSS variables can't be CSS-module scoped
+   (and shouldn't be: tokens are the contract every component reads from).
+   Imported once via client.ts. */
+
+:root {
+  --ink: #0a0a0a;
+  --ink-2: #1a1a1a;
+  --paper: #ffffff;
+  --paper-2: #f4f4f2;
+  --paper-3: #ecece8;
+  --rule: #e5e5e1;
+  --rule-strong: #d4d4ce;
+  --muted: #6b6b66;
+  --muted-2: #9a9a93;
+  --hover: #2a2a2a;
+  --error: #b00020;
+  --success: #1f6e3f;
+  --link: #0645ad;
+  --link-hover: #032b73;
+
+  --pad-x: 56px;
+  --pad-y: 96px;
+  --maxw: 1200px;
+
+  --eyebrow-size: 11px;
+  --eyebrow-track: 0.22em;
+
+  --t-display: 56px;
+  --t-h1: 44px;
+  --t-h2: 30px;
+  --t-h3: 18px;
+  --t-body: 15px;
+  --t-small: 13px;
+  --t-micro: 11px;
+
+  --row-pad: 20px;
+}
+
+@media (max-width: 1023px) {
+  :root {
+    --pad-x: 32px;
+    --pad-y: 64px;
+    --maxw: 100%;
+  }
+}
+
+@media (max-width: 767px) {
+  :root {
+    --pad-x: 20px;
+    --pad-y: 48px;
+    --t-display: 36px;
+    --t-h1: 28px;
+    --t-h2: 22px;
+    --t-h3: 16px;
+  }
+}

@@ -1,0 +1,227 @@
+<svg id="arch-svg" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 880px; background-color: white;" viewBox="0 0 880 1320" role="graphics-document document" aria-roledescription="flowchart-v2">
+  <style>
+    #arch-svg { font-family: Arial, sans-serif; font-size: 14px; fill: #000; }
+    .box { fill: #fff; stroke: #000; stroke-width: 2px; }
+    .box-muted { fill: #f5f5f5; stroke: #000; stroke-width: 1px; }
+    .box-aux { fill: #fff; stroke: #000; stroke-width: 1px; }
+    .label { text-anchor: middle; font-size: 14px; fill: #000; font-weight: bold; }
+    .sublabel { text-anchor: middle; font-size: 12px; fill: #666; }
+    .note { text-anchor: start; font-size: 11px; fill: #555; }
+    .edge { stroke: #000; stroke-width: 2px; fill: none; }
+    .edge-dashed { stroke: #000; stroke-width: 1.5px; fill: none; stroke-dasharray: 5,3; }
+    .arrow { fill: #000; stroke: #000; stroke-width: 1px; }
+    .group-title { text-anchor: start; font-size: 12px; font-weight: bold; fill: #666; }
+    .tree-name { text-anchor: middle; font-size: 11px; fill: #000; }
+  </style>
+  <defs>
+    <marker id="arch-arrowEnd" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="440" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#000">System Architecture</text>
+
+  <!-- =========== MAIN COLUMN (centered at x=440) =========== -->
+
+  <!-- Clients -->
+  <rect x="295" y="55" width="290" height="50" rx="4" class="box" style="stroke-width: 3px"/>
+  <text x="440" y="77" class="label">Binary TCP Clients</text>
+  <text x="440" y="93" class="sublabel">persistent connections</text>
+
+  <line x1="440" y1="105" x2="440" y2="135" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- Epoll Server -->
+  <rect x="265" y="140" width="350" height="60" rx="4" class="box"/>
+  <text x="440" y="162" class="label">Epoll Server (multi-reactor)</text>
+  <text x="440" y="180" class="sublabel">(epoll.zig)</text>
+  <text x="440" y="194" class="sublabel">edge-triggered, SO_REUSEPORT, 4096 conns/reactor</text>
+
+  <line x1="440" y1="200" x2="440" y2="230" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- Binary Protocol -->
+  <rect x="265" y="235" width="350" height="60" rx="4" class="box"/>
+  <text x="440" y="257" class="label">Binary Protocol (comptime dispatch)</text>
+  <text x="440" y="275" class="sublabel">(binary_protocol.zig)</text>
+  <text x="440" y="289" class="sublabel">21 ops + ping, inline on epoll thread (Redis model)</text>
+
+  <line x1="440" y1="295" x2="440" y2="325" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- Operations -->
+  <rect x="295" y="330" width="290" height="60" rx="4" class="box"/>
+  <text x="440" y="352" class="label">Operations</text>
+  <text x="440" y="370" class="sublabel">(operations.zig)</text>
+  <text x="440" y="384" class="sublabel">validation + ChangeSet compute</text>
+
+  <line x1="440" y1="390" x2="440" y2="420" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- db.commit(ChangeSet) -->
+  <rect x="295" y="425" width="290" height="55" rx="4" class="box"/>
+  <text x="440" y="447" class="label">db.commit(ChangeSet)</text>
+  <text x="440" y="465" class="sublabel">(database.zig)</text>
+
+  <!-- Fan out from db.commit to WAL Writer (left) and apply.zig (right) -->
+  <line x1="440" y1="480" x2="440" y2="510" class="edge"/>
+  <line x1="200" y1="510" x2="680" y2="510" class="edge"/>
+  <line x1="200" y1="510" x2="200" y2="540" class="edge" marker-end="url(#arch-arrowEnd)"/>
+  <line x1="680" y1="510" x2="680" y2="540" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- WAL Writer (left branch) -->
+  <rect x="100" y="545" width="200" height="60" rx="4" class="box"/>
+  <text x="200" y="567" class="label">WAL Writer</text>
+  <text x="200" y="585" class="sublabel">(wal.zig)</text>
+  <text x="200" y="599" class="sublabel">group commit, CRC32</text>
+
+  <!-- WAL Writer -> wal.bin -->
+  <line x1="200" y1="605" x2="200" y2="635" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- wal.bin -->
+  <rect x="120" y="640" width="160" height="50" rx="4" class="box-muted"/>
+  <text x="200" y="663" class="label">wal.bin</text>
+  <text x="200" y="679" class="sublabel">on disk</text>
+
+  <!-- apply.zig (right branch) -->
+  <rect x="580" y="545" width="200" height="60" rx="4" class="box"/>
+  <text x="680" y="567" class="label">apply.zig</text>
+  <text x="680" y="585" class="sublabel">per-variant effect</text>
+  <text x="680" y="599" class="sublabel">dispatch</text>
+
+  <line x1="680" y1="605" x2="680" y2="635" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- MemTables -->
+  <rect x="565" y="640" width="230" height="60" rx="4" class="box"/>
+  <text x="680" y="662" class="label">MemTables</text>
+  <text x="680" y="680" class="sublabel">(memtable.zig)</text>
+  <text x="680" y="694" class="sublabel">32 shards x 5 primary trees</text>
+
+  <!-- MemTables -> B+Trees: bring flow back to center column -->
+  <line x1="680" y1="700" x2="680" y2="725" class="edge"/>
+  <line x1="680" y1="725" x2="440" y2="725" class="edge"/>
+  <line x1="440" y1="725" x2="440" y2="755" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- Edge label: drained by Memtable Flusher -->
+  <text x="500" y="720" class="note">drained by Memtable Flusher</text>
+
+  <!-- B+Trees on disk -->
+  <rect x="295" y="760" width="290" height="55" rx="4" class="box"/>
+  <text x="440" y="782" class="label">B+Trees on disk (10 total)</text>
+  <text x="440" y="800" class="sublabel">(btree.zig)</text>
+
+  <!-- Subgroup container around the three tree groups -->
+  <rect x="60" y="830" width="760" height="170" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="6,3"/>
+
+  <!-- Connector from B+Trees to subgroup -->
+  <line x1="440" y1="815" x2="440" y2="830" class="edge"/>
+
+  <!-- 5 PRIMARY group -->
+  <rect x="80" y="850" width="340" height="135" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="90" y="868" class="group-title">5 PRIMARY</text>
+
+  <rect x="100" y="878" width="300" height="22" rx="3" class="box-muted"/>
+  <text x="250" y="893" class="tree-name">categories_by_id</text>
+  <rect x="100" y="903" width="300" height="22" rx="3" class="box-muted"/>
+  <text x="250" y="918" class="tree-name">links_by_id</text>
+  <rect x="100" y="928" width="300" height="22" rx="3" class="box-muted"/>
+  <text x="250" y="943" class="tree-name">cat_by_parent</text>
+  <rect x="100" y="953" width="300" height="22" rx="3" class="box-muted"/>
+  <text x="250" y="968" class="tree-name">link_by_category, link_by_url_hash</text>
+
+  <!-- 4 INDEXING group -->
+  <rect x="450" y="850" width="280" height="135" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="460" y="868" class="group-title">4 INDEXING</text>
+
+  <rect x="465" y="878" width="250" height="22" rx="3" class="box-muted"/>
+  <text x="590" y="893" class="tree-name">categories_by_slug_path</text>
+  <rect x="465" y="903" width="250" height="22" rx="3" class="box-muted"/>
+  <text x="590" y="918" class="tree-name">categories_by_slug_only</text>
+  <rect x="465" y="928" width="250" height="22" rx="3" class="box-muted"/>
+  <text x="590" y="943" class="tree-name">categories_index_tree</text>
+  <rect x="465" y="953" width="250" height="22" rx="3" class="box-muted"/>
+  <text x="590" y="968" class="tree-name">links_index_tree</text>
+
+  <!-- 1 REPAIR group: spans below within same dashed container -->
+  <rect x="750" y="850" width="60" height="135" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="755" y="868" class="group-title" style="font-size:10px">1 REPAIR</text>
+  <rect x="755" y="893" width="50" height="80" rx="3" class="box-muted"/>
+  <text x="780" y="925" class="tree-name" style="font-size:9px">slug_</text>
+  <text x="780" y="938" class="tree-name" style="font-size:9px">path_</text>
+  <text x="780" y="951" class="tree-name" style="font-size:9px">repair_</text>
+  <text x="780" y="964" class="tree-name" style="font-size:9px">queue</text>
+
+  <!-- B+Trees -> Page Cache -->
+  <line x1="440" y1="1000" x2="440" y2="1030" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- Page Cache -->
+  <rect x="295" y="1035" width="290" height="60" rx="4" class="box"/>
+  <text x="440" y="1057" class="label">Page Cache</text>
+  <text x="440" y="1075" class="sublabel">(page_cache.zig)</text>
+  <text x="440" y="1089" class="sublabel">sharded LRU, dirty tracking</text>
+
+  <line x1="440" y1="1095" x2="440" y2="1125" class="edge" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- dmozdb.dat -->
+  <rect x="295" y="1130" width="290" height="55" rx="4" class="box-muted"/>
+  <text x="440" y="1152" class="label">dmozdb.dat</text>
+  <text x="440" y="1170" class="sublabel">16 KB pages</text>
+
+  <!-- =========== LEFT SIDE PANEL: in-memory caches attached to Operations =========== -->
+  <rect x="20" y="320" width="220" height="140" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="6,3"/>
+  <text x="30" y="338" class="group-title">In-memory caches</text>
+
+  <rect x="35" y="350" width="190" height="45" rx="4" class="box-aux"/>
+  <text x="130" y="368" class="label" style="font-size:13px">Subtree Cache</text>
+  <text x="130" y="384" class="sublabel" style="font-size:11px">subtree.zig — descendants</text>
+
+  <rect x="35" y="403" width="190" height="45" rx="4" class="box-aux"/>
+  <text x="130" y="421" class="label" style="font-size:13px">Bloom Filter</text>
+  <text x="130" y="437" class="sublabel" style="font-size:11px">bloom.zig — URL dedup</text>
+
+  <!-- Dashed connectors from Operations to caches -->
+  <line x1="295" y1="365" x2="225" y2="370" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+  <line x1="295" y1="380" x2="225" y2="423" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- =========== RIGHT SIDE PANEL: background threads / aux subsystems =========== -->
+  <rect x="640" y="320" width="220" height="200" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="6,3"/>
+  <text x="650" y="338" class="group-title">Background threads</text>
+
+  <rect x="655" y="350" width="190" height="38" rx="4" class="box-aux"/>
+  <text x="750" y="367" class="label" style="font-size:13px">WAL Flusher</text>
+  <text x="750" y="381" class="sublabel" style="font-size:11px">drives fdatasync</text>
+
+  <rect x="655" y="395" width="190" height="38" rx="4" class="box-aux"/>
+  <text x="750" y="412" class="label" style="font-size:13px">Memtable Flusher</text>
+  <text x="750" y="426" class="sublabel" style="font-size:11px">drains shards to B+Tree</text>
+
+  <rect x="655" y="440" width="190" height="38" rx="4" class="box-aux"/>
+  <text x="750" y="457" class="label" style="font-size:13px">Verifier</text>
+  <text x="750" y="471" class="sublabel" style="font-size:11px">verifier.zig — WARN-only</text>
+
+  <rect x="655" y="485" width="190" height="38" rx="4" class="box-aux"/>
+  <text x="750" y="502" class="label" style="font-size:13px">Repair Worker</text>
+  <text x="750" y="516" class="sublabel" style="font-size:11px">repair_worker.zig</text>
+
+  <!-- Dashed connectors from main column subsystems to background threads -->
+  <!-- WAL Writer (200,575) -> WAL Flusher (655,369) -->
+  <path d="M 300 575 L 630 575 L 630 369 L 655 369" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- MemTables (565,670) -> Memtable Flusher (655,414) -->
+  <path d="M 565 670 L 620 670 L 620 414 L 655 414" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- B+Trees (585,787) -> Verifier (655,459) -->
+  <path d="M 585 787 L 610 787 L 610 459 L 655 459" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- slug_path_repair_queue (810,933) -> Repair Worker (655,504) -->
+  <path d="M 815 933 L 840 933 L 840 504 L 845 504" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+
+  <!-- =========== STARTUP RECOVERY: WAL Replay panel =========== -->
+  <rect x="20" y="475" width="220" height="80" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="6,3"/>
+  <text x="30" y="493" class="group-title">Startup recovery</text>
+
+  <rect x="35" y="503" width="190" height="42" rx="4" class="box-aux"/>
+  <text x="130" y="521" class="label" style="font-size:13px">WAL Replay</text>
+  <text x="130" y="537" class="sublabel" style="font-size:11px">wal_replay.zig</text>
+
+  <!-- WAL Replay -> db.commit -->
+  <path d="M 225 524 L 270 524 L 270 452 L 295 452" class="edge-dashed" marker-end="url(#arch-arrowEnd)"/>
+
+</svg>

@@ -1,0 +1,76 @@
+<svg id="wire-svg" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 720px; background-color: white;" viewBox="0 0 720 340" role="graphics-document document" aria-roledescription="diagram">
+  <style>
+    #wire-svg { font-family: Arial, sans-serif; font-size: 14px; fill: #000; }
+    .cell { fill: #fff; stroke: #000; stroke-width: 1.5px; }
+    .cell-header { fill: #e8e8e8; stroke: #000; stroke-width: 1.5px; }
+    .label { text-anchor: middle; font-size: 12px; fill: #000; font-weight: bold; }
+    .sublabel { text-anchor: middle; font-size: 10px; fill: #555; }
+    .note { text-anchor: start; font-size: 11px; fill: #555; }
+    .title { text-anchor: middle; font-size: 14px; fill: #000; font-weight: bold; }
+  </style>
+
+  <!-- Title -->
+  <text x="360" y="25" class="title">Binary Wire Format</text>
+
+  <!-- Request Frame -->
+  <text x="30" y="60" font-size="13" font-weight="bold" fill="#000">Request Frame:</text>
+
+  <rect x="30" y="70" width="80" height="40" class="cell-header"/>
+  <text x="70" y="93" class="label">len</text>
+  <text x="70" y="105" class="sublabel">4B LE</text>
+
+  <rect x="110" y="70" width="60" height="40" class="cell-header"/>
+  <text x="140" y="93" class="label">op</text>
+  <text x="140" y="105" class="sublabel">1B</text>
+
+  <rect x="170" y="70" width="60" height="40" class="cell-header"/>
+  <text x="200" y="93" class="label">flags</text>
+  <text x="200" y="105" class="sublabel">1B</text>
+
+  <rect x="230" y="70" width="70" height="40" class="cell-header"/>
+  <text x="265" y="93" class="label">count</text>
+  <text x="265" y="105" class="sublabel">2B LE</text>
+
+  <rect x="300" y="70" width="200" height="40" class="cell"/>
+  <text x="400" y="93" class="label">payload...</text>
+  <text x="400" y="105" class="sublabel">variable length</text>
+
+  <!-- Response Frame -->
+  <text x="30" y="150" font-size="13" font-weight="bold" fill="#000">Response Frame:</text>
+
+  <rect x="30" y="160" width="80" height="40" class="cell-header"/>
+  <text x="70" y="183" class="label">len</text>
+  <text x="70" y="195" class="sublabel">4B LE</text>
+
+  <rect x="110" y="160" width="60" height="40" class="cell-header"/>
+  <text x="140" y="183" class="label">op</text>
+  <text x="140" y="195" class="sublabel">1B</text>
+
+  <rect x="170" y="160" width="60" height="40" class="cell-header"/>
+  <text x="200" y="183" class="label">status</text>
+  <text x="200" y="195" class="sublabel">1B</text>
+
+  <rect x="230" y="160" width="70" height="40" class="cell-header"/>
+  <text x="265" y="183" class="label">count</text>
+  <text x="265" y="195" class="sublabel">2B LE</text>
+
+  <rect x="300" y="160" width="200" height="40" class="cell"/>
+  <text x="400" y="183" class="label">payload...</text>
+  <text x="400" y="195" class="sublabel">variable length</text>
+
+  <!-- Notes: header = 8 bytes -->
+  <text x="520" y="90" class="note">header = 8 bytes</text>
+  <text x="520" y="105" class="note">len includes header</text>
+  <text x="520" y="180" class="note">all integers little-endian</text>
+  <text x="520" y="195" class="note">pipelining supported</text>
+
+  <!-- Op codes table -->
+  <text x="30" y="240" font-size="13" font-weight="bold" fill="#000">Op Codes:</text>
+
+  <text x="30" y="260" class="note">1 create_link    7 update_category   12 list_children</text>
+  <text x="30" y="275" class="note">2 create_category 8 move_category     13 list_links</text>
+  <text x="30" y="290" class="note">3 get_link        9 update_link       14 search</text>
+  <text x="30" y="305" class="note">4 get_category   10 list_root_cats    15 stats</text>
+  <text x="30" y="320" class="note">5 delete_link    11 browse_path      255 ping</text>
+  <text x="30" y="335" class="note">6 delete_category</text>
+</svg>

@@ -1,0 +1,30 @@
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--rule-strong);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.btn {
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding: 8px 12px;
+  background: var(--paper);
+  color: var(--muted);
+  border: 0;
+  border-right: 1px solid var(--rule-strong);
+  cursor: pointer;
+}
+.btn:last-child {
+  border-right: 0;
+}
+.btn:hover {
+  color: var(--ink);
+}
+.btn.active {
+  background: var(--ink);
+  color: var(--paper);
+}

@@ -1,0 +1,56 @@
+.hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 64px;
+  padding: 64px 0;
+}
+.hero::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+}
+.hero .lede {
+  margin-top: 24px;
+}
+.metaStack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  border: 1px solid var(--rule-strong);
+  padding: 24px;
+}
+.metaRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-top: 1px solid var(--rule);
+  padding-top: 12px;
+}
+.metaRow:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.metaRow .label {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--muted);
+}
+.metaRow .value {
+  font-size: 16px;
+  font-weight: 900;
+}
+
+@media (max-width: 1023px) {
+  .hero {
+    grid-template-columns: 1fr;
+    gap: 32px;
+  }
+}

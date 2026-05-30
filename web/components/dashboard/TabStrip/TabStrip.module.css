@@ -1,0 +1,39 @@
+.tabs {
+  display: flex;
+  gap: 24px;
+  margin: 32px 0 0;
+  flex-wrap: wrap;
+}
+.tabs a {
+  position: relative;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 12px 4px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-decoration: none;
+}
+.tabs a:hover {
+  color: var(--ink);
+}
+.tabs a.active {
+  color: var(--ink);
+}
+.tabs a.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--ink);
+}
+.count {
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}

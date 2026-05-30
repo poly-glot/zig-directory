@@ -1,0 +1,171 @@
+<svg id="link-insert-svg" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 820px; background-color: white;" viewBox="0 0 820 1200" role="graphics-document document" aria-roledescription="flowchart-v2">
+  <style>
+    #link-insert-svg { font-family: Arial, sans-serif; font-size: 14px; fill: #000; }
+    .box { fill: #fff; stroke: #000; stroke-width: 2px; }
+    .box-muted { fill: #f5f5f5; stroke: #000; stroke-width: 1px; }
+    .label { text-anchor: middle; font-size: 14px; fill: #000; font-weight: bold; }
+    .sublabel { text-anchor: middle; font-size: 12px; fill: #666; }
+    .note { text-anchor: start; font-size: 11px; fill: #555; }
+    .edge { stroke: #000; stroke-width: 2px; fill: none; }
+    .arrow { fill: #000; stroke: #000; stroke-width: 1px; }
+    .group-title { text-anchor: start; font-size: 12px; font-weight: bold; fill: #666; }
+    .edge-label { text-anchor: middle; font-size: 11px; fill: #555; }
+  </style>
+  <defs>
+    <marker id="link-insert-arrowEnd" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="410" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#000">Link Insert Path</text>
+
+  <!-- =========== MAIN COLUMN (centered at x=410) =========== -->
+
+  <!-- createLink -->
+  <rect x="245" y="55" width="330" height="60" rx="4" class="box" style="stroke-width: 3px"/>
+  <text x="410" y="78" class="label">createLink(category_id, url, title, desc)</text>
+  <text x="410" y="96" class="sublabel">(operations.zig)</text>
+  <text x="410" y="110" class="sublabel">entry point</text>
+
+  <line x1="410" y1="115" x2="410" y2="145" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Validate category -->
+  <rect x="265" y="150" width="290" height="55" rx="4" class="box"/>
+  <text x="410" y="173" class="label">Validate category exists</text>
+  <text x="410" y="191" class="sublabel">getCategory: memtable -> categories_by_id</text>
+
+  <line x1="410" y1="205" x2="410" y2="235" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Allocate link ID -->
+  <rect x="265" y="240" width="290" height="55" rx="4" class="box"/>
+  <text x="410" y="263" class="label">Allocate link ID</text>
+  <text x="410" y="281" class="sublabel">atomic fetchAdd (lock-free)</text>
+
+  <line x1="410" y1="295" x2="410" y2="325" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Bloom filter decision -->
+  <rect x="285" y="330" width="250" height="60" rx="4" class="box"/>
+  <text x="410" y="353" class="label">Bloom filter mayContain(url)?</text>
+  <text x="410" y="371" class="sublabel">(bloom.zig)</text>
+  <text x="410" y="385" class="sublabel">probabilistic prefilter</text>
+
+  <!-- "no" branch: Bloom -> bypass exact-match check, rejoin at computeChangeSet -->
+  <line x1="535" y1="360" x2="730" y2="360" class="edge"/>
+  <line x1="730" y1="360" x2="730" y2="572" class="edge"/>
+  <line x1="730" y1="572" x2="585" y2="572" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <text x="630" y="354" class="edge-label">no (~99%)</text>
+
+  <!-- "yes" branch: Bloom -> URL exact match -->
+  <line x1="410" y1="390" x2="410" y2="420" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <text x="425" y="408" class="edge-label" text-anchor="start">yes</text>
+
+  <!-- URL exact match decision -->
+  <rect x="265" y="425" width="290" height="60" rx="4" class="box"/>
+  <text x="410" y="448" class="label">Exact URL match?</text>
+  <text x="410" y="466" class="sublabel">memtable + link_by_url_hash B+Tree</text>
+  <text x="410" y="480" class="sublabel">(database.zig)</text>
+
+  <!-- "duplicate" branch: -> right -->
+  <line x1="555" y1="455" x2="640" y2="455" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <text x="597" y="449" class="edge-label">duplicate</text>
+
+  <!-- DuplicateUrl box -->
+  <rect x="640" y="425" width="160" height="60" rx="4" class="box"/>
+  <text x="720" y="453" class="label">Return DuplicateUrl</text>
+  <text x="720" y="471" class="sublabel">error</text>
+
+  <!-- "unique" branch: down -->
+  <line x1="410" y1="485" x2="410" y2="555" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <text x="425" y="525" class="edge-label" text-anchor="start">unique</text>
+
+  <!-- computeLinkInsertChangeSet -->
+  <rect x="295" y="560" width="290" height="55" rx="4" class="box"/>
+  <text x="410" y="583" class="label">computeLinkInsertChangeSet</text>
+  <text x="410" y="601" class="sublabel">(operations.zig)</text>
+
+  <line x1="410" y1="615" x2="410" y2="645" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- db.commit(ChangeSet) -->
+  <rect x="295" y="650" width="290" height="55" rx="4" class="box"/>
+  <text x="410" y="673" class="label">db.commit(ChangeSet)</text>
+  <text x="410" y="691" class="sublabel">(database.zig)</text>
+
+  <!-- Fan out: db.commit -> WAL (left) + apply (right) -->
+  <line x1="410" y1="705" x2="410" y2="730" class="edge"/>
+  <line x1="200" y1="730" x2="620" y2="730" class="edge"/>
+  <line x1="200" y1="730" x2="200" y2="755" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <line x1="620" y1="730" x2="620" y2="755" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- WAL append (left) -->
+  <rect x="80" y="760" width="240" height="60" rx="4" class="box"/>
+  <text x="200" y="783" class="label">Encode + append to WAL</text>
+  <text x="200" y="801" class="sublabel">(wal.zig)</text>
+  <text x="200" y="815" class="sublabel">CRC32 + sequence number</text>
+
+  <!-- apply.applyLinkInserted (right) -->
+  <rect x="500" y="760" width="240" height="60" rx="4" class="box"/>
+  <text x="620" y="783" class="label">apply.applyLinkInserted</text>
+  <text x="620" y="801" class="sublabel">(apply.zig)</text>
+  <text x="620" y="815" class="sublabel">per-variant effect dispatch</text>
+
+  <!-- apply -> memtable subgraph (vertical line into rail) -->
+  <line x1="620" y1="820" x2="620" y2="855" class="edge"/>
+  <line x1="140" y1="855" x2="700" y2="855" class="edge"/>
+  <line x1="140" y1="855" x2="140" y2="900" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <line x1="325" y1="855" x2="325" y2="900" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <line x1="510" y1="855" x2="510" y2="900" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+  <line x1="700" y1="855" x2="700" y2="900" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Memtable subgraph border (encloses 4 shard boxes) -->
+  <rect x="40" y="870" width="760" height="115" rx="4" fill="none" stroke="#999" stroke-width="1" stroke-dasharray="6,3"/>
+  <text x="50" y="887" class="group-title">Memtable writes (in-memory, sharded)</text>
+
+  <!-- mt_links_by_id -->
+  <rect x="60" y="905" width="160" height="65" rx="4" class="box-muted"/>
+  <text x="140" y="928" class="label">mt_links_by_id</text>
+  <text x="140" y="946" class="sublabel">id -> Link struct</text>
+  <text x="140" y="960" class="sublabel">primary record</text>
+
+  <!-- mt_link_by_category -->
+  <rect x="245" y="905" width="160" height="65" rx="4" class="box-muted"/>
+  <text x="325" y="928" class="label">mt_link_by_category</text>
+  <text x="325" y="946" class="sublabel">(cat_id, link_id)</text>
+  <text x="325" y="960" class="sublabel">-> id</text>
+
+  <!-- mt_link_by_url_hash -->
+  <rect x="430" y="905" width="160" height="65" rx="4" class="box-muted"/>
+  <text x="510" y="928" class="label">mt_link_by_url_hash</text>
+  <text x="510" y="946" class="sublabel">hash(url) -> id</text>
+  <text x="510" y="960" class="sublabel">dedup index</text>
+
+  <!-- mt_links_index_tree (token postings, on-disk-backed) -->
+  <rect x="620" y="905" width="160" height="65" rx="4" class="box-muted"/>
+  <text x="700" y="928" class="label">mt_links_index_tree</text>
+  <text x="700" y="946" class="sublabel">token || id_be -> ""</text>
+  <text x="700" y="960" class="sublabel">token postings (on-disk)</text>
+
+  <!-- Collapse rails: 4 boxes -> single midpoint -> bloom add -->
+  <line x1="140" y1="970" x2="140" y2="1005" class="edge"/>
+  <line x1="325" y1="970" x2="325" y2="1005" class="edge"/>
+  <line x1="510" y1="970" x2="510" y2="1005" class="edge"/>
+  <line x1="700" y1="970" x2="700" y2="1005" class="edge"/>
+  <line x1="140" y1="1005" x2="700" y2="1005" class="edge"/>
+  <line x1="410" y1="1005" x2="410" y2="1030" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Add URL to bloom filter -->
+  <rect x="285" y="1035" width="250" height="40" rx="4" class="box"/>
+  <text x="410" y="1060" class="label">Add URL to bloom filter</text>
+
+  <line x1="410" y1="1075" x2="410" y2="1095" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Cascade ancestor link_count_subtree -->
+  <rect x="245" y="1100" width="330" height="40" rx="4" class="box"/>
+  <text x="410" y="1125" class="label">Cascade ancestor link_count_subtree</text>
+
+  <line x1="410" y1="1140" x2="410" y2="1165" class="edge" marker-end="url(#link-insert-arrowEnd)"/>
+
+  <!-- Return link ID -->
+  <text x="410" y="1185" class="label">Return link ID</text>
+
+</svg>

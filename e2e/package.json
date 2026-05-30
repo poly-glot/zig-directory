@@ -1,0 +1,12 @@
+{
+  "name": "zig-directory-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "npx playwright test --project=chromium",
+    "test:cold-boot": "npx playwright test --project=cold-boot"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

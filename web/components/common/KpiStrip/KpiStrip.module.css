@@ -1,0 +1,79 @@
+.strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  position: relative;
+}
+/*
+ * Full-bleed top + bottom rules — the strip itself stays inside
+ * .container (so the four cells align with the section's content
+ * column) but the horizontal rules above and below the strip
+ * extend to the viewport edges via 100vw pseudo-elements.
+ */
+.strip::before,
+.strip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.strip::before {
+  top: 0;
+}
+.strip::after {
+  bottom: 0;
+}
+.cell {
+  padding: 32px;
+  border-right: 1px solid var(--rule);
+}
+.cell:last-child {
+  border-right: 0;
+}
+.cell .h1 {
+  font-size: 48px;
+  margin-top: 12px;
+}
+.compact .cell {
+  padding: 20px;
+}
+.compact .cell .h1 {
+  font-size: 28px;
+}
+
+/* Dark-section overrides */
+:global(.section.dark) .strip::before,
+:global(.section.dark) .strip::after {
+  background: #1f1f1f;
+}
+:global(.section.dark) .cell {
+  border-color: #1f1f1f;
+}
+
+@media (max-width: 1023px) {
+  .strip {
+    grid-template-columns: 1fr 1fr;
+  }
+  .cell:nth-child(2) {
+    border-right: 0;
+  }
+  .cell:nth-child(1), .cell:nth-child(2) {
+    border-bottom: 1px solid var(--rule);
+  }
+}
+
+@media (max-width: 767px) {
+  .strip {
+    grid-template-columns: 1fr;
+  }
+  .cell {
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .cell:last-child {
+    border-bottom: 0;
+  }
+}

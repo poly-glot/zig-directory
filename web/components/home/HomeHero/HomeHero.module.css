@@ -1,0 +1,35 @@
+.hero {
+  padding: 120px 0 96px;
+  border-bottom: 1px solid var(--rule);
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 80px;
+  align-items: end;
+}
+.title {
+  margin: 18px 0 28px;
+  max-width: 16ch;
+}
+.lede {
+  margin-bottom: 36px;
+}
+.actions {
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 1023px) {
+  .grid {
+    grid-template-columns: 1fr;
+    gap: 48px;
+  }
+}
+@media (max-width: 767px) {
+  .hero {
+    padding: 64px 0 48px;
+  }
+}

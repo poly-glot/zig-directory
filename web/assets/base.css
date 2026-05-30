@@ -1,0 +1,95 @@
+/* Reset + document defaults + global typography classes used across CSS
+   modules via :global / class composition. Stays here because these
+   apply to every page and have no per-component owner. */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+* {
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  font-family:
+    "Lato", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+  font-size: var(--t-body);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+@media (max-width: 767px) {
+  body {
+    font-size: 14px;
+  }
+}
+
+img, svg {
+  max-width: 100%;
+  display: block;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+summary {
+  cursor: pointer;
+}
+
+mark {
+  background: #fff200;
+  color: var(--ink);
+  padding: 0 2px;
+}
+
+/* Density modifiers — applied to <html> by the DensityToggle island.
+   Global because any descendant reading `--row-pad` needs to inherit. */
+.density-spacious {
+  --row-pad: 28px;
+}
+.density-balanced {
+  --row-pad: 20px;
+}
+.density-dense {
+  --row-pad: 14px;
+}
+
+/* Admin shell tokens — scoped, do not leak to public site */
+.admin-shell {
+  --admin-pad: 32px;
+  --admin-gap: 24px;
+  --admin-bar-h: 44px;
+  --admin-field-gap: 16px;
+}
+@media (max-width: 767px) {
+  .admin-shell {
+    --admin-pad: 16px;
+    --admin-gap: 16px;
+  }
+}
+
+/* Status colors — used by admin Banner, Field error, etc. */
+:root {
+  --ok-fg: #1b5e20;
+  --ok-bg: #e8f5e9;
+  --ok-bd: #2e7d32;
+  --err-fg: #7f0014;
+  --err-bg: #fdecea;
+  --err-bd: #b00020;
+}
+
+/* Sublabel used under primary table cell values (e.g. category description). */
+.sublabel {
+  margin-top: 4px;
+  color: var(--muted);
+}

@@ -1,0 +1,46 @@
+%% Slug-Path Repair Flow (rename / move) - Mermaid source
+%% Render: hand-crafted SVG (see 09-rename-move-flow.svg)
+%% Slice 1, commits up to f6a027f
+
+graph TD
+    A["updateCategory(slug rename) / moveCategory<br/><i>operations.zig</i>"] --> B
+
+    B["computeRenameChangeSet / computeMoveChangeSet<br/><i>operations.zig</i><br/>DFS via cat_by_parent, capped at threshold + 1"]
+    B --> C{"descendants &le; rename_inline_threshold?<br/><i>db.config (default 5000)</i>"}
+
+    C -- "yes (atomic in-line)" --> D
+    C -- "no  (queued async)" --> E
+
+    %% =========== ATOMIC IN-LINE BRANCH ===========
+    subgraph ATOMIC ["Atomic in-line branch"]
+        D["ChangeSet {<br/>  CategoryRenamed/Moved,<br/>  descendant_swaps = [...],<br/>  enqueue = .{}<br/>}"]
+        D --> D1["apply.applyCategoryRenamed/Moved<br/><i>apply.zig</i>"]
+        D1 --> D2["delete-old + insert-new<br/>SELF + EVERY descendant<br/><i>same WAL frame</i>"]
+        D2 --> D3["DONE (single commit)"]
+    end
+
+    %% =========== QUEUED ASYNC BRANCH ===========
+    subgraph QUEUED ["Queued async branch"]
+        E["ChangeSet {<br/>  CategoryRenamed/Moved,<br/>  descendant_swaps = &.{},<br/>  enqueue.seq != 0,<br/>  old_slug_prefix = ...<br/>}"]
+        E --> E1["apply.applyCategoryRenamed/Moved<br/><i>apply.zig</i>"]
+        E1 --> E2["delete-old + insert-new<br/>SELF only"]
+        E1 --> E3["Write RepairTask to<br/>slug_path_repair_queue<br/><i>keyed by big-endian seq</i>"]
+        E2 --> E4["Rename commit returns"]
+        E3 --> E4
+
+        E4 -. "later (async)" .-> W1["repair_worker tick<br/><i>repair_worker.zig</i>"]
+        W1 --> W2["peekMin(slug_path_repair_queue)"]
+        W2 --> W3["walk descendants via cat_by_parent"]
+        W3 --> W4["For each chunk of 10000:<br/>ChangeSet { slug_path_repair_chunk }<br/><i>db.commit (WAL-durable per chunk)</i>"]
+        W4 --> W5["Final: ChangeSet { slug_path_repair_complete }<br/><i>removes queue entry</i>"]
+    end
+
+    %% =========== READ SIDE ===========
+    subgraph READ ["Read side: resolveSlugPath"]
+        R0["resolveSlugPath(path)<br/><i>operations.zig</i>"] --> R1{"slug_path_repair_queue<br/>entry_count == 0?"}
+        R1 -- "yes (steady state)" --> R2["return cat_id<br/><i>fast path</i>"]
+        R1 -- "no  (repair window)" --> R3["walk parent chain<br/>buildCanonicalSlugPath(cat)"]
+        R3 --> R4{"canonical == query path?"}
+        R4 -- "yes" --> R2
+        R4 -- "no" --> R5["return not_found<br/><i>orphan hidden</i>"]
+    end

@@ -1,0 +1,15 @@
+.refCard {
+  border: 1px solid var(--rule-strong);
+  padding: 48px;
+  background: var(--paper);
+  max-width: 720px;
+  margin: 32px 0 0;
+}
+.refRow {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 32px;
+}
+.refValue {
+  font-weight: 900;
+}

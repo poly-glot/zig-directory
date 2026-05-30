@@ -1,0 +1,11 @@
+.form {
+  justify-content: flex-end;
+}
+.select {
+  width: auto;
+  /* Block/inline-start only — the global .select owns the arrow gutter
+     (padding-inline-end); a `padding` shorthand here would clobber it. */
+  padding-block: 8px;
+  padding-inline-start: 12px;
+  font-size: var(--t-small);
+}

@@ -1,0 +1,76 @@
+.wrap {
+  position: relative;
+}
+
+.input {
+  width: 100%;
+}
+
+.results {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: var(--bg, #fff);
+  border: 1px solid var(--rule, #ddd);
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 280px;
+  overflow-y: auto;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+}
+
+.item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  border-bottom: 1px solid var(--rule, #eee);
+}
+
+.item:hover,
+.item:focus,
+.itemActive {
+  background: var(--accent-soft, #f3f3f3);
+}
+
+.itemMeta {
+  display: block;
+  font-size: 0.8em;
+  color: var(--muted, #888);
+}
+
+.empty {
+  padding: 8px 12px;
+  color: var(--muted, #888);
+  font-size: 0.85em;
+}
+
+.selected {
+  margin-top: 6px;
+  font-size: 0.9em;
+}
+
+.hiddenField {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
+.clear {
+  margin-left: 8px;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  color: var(--muted, #888);
+  text-decoration: underline;
+}

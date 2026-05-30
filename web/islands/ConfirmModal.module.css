@@ -1,0 +1,45 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.dialog {
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  min-width: 420px;
+  max-width: 90vw;
+  padding: 24px;
+}
+.title {
+  margin: 0 0 12px 0;
+  font-size: 18px;
+}
+.body {
+  margin: 0 0 16px 0;
+}
+.input {
+  width: 100%;
+  font-size: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+.danger {
+  background: #b00020;
+  color: #fff;
+  border-color: #b00020;
+}
+.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}

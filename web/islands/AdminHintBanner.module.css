@@ -1,0 +1,22 @@
+.hint {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--ink);
+  background: var(--paper-2);
+  font-size: 13px;
+  margin: 0 0 var(--admin-gap) 0;
+}
+.close {
+  margin-left: auto;
+  background: transparent;
+  border: 0;
+  font-size: 18px;
+  cursor: pointer;
+  color: var(--muted);
+  line-height: 1;
+}
+.close:hover {
+  color: var(--ink);
+}

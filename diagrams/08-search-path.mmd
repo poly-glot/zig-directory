@@ -1,0 +1,28 @@
+%% Search Path - Mermaid source
+%% Render: hand-crafted SVG (see 08-search-path.svg)
+
+graph TD
+    A["searchLinks(query, limit)<br/><i>operations.zig</i><br/>(mirror flow for searchCategories)"] --> B
+
+    B["Tokenise query<br/><i>inverted.TokenIterator</i><br/>lowercase ASCII alphanumeric, len 2..64"]
+    B --> C{"more query tokens?"}
+
+    C -- "yes" --> D["Build key range<br/><i>lo = token || 0x00*8</i><br/><i>hi = token || 0xFF*8</i>"]
+
+    subgraph "Per-token range scan (on-disk B+Tree)"
+        D --> E["B+Tree rangeScan<br/><i>links_index_tree</i><br/>(no vocabulary scan)"]
+        E --> F["Decode trailing 8 bytes<br/><i>doc_id = readInt big-endian</i>"]
+        F --> G["Append to per-token<br/>id slice (ascending)"]
+    end
+
+    G --> H{"first token?"}
+    H -- "yes" --> I["Seed candidate set<br/><i>candidates := ids</i>"]
+    H -- "no" --> J["AND-intersect<br/><i>candidates ∩ ids</i><br/>two-pointer merge"]
+
+    I --> C
+    J --> K{"candidates empty?"}
+    K -- "yes" --> Z["Return empty slice"]
+    K -- "no" --> C
+
+    C -- "no" --> L["For first `limit` ids:<br/>getLink(db, id)<br/><i>memtable -> links_by_id B+Tree</i>"]
+    L --> M["Return slice of Link structs"]

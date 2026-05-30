@@ -1,0 +1,25 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+*.o
+
+# e2e: track sources, ignore build artefacts + test output
+e2e/node_modules/
+e2e/test-results/
+e2e/screenshots/
+e2e/playwright-report/
+data/feedback/
+feedback/

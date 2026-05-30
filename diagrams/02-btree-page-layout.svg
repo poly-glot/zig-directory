@@ -1,0 +1,61 @@
+<svg id="page-svg" width="100%" xmlns="http://www.w3.org/2000/svg" style="max-width: 500px; background-color: white;" viewBox="0 0 500 520" role="graphics-document document" aria-roledescription="flowchart-v2">
+  <style>
+    #page-svg { font-family: Arial, sans-serif; font-size: 14px; fill: #000; }
+    .box { fill: #fff; stroke: #000; stroke-width: 2px; }
+    .section { fill: #f5f5f5; stroke: #000; stroke-width: 1.5px; }
+    .section-alt { fill: #fff; stroke: #000; stroke-width: 1.5px; }
+    .free { fill: #fff; stroke: #000; stroke-width: 1px; stroke-dasharray: 4,3; }
+    .label { text-anchor: middle; font-size: 14px; fill: #000; font-weight: bold; }
+    .sublabel { text-anchor: middle; font-size: 12px; fill: #555; }
+    .field { text-anchor: start; font-size: 12px; fill: #000; font-family: 'Courier New', monospace; }
+    .field-note { text-anchor: end; font-size: 11px; fill: #666; }
+    .divider { stroke: #000; stroke-width: 1px; stroke-dasharray: 3,3; }
+    .arrow-text { text-anchor: middle; font-size: 11px; fill: #555; }
+    .arrow-line { stroke: #555; stroke-width: 1px; fill: none; }
+  </style>
+
+  <!-- Title -->
+  <text x="250" y="30" text-anchor="middle" font-size="16" font-weight="bold" fill="#000">B+Tree Page Layout (4,096 bytes)</text>
+
+  <!-- Outer box -->
+  <rect x="60" y="50" width="380" height="450" rx="4" class="box"/>
+
+  <!-- Section 1: PageHeader -->
+  <rect x="60" y="50" width="380" height="175" rx="4" class="section"/>
+  <text x="250" y="75" class="label">PageHeader (20 bytes)</text>
+  <line x1="60" y1="85" x2="440" y2="85" class="divider"/>
+  <text x="85" y="108" class="field">page_id           : u32</text>
+  <text x="85" y="128" class="field">right_sibling     : u32</text>
+  <text x="85" y="148" class="field">checksum          : u32</text>
+  <text x="415" y="148" class="field-note">(CRC32)</text>
+  <text x="85" y="168" class="field">key_count         : u16</text>
+  <text x="85" y="188" class="field">free_space_offset : u16</text>
+  <text x="85" y="208" class="field">page_type         : u8</text>
+
+  <!-- Section 2: Slot Array -->
+  <rect x="60" y="225" width="380" height="120" rx="0" class="section-alt"/>
+  <text x="250" y="250" class="label">Slot Array (grows downward)</text>
+  <line x1="60" y1="258" x2="440" y2="258" class="divider"/>
+  <text x="85" y="278" class="field">SlotEntry (8 bytes each):</text>
+  <text x="105" y="298" class="field">key_offset : u16   key_len : u16</text>
+  <text x="105" y="318" class="field">val_offset : u16   val_len : u16</text>
+
+  <!-- Down arrow for slot array -->
+  <line x1="460" y1="240" x2="460" y2="330" class="arrow-line"/>
+  <polygon points="456,325 460,335 464,325" fill="#555"/>
+  <text x="477" y="285" class="arrow-text" text-anchor="start" transform="rotate(90,477,285)">grows</text>
+
+  <!-- Section 3: Free Space -->
+  <rect x="60" y="345" width="380" height="55" rx="0" class="free"/>
+  <text x="250" y="377" class="sublabel">(free space)</text>
+
+  <!-- Section 4: Key/Value Data -->
+  <rect x="60" y="400" width="380" height="100" rx="0" class="section"/>
+  <rect x="60" y="400" width="380" height="100" rx="0" style="fill:#f5f5f5; stroke:#000; stroke-width:1.5px;"/>
+  <text x="250" y="455" class="label">Key/Value data (grows upward)</text>
+
+  <!-- Up arrow for K/V data -->
+  <line x1="460" y1="490" x2="460" y2="410" class="arrow-line"/>
+  <polygon points="456,415 460,405 464,415" fill="#555"/>
+  <text x="477" y="455" class="arrow-text" text-anchor="start" transform="rotate(90,477,455)">grows</text>
+</svg>

@@ -1,0 +1,67 @@
+.bar {
+  display: flex;
+  background: var(--bg);
+}
+
+.inner {
+  display: flex;
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 0 var(--pad-x);
+  overflow-x: auto;
+  height: var(--admin-bar-h);
+  align-items: stretch;
+  gap: 24px;
+}
+
+.tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  color: var(--ink);
+}
+
+.tab:focus-visible {
+  color: var(--ink);
+  outline: 2px solid var(--ink);
+  outline-offset: -2px;
+}
+
+.active {
+  color: var(--ink);
+}
+
+.active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--ink);
+}
+
+.count {
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-left: 6px;
+}
+
+.trailing {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+}

@@ -1,0 +1,368 @@
+/* Button atoms — applied via plain `class="btn"` on <a> and <button>. */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  padding: 14px 24px;
+  border-radius: 999px;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--paper);
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.18s ease;
+}
+.btn:hover {
+  background: var(--hover);
+}
+.btn.ghost {
+  background: transparent;
+  color: var(--ink);
+}
+.btn.ghost:hover {
+  background: var(--ink);
+  color: var(--paper);
+}
+.btn.link {
+  background: transparent;
+  border-color: transparent;
+  padding-left: 0;
+  padding-right: 0;
+  color: var(--ink);
+}
+.btn.link:hover {
+  color: var(--muted);
+  background: transparent;
+}
+.btn.small {
+  padding: 10px 18px;
+  font-size: 11px;
+}
+.btn .arrow {
+  display: inline-block;
+  transition: transform 0.18s ease;
+}
+.btn:hover .arrow {
+  transform: translateX(3px);
+}
+.btn.invert {
+  background: var(--paper);
+  color: var(--ink);
+  border-color: var(--paper);
+}
+.btn.invert:hover {
+  background: #ddd;
+}
+.btn.invert.ghost {
+  background: transparent;
+  color: var(--paper);
+  border-color: var(--paper);
+}
+.btn.invert.ghost:hover {
+  background: var(--paper);
+  color: var(--ink);
+}
+.btn.danger {
+  background: var(--error);
+  border-color: var(--error);
+}
+.btn.danger:hover {
+  background: #8a0019;
+  border-color: #8a0019;
+}
+.btn[disabled],
+.btn:disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* Form atoms — fields used by submit/auth/admin etc. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.field label {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+/* Form-field hint — secondary copy below an input. Scoped to `.hint`
+   (not `.field .hint`) so it works in standalone forms (auth/register). */
+.hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+/* Inline form-error message — block so it sits on its own line under the
+   field/input it describes. Scoped to `.err` (not `.field .err`) because
+   we use it in standalone forms (auth/register) too, not just inside .field. */
+.err {
+  display: block;
+  font-size: 12px;
+  color: var(--error);
+}
+
+.input, .select, .textarea {
+  font-family: inherit;
+  font-size: 15px;
+  padding: 14px 16px;
+  border: 1px solid var(--rule-strong);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 0;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.input:focus, .select:focus, .textarea:focus {
+  border-color: var(--ink);
+}
+/* Selects replace the native OS control with a flat monochrome chevron to match
+   the directory's square, black-on-paper design. appearance:none strips the
+   native widget; the chevron is an inline SVG stroked in --ink. A
+   background-image url() can't read a custom property, so the ink value
+   (#0a0a0a) is inlined here — keep it in sync with --ink. padding-inline-end
+   reserves the arrow gutter; compact selects (toolbars) override only block /
+   inline-start padding, leaving this gutter intact. */
+.select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none' stroke='%230a0a0a' stroke-width='1.5'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  padding-inline-end: 38px;
+  cursor: pointer;
+}
+.input::placeholder, .textarea::placeholder {
+  color: var(--muted-2);
+}
+.textarea {
+  resize: vertical;
+  min-height: 120px;
+  line-height: 1.5;
+}
+
+.checkbox {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  cursor: pointer;
+}
+.checkbox input {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--ink);
+  background: var(--paper);
+  margin-top: 2px;
+  flex: 0 0 16px;
+  cursor: pointer;
+}
+.checkbox input:checked {
+  background: var(--ink);
+}
+.checkbox span {
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+.form-grid {
+  display: grid;
+  gap: 24px;
+}
+.form-grid.two {
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 767px) {
+  .form-grid.two {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Banner atoms — error/success notifications */
+.banner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 16px 20px;
+  border: 1px solid var(--rule-strong);
+  background: var(--paper-2);
+  font-size: 13px;
+  margin-bottom: 24px;
+}
+.banner.error {
+  border-color: var(--error);
+  color: var(--error);
+  background: #fbebee;
+}
+.banner.success {
+  border-color: var(--success);
+  color: var(--success);
+  background: #ecf6ef;
+}
+.banner a {
+  color: inherit;
+  text-decoration: underline;
+}
+
+/* Status dot indicator (admin tables, dashboard role panel) */
+.status-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.status-dot::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink);
+}
+.status-dot.pending::before {
+  background: var(--paper);
+  border: 1px solid var(--ink);
+}
+.status-dot.warn::before {
+  background: var(--muted-2);
+}
+.status-dot.live::before {
+  background: var(--success);
+}
+.status-dot.down::before {
+  background: var(--error);
+}
+.status-dot.editor::before {
+  background: linear-gradient(90deg, var(--ink) 50%, var(--paper) 50%);
+  border: 1px solid var(--ink);
+}
+
+/* Breadcrumb atom */
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--muted);
+  padding-top: 32px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+.crumbs a {
+  color: var(--muted);
+  text-decoration: none;
+}
+.crumbs a:hover {
+  color: var(--ink);
+}
+.crumbs .sep {
+  color: var(--rule-strong);
+}
+.crumbs .here {
+  color: var(--ink);
+}
+
+@media (max-width: 767px) {
+  .crumbs {
+    font-size: 11px;
+  }
+}
+
+/* Pagination atom */
+.pager {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.pager a, .pager span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--rule-strong);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+  background: var(--paper);
+  text-decoration: none;
+}
+.pager a:hover {
+  border-color: var(--ink);
+}
+.pager .active {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+.pager .ellipsis {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+.pager .prev, .pager .next {
+  width: auto;
+  padding: 0 14px;
+}
+
+@media (max-width: 767px) {
+  .pager a, .pager span {
+    width: 32px;
+    height: 32px;
+    font-size: 11px;
+  }
+}
+
+/* Chip atom */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 700;
+  border: 1px solid var(--rule-strong);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink);
+  text-decoration: none;
+}
+.chip.solid {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+.chip.count {
+  color: var(--muted);
+  border-color: var(--rule);
+}
+:where(.section.dark) .chip {
+  background: transparent;
+  color: var(--paper);
+  border-color: #2e2e2e;
+}
+:where(.section.dark) .chip.solid {
+  background: var(--paper);
+  color: var(--ink);
+  border-color: var(--paper);
+}

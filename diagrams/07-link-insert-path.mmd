@@ -1,0 +1,33 @@
+%% Link Insert Path - Mermaid source
+%% Render: hand-crafted SVG (see 07-link-insert-path.svg)
+
+graph TD
+    A["createLink(category_id, url, title, desc)<br/><i>operations.zig</i>"] --> B
+
+    B["Validate category exists<br/><i>getCategory: memtable -> categories_by_id</i>"]
+    B --> C["Allocate link ID<br/><i>atomic fetchAdd (lock-free)</i>"]
+
+    C --> D{"Bloom filter<br/>mayContain(url)?"}
+    D -- "no (99%)" --> G
+    D -- "yes" --> E
+
+    E{"Memtable + link_by_url_hash<br/>exact URL match?"}
+    E -- "duplicate" --> X["Return DuplicateUrl"]
+    E -- "unique" --> G
+
+    G["computeLinkInsertChangeSet<br/><i>operations.zig</i>"]
+    G --> H["db.commit(ChangeSet)<br/><i>database.zig</i>"]
+
+    H --> W["Encode + append to WAL<br/><i>CRC32 + sequence number</i>"]
+    H --> AP["apply.applyLinkInserted<br/><i>apply.zig</i>"]
+
+    subgraph "Memtable writes (in-memory)"
+        AP --> M1["mt_links_by_id<br/><i>id -> Link struct</i>"]
+        AP --> M2["mt_link_by_category<br/><i>(cat_id, link_id) -> id</i>"]
+        AP --> M3["mt_link_by_url_hash<br/><i>hash(url) -> id</i>"]
+        AP --> M4["mt_links_index_tree<br/><i>token || id_be -> empty</i>"]
+    end
+
+    M1 --> P["Add URL to bloom filter"]
+    P --> Q["Cascade ancestor link_count_subtree"]
+    Q --> R["Return link ID"]

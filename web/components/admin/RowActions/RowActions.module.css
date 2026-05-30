@@ -1,0 +1,35 @@
+.cluster {
+  display: inline-flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Plain-text action link/button inside a row. Replaces the rounded
+   .btn pills which read as too heavy in tabular contexts. */
+:global(.text-action) {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--link);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+:global(.text-action:hover) {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+
+:global(.text-action.danger) {
+  color: var(--error);
+}
+
+:global(.text-action.danger:hover) {
+  color: var(--error);
+}

@@ -1,0 +1,60 @@
+.panel {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  padding: 24px;
+}
+.trending {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 24px;
+}
+.trending .label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/*
+ * Plain text links — no pill background, no border, no caps. The
+ * `chip` global class was a button-shaped affordance that read as
+ * filterable tags; these are just shortcuts into search.
+ */
+.trendLink {
+  color: var(--link);
+  text-decoration: none;
+  font-size: 13px;
+}
+.trendLink:hover {
+  color: var(--link-hover);
+  text-decoration: underline;
+}
+.stats {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.statCell {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--rule);
+  gap: 16px;
+}
+.statCell:last-child {
+  border-bottom: 0;
+}
+.statValue {
+  font-weight: 700;
+  font-size: 22px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.divider {
+  height: 1px;
+  background: var(--rule);
+  border: 0;
+  margin: 24px 0;
+}

@@ -1,0 +1,20 @@
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  /* No border-top: the table's last row already draws a full-bleed bottom
+     rule directly above. Adding an inset container-width border here just
+     stacked a second, conflicting line under it. */
+  padding: 16px 0;
+}
+.range {
+  color: var(--muted);
+  font-size: 13px;
+}
+.spacer {
+  flex: 1;
+}
+.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}

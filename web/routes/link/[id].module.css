@@ -1,0 +1,14 @@
+.shell {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 80px;
+  align-items: start;
+  padding: 32px 0 64px;
+}
+
+@media (max-width: 1023px) {
+  .shell {
+    grid-template-columns: 1fr;
+    gap: 32px;
+  }
+}

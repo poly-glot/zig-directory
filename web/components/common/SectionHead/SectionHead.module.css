@@ -1,0 +1,29 @@
+.head {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 56px;
+  align-items: start;
+  margin-bottom: 56px;
+}
+.label .num {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--muted);
+}
+.label .micro {
+  color: var(--muted);
+  display: inline-block;
+  margin-top: 8px;
+}
+.head h2 {
+  max-width: 18ch;
+}
+
+@media (max-width: 1023px) {
+  .head {
+    grid-template-columns: 1fr;
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+}

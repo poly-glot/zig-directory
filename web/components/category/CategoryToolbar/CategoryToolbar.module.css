@@ -1,0 +1,30 @@
+.toolbar {
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  padding: 16px 0;
+  margin-top: 32px;
+}
+.densitySeg {
+  display: inline-flex;
+  border: 1px solid var(--rule-strong);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.sortLabel {
+  align-self: center;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.sortSelect {
+  width: auto;
+  /* Block/inline-start only — the global .select owns the arrow gutter
+     (padding-inline-end); a `padding` shorthand here would clobber it. */
+  padding-block: 8px;
+  padding-inline-start: 12px;
+  font-size: var(--t-small);
+}
+.summary {
+  align-self: center;
+}

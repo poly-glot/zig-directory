@@ -1,0 +1,54 @@
+.aside {
+  border: 1px solid var(--rule);
+  padding: 32px;
+}
+.kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 16px;
+}
+.kv:last-child {
+  margin-bottom: 0;
+}
+.kv .label {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--muted);
+}
+.kv .value {
+  font-size: 13px;
+  color: var(--ink);
+}
+.actions {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0 0;
+}
+.actions li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  padding: 12px 0;
+  border-top: 1px solid var(--rule);
+}
+.actions li:last-child {
+  border-bottom: 1px solid var(--rule);
+}
+.actions a {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-decoration: none;
+}
+.actions a:hover {
+  color: var(--muted);
+}
+.actions .arrow {
+  font-size: 13px;
+  color: var(--muted);
+}

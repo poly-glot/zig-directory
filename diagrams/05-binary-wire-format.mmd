@@ -1,0 +1,30 @@
+%% Binary Wire Format - Mermaid source
+%% This diagram is best rendered as the hand-crafted SVG (05-binary-wire-format.svg)
+%% since Mermaid doesn't natively support byte-level protocol diagrams.
+%%
+%% Request Frame:
+%%   [4B len LE][1B op][1B flags][2B count LE][payload...]
+%%
+%% Response Frame:
+%%   [4B len LE][1B op][1B status][2B count LE][payload...]
+%%
+%% Header = 8 bytes. len includes header. All integers little-endian.
+%% Pipelining: multiple frames back-to-back on same persistent connection.
+%%
+%% Op Codes:
+%%    1 create_link         7 update_category    12 list_children
+%%    2 create_category     8 move_category      13 list_links
+%%    3 get_link            9 update_link        14 search
+%%    4 get_category       10 list_root_cats     15 stats
+%%    5 delete_link        11 browse_path       255 ping
+%%    6 delete_category
+%%
+%% Status Codes:
+%%    0 ok                  3 invalid             6 has_children
+%%    1 not_found           4 err                 7 circular
+%%    2 duplicate           5 category_not_found
+
+graph LR
+    subgraph "Request Frame (8-byte header + payload)"
+        A["len<br/>4B LE"] --> B["op<br/>1B"] --> C["flags<br/>1B"] --> D["count<br/>2B LE"] --> E["payload..."]
+    end

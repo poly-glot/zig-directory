@@ -1,0 +1,57 @@
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-top: 24px;
+}
+
+.table thead th {
+  text-align: left;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 700;
+  padding: 16px 12px;
+  vertical-align: bottom;
+}
+
+.table tbody td {
+  padding: 20px 12px;
+  vertical-align: top;
+}
+
+/*
+ * Full-bleed row rules: each row's bottom rule extends to the viewport
+ * edges. The 100vw line is centered with `left:50%; translateX(-50%)`,
+ * which only spans the viewport when its positioned anchor is itself
+ * centered on the page. The container is centered (`margin:0 auto`), so
+ * the anchor must be a full-container-width element — the ROW.
+ *
+ * Previously this anchored to the first <td>; once that became a narrow
+ * checkbox cell at the far left, the line's center sat near the left edge
+ * and it reached only ~halfway across. Anchoring to <tr> (same idea as
+ * ListRow's `.list-bleed-borders .row`) fixes it.
+ */
+.bleed thead tr,
+.bleed tbody tr {
+  position: relative;
+}
+.bleed thead tr::after,
+.bleed tbody tr::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 100vw;
+  height: 1px;
+  background: var(--rule);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 32px 12px;
+}

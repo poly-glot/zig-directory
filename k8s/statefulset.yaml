@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dmozdb
+  namespace: dmozdb
+spec:
+  serviceName: dmozdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dmozdb
+  template:
+    metadata:
+      labels:
+        app: dmozdb
+    spec:
+      containers:
+        - name: dmozdb
+          image: dmozdb:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: DMOZDB_PORT
+              value: "8080"
+            - name: DMOZDB_BIND
+              value: "0.0.0.0"
+            # - name: DMOZDB_TRUSTED
+            #   value: "10.0.0.0"  # Set to the frontend / load balancer IP
+            - name: DMOZDB_DATA_DIR
+              value: /var/lib/dmozdb
+            - name: DMOZDB_CACHE_SIZE_MB
+              value: "256"
+            - name: DMOZDB_THREAD_COUNT
+              value: "4"
+            - name: DMOZDB_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dmozdb-secrets
+                  key: admin-api-key
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/dmozdb
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
