@@ -158,6 +158,22 @@
   transform: translateX(3px);
 }
 
+/* Rightmost utility icon: links to the source repo. Inherits the header's
+   text color via currentColor (so it flips on the inverted header too). */
+.github {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+.invert .github {
+  color: var(--paper);
+}
+.github:hover {
+  color: var(--muted);
+}
+
 @media (max-width: 767px) {
   .wrap {
     grid-template-columns: auto auto;
