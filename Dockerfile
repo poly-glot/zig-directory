@@ -35,7 +35,7 @@ COPY src/ src/
 RUN zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 
 # ── Stage 2: build the Deno/Fresh web frontend ─────────────
-FROM denoland/deno:2.5.6 AS web-builder
+FROM denoland/deno:2.8.1 AS web-builder
 
 WORKDIR /web
 
@@ -49,7 +49,7 @@ COPY web/ ./
 RUN deno task build
 
 # ── Stage 3: runtime ───────────────────────────────────────
-FROM denoland/deno:2.5.6
+FROM denoland/deno:2.8.1
 
 WORKDIR /web
 
