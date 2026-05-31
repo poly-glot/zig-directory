@@ -6,7 +6,7 @@ echo "=== Dmoz Zig Development Container Setup ==="
 # Install system packages
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
-  curl wget jq htop xz-utils wrk
+  curl wget jq htop xz-utils unzip wrk
 
 # Install Zig 0.15.2
 ZIG_VERSION="0.15.2"
