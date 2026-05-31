@@ -21,6 +21,10 @@ pkill -f "zig-out/bin/dmozdb" 2>/dev/null || true
 pkill -f "vite" 2>/dev/null || true
 pkill -f "_fresh/server.js" 2>/dev/null || true
 
+# Seed the directory DB and the user store if they aren't already present
+# (idempotent). Runs while the servers are stopped so nothing holds the files.
+bash "$SCRIPT_DIR/seed.sh"
+
 echo "[run:$MODE] Building dmozdb (ReleaseSafe)..."
 zig build -Doptimize=ReleaseSafe
 
