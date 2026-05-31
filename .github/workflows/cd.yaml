@@ -1,0 +1,113 @@
+name: "Build and Deploy"
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+env:
+  OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+  OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+  OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+  OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+  OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+
+jobs:
+  ci:
+    # Native arm64 runner (free for public repos): the image compiles the Zig
+    # backend and runs a Vite build, both of which crawl under QEMU emulation.
+    # The OKE nodes are Ampere A1 (arm64), so this also matches the target arch.
+    runs-on: ubuntu-24.04-arm
+    name: Build & Push Docker Image
+    outputs:
+      REPO_PATH: ${{ steps.get-ocir-repository.outputs.repo_path }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get or create an OCIR Repository
+        uses: oracle-actions/get-ocir-repository@v1.2.1
+        id: get-ocir-repository
+        with:
+          name: zig-directory
+          compartment: ${{ secrets.OCI_COMPARTMENT_OCID }}
+
+      - name: Log into OCIR
+        uses: oracle-actions/login-ocir@v1.2.1
+        id: login-ocir
+        with:
+          auth_token: ${{ secrets.OCI_AUTH_TOKEN }}
+
+      # One combined image: the Zig backend and the Deno/Fresh frontend. The
+      # OKE nodes are Ampere A1 (arm64), so the build targets linux/arm64.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.sha }}"
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  cd:
+    needs: ci
+    runs-on: ubuntu-24.04
+    name: Deploy
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Configure Kubectl
+        uses: oracle-actions/configure-kubectl-oke@v1.5.0
+        id: configure-kubectl
+        with:
+          cluster: ${{ secrets.OCI_OKE_CLUSTER_OCID }}
+
+      - name: Create namespace and image-pull secret
+        run: |
+          NAMESPACE="dmozdb"
+
+          # Create the namespace and label it so the ClusterSecret operator
+          # keeps the OCIR pull secret (ocirsecret) in sync here.
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace "$NAMESPACE" registry=oci --overwrite
+
+          # Copy ocirsecret now so the first image pull does not race the
+          # operator's reconcile loop. ownerReferences are stripped so the
+          # copy is not garbage-collected with a foreign owner.
+          kubectl get secret ocirsecret --namespace=default -o json \
+            | jq 'del(.metadata.namespace,.metadata.resourceVersion,.metadata.uid,.metadata.creationTimestamp,.metadata.annotations,.metadata.ownerReferences)' \
+            | kubectl apply --namespace="$NAMESPACE" -f - || true
+
+      - name: Deploy
+        env:
+          REPO_PATH: ${{ needs.ci.outputs.REPO_PATH }}
+          SHA: ${{ github.sha }}
+        run: |
+          cd deployment/overlays/main
+
+          kustomize edit set image dmozdb=$REPO_PATH:$SHA
+
+          # Record the resolved tag back to the branch — best-effort only. A
+          # re-run of an already-deployed SHA produces no diff (empty commit
+          # would exit non-zero and, under `bash -e`, abort the step), and a
+          # protected branch would reject the push; neither must block the
+          # deploy. Stage only the kustomization so nothing else is swept in.
+          git config --global user.name "@poly-glot-bot"
+          git config --global user.email "poly-glot-bot@users.noreply.github.com"
+          git add kustomization.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "feat: Update deployment image tag to $SHA [skip ci]"
+            git push || echo "::warning::tag-bump push failed (branch protected?); continuing to apply"
+          fi
+
+          # The actual deploy — always runs regardless of the bookkeeping above.
+          kubectl apply -k .

@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dmozdb
+spec:
+  serviceName: dmozdb
+  # Single writer: the backend owns one on-disk database. Scaling out is a
+  # protocol/replication change, not a replica bump.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dmozdb
+  template:
+    metadata:
+      labels:
+        app: dmozdb
+    spec:
+      # Kubernetes injects legacy service-link env vars for every Service in the
+      # namespace; the Service named "dmozdb" would set DMOZDB_PORT=tcp://<ip>:8000,
+      # clobbering the backend's own DMOZDB_PORT and breaking both processes. The
+      # app talks over loopback and uses no service-link vars, so disable them.
+      enableServiceLinks: false
+      containers:
+        - name: dmozdb
+          image: dmozdb:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          # The frontend reaches the loopback backend via these; set explicitly
+          # (not just in the image ENV) so they are authoritative in the pod.
+          # DMOZDB_BIND=127.0.0.1 and the data paths stay fixed in the image ENV.
+          env:
+            - name: DMOZDB_HOST
+              value: "127.0.0.1"
+            - name: DMOZDB_PORT
+              value: "8080"
+            - name: DMOZDB_CACHE_SIZE_MB
+              value: "256"
+            - name: DMOZDB_THREAD_COUNT
+              value: "4"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/dmozdb
+            - name: web-kv
+              mountPath: /var/lib/web-kv
+          # All probes hit the web frontend's /healthz, which also TCP-checks
+          # the loopback backend — so a dead backend fails liveness and
+          # restarts the whole pod (the entrypoint relaunches both).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+    - metadata:
+        name: web-kv
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

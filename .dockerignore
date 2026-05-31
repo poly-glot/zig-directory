@@ -1,0 +1,28 @@
+# Build artifacts — the image rebuilds these from source.
+zig-out/
+zig-cache/
+.zig-cache/
+**/.zig-cache/
+web/_fresh/
+web/node_modules/
+node_modules/
+
+# Runtime database state — never bake stale data into the image; it is
+# served from mounted volumes at runtime.
+data/
+web/data/
+
+# VCS, editor, OS, docs, and local tooling not needed for the build.
+.git/
+.github/
+.idea/
+.vscode/
+.devcontainer/
+.claude/
+bench/
+diagrams/
+e2e/
+k8s/
+deployment/
+*.md
+.DS_Store

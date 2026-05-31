@@ -23,3 +23,15 @@ e2e/screenshots/
 e2e/playwright-report/
 data/feedback/
 feedback/
+
+# Runtime database state — regenerated at runtime, must never ship in the
+# repo or image. The compressed seed dataset (data/dmozdb.dat.zip) is the
+# one intentionally-tracked file under data/.
+data/dmozdb.dat
+data/wal.bin
+data/*.hdr
+data/*.hdr.bak
+data/snapshot.meta
+# Web Deno KV (admin users + sessions). Dev-only path; prod uses KV_PATH on a
+# mounted volume.
+web/data/

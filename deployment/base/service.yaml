@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dmozdb
+  labels:
+    app: dmozdb
+spec:
+  type: ClusterIP
+  selector:
+    app: dmozdb
+  ports:
+    # Only the web frontend is exposed; the backend stays on pod-local
+    # loopback and has no Service.
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http

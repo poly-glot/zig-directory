@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+namespace: dmozdb
+
+patches:
+  - path: statefulset.yaml
+  - path: ingress.yaml
+
+# The CD pipeline rewrites newTag to the built image's commit SHA via
+# `kustomize edit set image dmozdb=<repo>:<sha>` before applying.
+images:
+  - name: dmozdb
+    newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
+    newTag: latest

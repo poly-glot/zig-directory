@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dmozdb
+spec:
+  rules:
+    - host: directory.local.junaid.guru
+      http:
+        paths:
+          - pathType: Prefix
+            path: /
+            backend:
+              service:
+                name: dmozdb
+                port:
+                  number: 8000
