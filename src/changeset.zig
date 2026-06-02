@@ -24,8 +24,8 @@ pub const TokenField = enum(u8) { title = 0, url = 1, desc = 2, name = 3, slug =
 
 pub const AncestorUpdate = struct {
     cat_id: u64,
-    new_link_count_subtree: u64,
-    new_child_count_subtree: u32,
+    link_count_subtree_delta: i64,
+    child_count_subtree_delta: i64,
 };
 
 pub const SlugPathSwap = struct {
@@ -34,9 +34,6 @@ pub const SlugPathSwap = struct {
     cat_id: u64,
 };
 
-/// Inline payload of the ChangeSet rename/move effects when the
-/// subtree exceeds the threshold and the cleanup is deferred to the
-/// repair_worker. `seq == 0` is the sentinel for "no enqueue".
 pub const EnqueueOnApply = struct {
     seq: u64 = 0,
     op: types.RepairOp = .renamed_slug,
@@ -61,11 +58,10 @@ pub const LinkTextUpdateEffect = struct {
     new_link: types.Link,
     old_tokens: []const Token,
     new_tokens: []const Token,
-    // Counts unchanged on a text edit (category_id is unchanged)
 };
 
 pub const LinkRecatEffect = struct {
-    link: types.Link, // post-recat (new category_id)
+    link: types.Link,
     old_category_id: u64,
     old_chain_updates: []const AncestorUpdate,
     new_chain_updates: []const AncestorUpdate,
@@ -75,8 +71,8 @@ pub const CategoryInsertEffect = struct {
     cat: types.Category,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
-    slug_path: []const u8, // canonical full path
-    is_shallowest_for_slug: bool, // controls slug_only insert
+    slug_path: []const u8,
+    is_shallowest_for_slug: bool,
 };
 
 pub const CategoryDeleteEffect = struct {
@@ -95,47 +91,34 @@ pub const CategoryTextUpdateEffect = struct {
 
 pub const CategoryRenameEffect = struct {
     old_cat: types.Category,
-    new_cat: types.Category, // updated slug
+    new_cat: types.Category,
     old_slug_path: []const u8,
     new_slug_path: []const u8,
-    /// Old/new slug-path pairs for every descendant. Empty when
-    /// above_threshold (cleanup deferred to repair_worker).
     descendant_swaps: []const SlugPathSwap,
     above_threshold: bool,
-    /// Sentinel-encoded: enqueue.seq == 0 means no queue write.
     enqueue: EnqueueOnApply,
 };
 
 pub const CategoryMoveEffect = struct {
-    cat: types.Category, // post-move state
+    cat: types.Category,
     old_parent_id: u64,
     new_parent_id: u64,
     old_chain_updates: []const AncestorUpdate,
     new_chain_updates: []const AncestorUpdate,
     old_slug_path: []const u8,
     new_slug_path: []const u8,
-    link_subtree_delta: u64, // for logging / verification
+    link_subtree_delta: u64,
     child_subtree_delta: u32,
-    /// Old/new slug-path pairs for every descendant. Empty when
-    /// above_threshold (cleanup deferred to repair_worker).
     descendant_swaps: []const SlugPathSwap,
     above_threshold: bool,
-    /// Sentinel-encoded: enqueue.seq == 0 means no queue write.
     enqueue: EnqueueOnApply,
 };
 
-/// Emitted by the background repair_worker. Carries one chunk of
-/// descendant slug-path swaps for a queued task. Multiple chunks may
-/// be emitted per task, each in its own commit, so per-chunk progress
-/// is WAL-durable.
 pub const SlugPathRepairChunkEffect = struct {
     task_seq: u64,
     swaps: []const SlugPathSwap,
 };
 
-/// Emitted by the worker after the final chunk completes; deletes the
-/// queue entry by seq. Sharing a commit with the final chunk effect is
-/// an optional optimisation deferred to a follow-up.
 pub const RepairTaskCompleteEffect = struct {
     seq: u64,
 };
@@ -165,20 +148,10 @@ pub const DecodeError = error{
     BufferTooShort,
     UnknownOpTag,
     UnsupportedSchemaVersion,
-    InvalidTokenField,
-    InvalidLinkSize,
-    InvalidCategorySize,
+    InvalidEnumValue,
     OutOfMemory,
 };
 
-// `union(Op)` already enforces tag/variant name parity at compile time.
-// The wire format is driven from struct field layout: the field order in
-// each *Effect struct above IS the order of bytes on disk. Re-ordering
-// fields breaks WAL replay — guarded by the round-trip tests below.
-
-/// Encode a ChangeSet to a freshly-allocated byte buffer.
-/// Format: [1B version][1B op_tag][payload bytes]
-/// Caller frees the returned slice.
 pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(allocator);
@@ -195,8 +168,6 @@ pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
     return try buf.toOwnedSlice(allocator);
 }
 
-/// Decode a byte buffer to a ChangeSet. The returned ChangeSet's
-/// variable-length fields (slices) are allocated from `arena`.
 pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
     if (bytes.len < 2) return DecodeError.BufferTooShort;
     if (bytes[0] != SCHEMA_VERSION) return DecodeError.UnsupportedSchemaVersion;
@@ -209,19 +180,8 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
             return @unionInit(ChangeSet, uf.name, variant);
         }
     }
-    unreachable; // tag is a valid Op, so one branch always matches
+    unreachable;
 }
-
-// ── Comptime field codec ──
-//
-// Wire format per type:
-//   integer    → big-endian, fixed width
-//   bool       → 1 byte (0 / 1)
-//   enum       → 1 byte tag
-//   extern T   → @sizeOf(T) raw bytes (POD memcpy)
-//   struct T   → fields encoded in declaration order
-//   []u8       → [u32 BE len][bytes]
-//   []T (T≠u8) → [u32 BE len][T encoded × len]
 
 fn encodeStruct(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
     inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |f| {
@@ -281,7 +241,7 @@ fn decodeField(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cu
         },
         .@"enum" => {
             if (cur.* >= bytes.len) return DecodeError.BufferTooShort;
-            const v = std.meta.intToEnum(T, bytes[cur.*]) catch return DecodeError.InvalidTokenField;
+            const v = std.meta.intToEnum(T, bytes[cur.*]) catch return DecodeError.InvalidEnumValue;
             cur.* += 1;
             return v;
         },
@@ -302,6 +262,7 @@ fn decodeField(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cu
                 cur.* += n;
                 return out;
             }
+            if (n > bytes.len - cur.*) return DecodeError.BufferTooShort;
             const out = try arena.alloc(p.child, n);
             for (out) |*item| item.* = try decodeField(arena, p.child, bytes, cur);
             return out;
@@ -332,8 +293,8 @@ test "encode/decode roundtrip — link_inserted" {
         .updated_at = 1000,
     };
     const ancestors = try arena_alloc.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 7, .new_link_count_subtree = 1, .new_child_count_subtree = 0 },
-        .{ .cat_id = 1, .new_link_count_subtree = 1, .new_child_count_subtree = 1 },
+        .{ .cat_id = 7, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
+        .{ .cat_id = 1, .link_count_subtree_delta = 1, .child_count_subtree_delta = 1 },
     });
     const tokens = try arena_alloc.dupe(Token, &.{
         .{ .text = try arena_alloc.dupe(u8, "example"), .field = .title },
@@ -369,7 +330,7 @@ test "encode/decode roundtrip — link_deleted" {
 
     const link = types.Link{ .id = 99, .category_id = 5 };
     const ancestors = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 5, .new_link_count_subtree = 0, .new_child_count_subtree = 0 },
+        .{ .cat_id = 5, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
     const tokens = try a.dupe(Token, &.{
         .{ .text = try a.dupe(u8, "gone"), .field = .title },
@@ -428,11 +389,11 @@ test "encode/decode roundtrip — link_recategorized" {
 
     const link = types.Link{ .id = 7, .category_id = 22 };
     const old_chain = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 5, .new_link_count_subtree = 3, .new_child_count_subtree = 1 },
+        .{ .cat_id = 5, .link_count_subtree_delta = 3, .child_count_subtree_delta = 1 },
     });
     const new_chain = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 22, .new_link_count_subtree = 1, .new_child_count_subtree = 0 },
-        .{ .cat_id = 1, .new_link_count_subtree = 5, .new_child_count_subtree = 2 },
+        .{ .cat_id = 22, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
+        .{ .cat_id = 1, .link_count_subtree_delta = 5, .child_count_subtree_delta = 2 },
     });
     const cs = ChangeSet{ .link_recategorized = .{
         .link = link,
@@ -468,7 +429,7 @@ test "encode/decode roundtrip — category_inserted" {
         .slug = types.FixedString(128).fromSlice("books"),
     };
     const ancestors = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 1, .new_link_count_subtree = 0, .new_child_count_subtree = 1 },
+        .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
     });
     const tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "books"), .field = .slug }});
     const cs = ChangeSet{ .category_inserted = .{
@@ -501,7 +462,7 @@ test "encode/decode roundtrip — category_deleted" {
 
     const cat = types.Category{ .id = 60, .parent_id = 1 };
     const ancestors = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 1, .new_link_count_subtree = 0, .new_child_count_subtree = 0 },
+        .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
     const tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .name }});
     const cs = ChangeSet{ .category_deleted = .{
@@ -594,11 +555,11 @@ test "encode/decode roundtrip — category_moved" {
 
     const cat = types.Category{ .id = 90, .parent_id = 200 };
     const old_chain = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 100, .new_link_count_subtree = 4, .new_child_count_subtree = 2 },
+        .{ .cat_id = 100, .link_count_subtree_delta = 4, .child_count_subtree_delta = 2 },
     });
     const new_chain = try a.dupe(AncestorUpdate, &.{
-        .{ .cat_id = 200, .new_link_count_subtree = 7, .new_child_count_subtree = 3 },
-        .{ .cat_id = 1, .new_link_count_subtree = 11, .new_child_count_subtree = 5 },
+        .{ .cat_id = 200, .link_count_subtree_delta = 7, .child_count_subtree_delta = 3 },
+        .{ .cat_id = 1, .link_count_subtree_delta = 11, .child_count_subtree_delta = 5 },
     });
     const cs = ChangeSet{ .category_moved = .{
         .cat = cat,
@@ -737,4 +698,22 @@ test "encode/decode roundtrip — slug_path_repair_complete" {
     const decoded = try decode(arena2.allocator(), encoded);
     try std.testing.expectEqual(Op.slug_path_repair_complete, std.meta.activeTag(decoded));
     try std.testing.expectEqual(@as(u64, 99), decoded.slug_path_repair_complete.seq);
+}
+
+fn fuzzDecodeOne(_: void, input: []const u8) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    _ = decode(arena.allocator(), input) catch {};
+}
+
+test "fuzz: changeset.decode tolerates arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzDecodeOne, .{
+        .corpus = &.{
+            &.{},
+            &.{SCHEMA_VERSION},
+            &.{ SCHEMA_VERSION, @intFromEnum(Op.link_inserted) },
+            &.{ SCHEMA_VERSION, @intFromEnum(Op.category_renamed) },
+            &.{ SCHEMA_VERSION, @intFromEnum(Op.category_renamed), 0xFF, 0xFF, 0xFF, 0xFF },
+        },
+    });
 }

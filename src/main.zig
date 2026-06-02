@@ -1,7 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
 
-// Module imports
 pub const page = @import("page.zig");
 pub const file_header = @import("file_header.zig");
 pub const btree = @import("btree/btree.zig");
@@ -28,35 +27,31 @@ const EpollServer = epoll_server.EpollServer;
 
 const log = std.log.scoped(.dmozdb);
 
-/// Server configuration loaded from environment variables.
 pub const Config = struct {
     port: u16 = 8080,
     data_dir: []const u8 = "/var/lib/dmozdb",
     cache_size_mb: u32 = 256,
-    thread_count: u32 = 0, // 0 = auto-detect (CPU count)
+    thread_count: u32 = 0,
     snapshot_interval_s: u32 = 300,
     wal_sync_interval_ms: u32 = 50,
     wal_batch_size: u32 = 256,
-    rename_inline_threshold: u32 = 5000, // subtree size flipping rename/move from in-line strict to queued async repair
-    repair_worker_interval_ms: u32 = 1000, // interval between repair_worker ticks
-    repair_worker_chunk_size: u32 = 10000, // descendants per worker chunk before yielding slug-path tree lock
-    repair_worker_max_tasks_per_tick: u32 = 1, // tasks pulled from queue per tick (predictable on 1 CPU / 2 GB)
-    subtree_scan_threshold: u32 = 1024, // descendant count above which list_subtree_links uses the sequential scan; below it uses per-descendant rangescans
+    rename_inline_threshold: u32 = 5000,
+    repair_worker_interval_ms: u32 = 1000,
+    repair_worker_chunk_size: u32 = 10000,
+    repair_worker_max_tasks_per_tick: u32 = 1,
+    subtree_scan_threshold: u32 = 1024,
     bind_address: [4]u8 = .{ 127, 0, 0, 1 },
     trusted_ips: [MAX_TRUSTED_IPS][4]u8 = undefined,
     trusted_count: u8 = 0,
 
     const MAX_TRUSTED_IPS = 16;
 
-    /// Load configuration from environment variables.
     pub fn fromEnv() Config {
         var config = Config{};
         if (std.posix.getenv("DMOZDB_PORT")) |v| {
             config.port = std.fmt.parseInt(u16, v, 10) catch 8080;
         }
         if (std.posix.getenv("DMOZDB_DATA_DIR")) |v| {
-            // getenv returns a slice into the process environment block,
-            // which is stable for the lifetime of the process — no copy needed.
             config.data_dir = v;
         }
         if (std.posix.getenv("DMOZDB_CACHE_SIZE_MB")) |v| {
@@ -96,10 +91,6 @@ pub const Config = struct {
         return config;
     }
 
-    /// Parse a comma separated list of IPv4 addresses into trusted_ips.
-    /// Logs and ignores any token that fails to parse, and any token past
-    /// MAX_TRUSTED_IPS — silent acceptance of misconfiguration would be
-    /// worse than a startup warning.
     fn parseTrustedIps(self: *Config, raw: []const u8) void {
         var count: u8 = 0;
         var rest = raw;
@@ -124,8 +115,6 @@ pub const Config = struct {
         self.trusted_count = count;
     }
 
-    /// Returns true if the given IPv4 address is allowed to connect.
-    /// Loopback (127.x.x.x) is always permitted.
     pub fn isAllowed(self: *const Config, addr: [4]u8) bool {
         if (addr[0] == 127) return true;
         for (self.trusted_ips[0..self.trusted_count]) |trusted| {
@@ -134,14 +123,11 @@ pub const Config = struct {
         return false;
     }
 
-    /// Returns true if protected mode is active: bind is non-loopback
-    /// and no trusted IPs are configured.
     pub fn isProtectedMode(self: *const Config) bool {
         return self.bind_address[0] != 127 and self.trusted_count == 0;
     }
 };
 
-/// Parse a dotted decimal IPv4 string into four octets.
 fn parseIpv4(s: []const u8) ?[4]u8 {
     var octets: [4]u8 = undefined;
     var idx: u8 = 0;
@@ -307,16 +293,13 @@ test "Config.isAllowed with trusted IPs" {
 }
 
 test "Config.isProtectedMode" {
-    // Default: bind 127.0.0.1, no trusted = not protected (loopback is safe)
     const default_config = Config{};
     try std.testing.expect(!default_config.isProtectedMode());
 
-    // Bind 0.0.0.0, no trusted = protected mode
     var wildcard = Config{};
     wildcard.bind_address = .{ 0, 0, 0, 0 };
     try std.testing.expect(wildcard.isProtectedMode());
 
-    // Bind 0.0.0.0, with trusted = not protected (operator configured it)
     var configured = Config{};
     configured.bind_address = .{ 0, 0, 0, 0 };
     configured.trusted_ips[0] = .{ 10, 0, 0, 5 };

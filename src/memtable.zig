@@ -2,15 +2,6 @@ const std = @import("std");
 
 const log = std.log.scoped(.memtable);
 
-/// Sharded in-memory write buffer that sits in front of a B+Tree.
-///
-/// 32 independent shards, each with its own mutex and hash map.
-/// Keys are distributed across shards by hash, so concurrent writers
-/// to different keys rarely contend. This is the same principle as
-/// the page cache's 64-shard design.
-///
-/// Each shard is double-buffered: front absorbs writes, back is
-/// drained to the B+Tree by the background flusher.
 pub const NUM_SHARDS = 32;
 
 pub const MemTable = struct {
@@ -120,10 +111,6 @@ pub const MemTable = struct {
         return total;
     }
 
-    /// Swap all shards' front/back. Called by the flusher under its own
-    /// coordination. Returns pointers to the back buffers for draining.
-    /// Caller must lock each shard before calling swapShard, or use
-    /// swapAllLocked.
     pub fn lockAll(self: *MemTable) void {
         for (&self.shards) |*s| s.lock.lock();
     }
@@ -223,7 +210,6 @@ test "MemTable swap and drain" {
     try mt.put("b", "2");
     try std.testing.expectEqual(@as(u32, 2), mt.count());
 
-    // Swap all shards.
     mt.lockAll();
     var total_back: u32 = 0;
     for (0..NUM_SHARDS) |i| {

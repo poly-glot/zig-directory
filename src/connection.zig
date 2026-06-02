@@ -2,18 +2,14 @@ const std = @import("std");
 const posix = std.posix;
 
 pub const Phase = enum(u8) {
-    /// Slot is unused.
     empty,
-    /// Reading data from the client socket.
     reading_request,
-    /// Sending the response back to the client.
     writing_response,
 };
 
 pub const REQUEST_BUF_SIZE = 65536;
 pub const RESPONSE_BUF_SIZE = 262144;
 
-/// I/O buffers acquired from a pool — only active connections hold one.
 pub const BufferPair = struct {
     request_buf: [REQUEST_BUF_SIZE]u8 = undefined,
     response_buf: [RESPONSE_BUF_SIZE]u8 = undefined,
@@ -27,9 +23,8 @@ pub const Connection = struct {
     bytes_written: usize = 0,
     response_len: usize = 0,
     last_activity: i64 = 0,
+    armed_for_write: bool = false,
 
-    /// Reset the connection state for reuse.
-    /// The caller must release the buffer back to the pool before calling this.
     pub fn reset(self: *Connection) void {
         self.fd = -1;
         self.phase = .empty;
@@ -38,15 +33,13 @@ pub const Connection = struct {
         self.bytes_written = 0;
         self.response_len = 0;
         self.last_activity = 0;
+        self.armed_for_write = false;
     }
 
-    /// Returns true if this connection slot is in use.
     pub fn isActive(self: *const Connection) bool {
         return self.phase != .empty;
     }
 
-    /// Attempt to write the next chunk of the response to the socket.
-    /// Returns true when the entire response has been written.
     pub fn writeChunk(self: *Connection) !bool {
         if (self.bytes_written >= self.response_len) return true;
 

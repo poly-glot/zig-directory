@@ -1,11 +1,3 @@
-// Search operations split from the original monolithic operations.zig.
-// Public surface:
-//   - searchCategories : tokenised AND-search over `categories_index_tree`
-//   - searchLinks      : tokenised AND-search over `links_index_tree`
-//
-// Internal helpers (`searchTreeByToken`, `searchViaIndexTree`) stay
-// private to this file — no other operations_* file references them.
-
 const std = @import("std");
 const types = @import("../types.zig");
 const Database = @import("../database.zig").Database;
@@ -16,9 +8,6 @@ const shared = @import("operations_shared.zig");
 
 const log = shared.log;
 
-/// Search categories by name, slug, or description.
-/// Tokenises the query and intersects per-token posting lists from
-/// `db.categories_index_tree`. AND semantics for multi-token queries.
 pub fn searchCategories(
     db: *Database,
     query: []const u8,
@@ -36,9 +25,6 @@ pub fn searchCategories(
     );
 }
 
-/// Search links by title, URL, or description.
-/// Tokenises the query and intersects per-token posting lists from
-/// `db.links_index_tree`. AND semantics for multi-token queries.
 pub fn searchLinks(
     db: *Database,
     query: []const u8,
@@ -56,9 +42,6 @@ pub fn searchLinks(
     );
 }
 
-/// Range-scan `tree` for all entries whose key is `(token || doc_id_be)`,
-/// returning the decoded doc-id set as an owned, ascending-sorted slice.
-/// The caller owns the returned memory and must free it with `allocator`.
 fn searchTreeByToken(
     tree: *@import("../btree/btree.zig").BPlusTree,
     token: []const u8,
@@ -74,11 +57,6 @@ fn searchTreeByToken(
     @memcpy(key_hi_buf[0..token.len], token);
     @memset(key_hi_buf[token.len..][0..8], 0xFF);
 
-    // RangeScanIterator treats `end_key` as exclusive (key < end_key stops),
-    // so adding one to the upper bound (or using a sentinel above the max
-    // doc_id) would skip the doc_id == max_u64 case. In practice doc_ids
-    // never reach max_u64; the exclusive bound at (token||0xFF*8) means we
-    // miss only that single hypothetical id, an acceptable trade-off.
     var iter = try tree.rangeScan(
         key_lo_buf[0 .. token.len + 8],
         key_hi_buf[0 .. token.len + 8],
@@ -88,9 +66,6 @@ fn searchTreeByToken(
     errdefer ids.deinit(allocator);
 
     while (try iter.next()) |kv| {
-        // Defensive: rangeScan can include keys with the same prefix when
-        // the iterator walks past the exclusive upper bound on a leaf
-        // boundary. Stop as soon as the prefix no longer matches.
         if (kv.key.len != token.len + 8) continue;
         if (!std.mem.eql(u8, kv.key[0..token.len], token)) break;
         const id = std.mem.readInt(u64, kv.key[token.len..][0..8], .big);
@@ -100,9 +75,6 @@ fn searchTreeByToken(
     return try ids.toOwnedSlice(allocator);
 }
 
-/// Generic index-tree-backed search: tokenise the query, range-scan the
-/// posting list for each token, AND-intersect across tokens, then
-/// hydrate the first `limit` matches via the provided getter.
 fn searchViaIndexTree(
     comptime T: type,
     db: *Database,
@@ -115,18 +87,9 @@ fn searchViaIndexTree(
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     if (max == 0) return buf[0..0];
 
-    // Tokenise the query the same way documents are tokenised at index
-    // time (lowercase ASCII alphanumeric runs of length [MIN_TOKEN_LEN,
-    // MAX_TOKEN_LEN]). Tokens shorter than MIN_TOKEN_LEN are dropped by
-    // TokenIterator, which mirrors the indexing pipeline.
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     var iter = inverted.TokenIterator.init(query);
 
-    // First token seeds the candidate set; each subsequent token
-    // intersects against it (AND semantics). `candidates_full` retains
-    // the full original allocation (so allocator.free sees the exact
-    // length it was given), while `candidates_len` tracks the live
-    // prefix shrunk by intersection.
     var candidates_full: ?[]u64 = null;
     var candidates_len: usize = 0;
     defer if (candidates_full) |c| db.allocator.free(c);
@@ -146,8 +109,6 @@ fn searchViaIndexTree(
         }
         defer db.allocator.free(ids);
 
-        // Intersect candidates ∩ ids in place. Both slices are produced
-        // by ascending range scans, so a two-pointer merge is O(n+m).
         const cur = candidates_full.?[0..candidates_len];
         var write: usize = 0;
         var i: usize = 0;
@@ -212,9 +173,6 @@ test "search: B+Tree-backed category search finds tokenised name" {
     var buf: [8]types.Category = undefined;
     const hits = try searchCategories(db, "computers", 8, &buf);
 
-    // Both "Top" (whose slug "top" doesn't match) and "Computers" share no
-    // tokens with the query except via "Computers" itself — only cat_id
-    // should appear.
     var found = false;
     for (hits) |c| if (c.id == cat_id) {
         found = true;
@@ -230,14 +188,12 @@ test "search: multi-token query AND-intersects per-token posting lists" {
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    // l1 contains both "alpha" and "beta"; l2 contains only "alpha".
     const l1 = try link_mod.createLink(db, top_id, "https://example.com/1", "Alpha Beta", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/2", "Alpha Only", "");
 
     var buf: [8]types.Link = undefined;
     const hits = try searchLinks(db, "alpha beta", 8, &buf);
 
-    // AND semantics: only l1 satisfies both tokens.
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(l1, hits[0].id);
 }
@@ -273,7 +229,6 @@ test "search: shared token \"test\" returns both docs in ascending id order" {
     var buf: [8]types.Link = undefined;
     const hits = try searchLinks(db, "test", 8, &buf);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
-    // Stable ordering: ids ascend.
     try std.testing.expect(hits[0].id < hits[1].id);
     try std.testing.expectEqual(a, hits[0].id);
     try std.testing.expectEqual(b, hits[1].id);
