@@ -1,20 +1,3 @@
-// Auto-emit the TS protocol layer from the Zig source of truth.
-//
-// Runs at build time via `zig build gen-client-ts`. Reads protocol.Op +
-// Status + SubStatus enums and types.Category + types.Link extern
-// struct layouts through @typeInfo, then writes a TS file that the
-// hand-maintained client imports.
-//
-// What this file removes the need to hand-maintain:
-//   - the Op number enum drift between Zig and TS
-//   - the Status / SubStatus enums (and their *_MSG maps)
-//   - CATEGORY_SIZE / LINK_SIZE constants
-//   - readCategory / readLink struct readers (which used to have hand-
-//     rolled r.skip(2) / r.skip(7) padding-byte skips that broke every
-//     time a new field landed in the Zig extern struct)
-//
-// Output: web/lib/dmoz-protocol.gen.ts.
-
 const std = @import("std");
 const protocol = @import("binary_protocol.zig");
 const types = @import("types.zig");
@@ -28,7 +11,7 @@ pub fn main() !void {
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
-    _ = args.next(); // executable name
+    _ = args.next();
     const out_path = args.next() orelse "web/lib/dmoz-protocol.gen.ts";
 
     var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
@@ -135,7 +118,6 @@ fn writeLinkStatusEnum(w: anytype) !void {
 fn isFixedString(comptime T: type) ?FixedStringMeta {
     const info = @typeInfo(T);
     if (info != .@"struct" or info.@"struct".layout != .@"extern") return null;
-    // FixedString(N) has fields { data: [N]u8, len: u16 }.
     const fields = info.@"struct".fields;
     if (fields.len != 2) return null;
     if (!std.mem.eql(u8, fields[0].name, "data")) return null;
@@ -167,9 +149,6 @@ fn writeStructInterface(w: anytype, comptime name: []const u8, comptime T: type)
 
 fn writeStructReader(w: anytype, comptime name: []const u8, comptime T: type) !void {
     try w.print("export function read{s}(r: BufferReader): {s} {{\n", .{ name, name });
-    // First pass: emit reads, tracking cursor offset so we can emit
-    // r.skip() for any alignment padding bytes the Zig compiler insets
-    // between fields.
     var cursor: usize = 0;
     inline for (@typeInfo(T).@"struct".fields) |f| {
         const target = @offsetOf(T, f.name);
@@ -190,7 +169,6 @@ fn writeStructReader(w: anytype, comptime name: []const u8, comptime T: type) !v
             cursor += @sizeOf(f.type);
             continue;
         }
-        // Primitive integer / timestamp / status byte.
         const reader = comptime primitiveReader(f.type, f.name);
         try w.print(
             "    const {s} = {s};\n",
@@ -198,13 +176,9 @@ fn writeStructReader(w: anytype, comptime name: []const u8, comptime T: type) !v
         );
         cursor += @sizeOf(f.type);
     }
-    // Tail padding to @sizeOf(T) — if a trailing _pad field doesn't
-    // already cover it, the alignment-gap pass above will have, but
-    // be defensive in case Zig adds tail padding the field list misses.
     if (cursor < @sizeOf(T)) {
         try w.print("    r.skip({d}); // tail padding to @sizeOf({s})\n", .{ @sizeOf(T) - cursor, name });
     }
-    // Emit the return object — collect the fields we read into a TS object.
     try w.writeAll("    return {\n");
     inline for (@typeInfo(T).@"struct".fields) |f| {
         if (comptime std.mem.startsWith(u8, f.name, "_pad")) continue;
@@ -217,8 +191,6 @@ fn writeStructReader(w: anytype, comptime name: []const u8, comptime T: type) !v
 
 fn primitiveReader(comptime T: type, comptime field_name: []const u8) []const u8 {
     if (T == u8) {
-        // The `status` field carries a LinkStatus enum value; wrap so the
-        // TS caller gets the string variant instead of the raw byte.
         if (comptime std.mem.eql(u8, field_name, "status")) return "linkStatusFromByte(r.u8())";
         return "r.u8()";
     }
@@ -226,7 +198,6 @@ fn primitiveReader(comptime T: type, comptime field_name: []const u8) []const u8
     if (T == u32) return "r.u32()";
     if (T == u64) return "r.u64()";
     if (T == i64) {
-        // The Zig schema uses i64 unix-seconds for created_at/updated_at.
         if (comptime std.mem.eql(u8, field_name, "created_at") or std.mem.eql(u8, field_name, "updated_at")) {
             return "r.timestamp()";
         }

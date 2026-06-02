@@ -1,15 +1,8 @@
 const std = @import("std");
 const wal = @import("wal.zig");
 
-/// Largest plausible per-entry payload during replay. Anything bigger is
-/// either batch padding (PAD_BYTE = 0xFF yields data_len = 0xFFFF_FFFF)
-/// or genuine corruption.
 const MAX_REPLAY_DATA_LEN: usize = 16 * 1024 * 1024;
 
-/// I/O block size used by the O_DIRECT write path in `wal.zig`. Must match
-/// `wal.zig:BLOCK_SIZE` — when the reader hits PAD_BYTE padding at the
-/// tail of a batch it jumps to the next block boundary, where the next
-/// batch's first entry starts.
 const BLOCK_SIZE: usize = 4096;
 
 pub const ReplayEntry = struct {
@@ -20,12 +13,14 @@ pub const ReplayEntry = struct {
 
 pub const WalReader = struct {
     file: std.fs.File,
-    buf: [65536]u8 = undefined,
+    buf: []u8,
     buf_len: usize = 0,
     pos: usize = 0,
     file_pos: u64 = 0,
 
-    /// Opens wal.bin for reading. Returns null if file doesn't exist.
+    const INITIAL_BUF_LEN: usize = 65536;
+    const MAX_BUF_LEN: usize = MAX_REPLAY_DATA_LEN + wal.HEADER_SIZE;
+
     pub fn init(dir: []const u8) !?WalReader {
         const path = try std.fs.path.join(std.heap.page_allocator, &.{ dir, "wal.bin" });
         defer std.heap.page_allocator.free(path);
@@ -34,38 +29,28 @@ pub const WalReader = struct {
             error.FileNotFound => return null,
             else => return err,
         };
+        errdefer file.close();
 
+        const buf = try std.heap.page_allocator.alloc(u8, INITIAL_BUF_LEN);
         return WalReader{
             .file = file,
+            .buf = buf,
         };
     }
 
-    /// Read next WAL entry. Returns null at EOF.
-    /// Validates CRC32 checksum. Stops replay on corrupted entries (torn writes).
     pub fn next(self: *WalReader) !?ReplayEntry {
         const header_size = wal.HEADER_SIZE;
 
         while (true) {
-            // Ensure we have enough buffered data for a header
             try self.ensureBuffered(header_size);
-            if (self.available() < header_size) return null; // EOF
+            if (self.available() < header_size) return null;
 
-            // Copy header into aligned local to avoid alignment issues
             var header_aligned: wal.WalEntryHeader align(@alignOf(wal.WalEntryHeader)) = undefined;
             const dst: *[header_size]u8 = @ptrCast(&header_aligned);
             @memcpy(dst, self.buf[self.pos..][0..header_size]);
 
-            // sequence == 0 means zero-filled preallocated tail or a
-            // kernel-zeroed torn block. There is no more valid WAL
-            // beyond this point — even within subsequent blocks, since
-            // fallocate yields zero blocks and no later batch ever wrote
-            // past this offset. Stop.
             if (header_aligned.sequence == 0) return null;
 
-            // data_len > MAX_REPLAY_DATA_LEN is the signature of
-            // PAD_BYTE (0xFF) padding written at the tail of an O_DIRECT
-            // batch to round up to BLOCK_SIZE. The NEXT batch starts at
-            // the next block boundary, so jump there and re-attempt.
             if (header_aligned.data_len > MAX_REPLAY_DATA_LEN) {
                 if (!try self.skipToNextBlock()) return null;
                 continue;
@@ -74,23 +59,18 @@ pub const WalReader = struct {
             const data_len: usize = header_aligned.data_len;
             const total_entry_size = header_size + data_len;
 
-            // Ensure we have the full entry buffered
-            if (total_entry_size > self.buf.len) return null; // exceeds buffer
             try self.ensureBuffered(total_entry_size);
-            if (self.available() < total_entry_size) return null; // Truncated entry (torn write)
+            if (self.available() < total_entry_size) return null;
 
             const data = self.buf[self.pos + header_size ..][0..data_len];
 
-            // Validate CRC32 checksum
             const computed_crc = std.hash.crc.Crc32.hash(data);
             if (computed_crc != header_aligned.checksum) {
-                // Checksum mismatch — assume torn write, stop replay
                 return null;
             }
 
-            // Validate op_code is a known enum value; invalid values indicate corruption.
             const op_code: wal.OpCode = std.meta.intToEnum(wal.OpCode, header_aligned.op_code) catch {
-                return null; // Unknown op code — treat as corruption, stop replay
+                return null;
             };
 
             const entry = ReplayEntry{
@@ -106,14 +86,6 @@ pub const WalReader = struct {
         }
     }
 
-    /// Jump to the next BLOCK_SIZE boundary in the file. Returns false
-    /// (signals end of WAL) if the next block boundary is at or past EOF.
-    /// Used to skip per-batch PAD_BYTE padding at the tail of an O_DIRECT
-    /// batch so the reader can continue into the next batch's records.
-    ///
-    /// Invariant relied upon: `buf[self.pos]` is at file offset
-    /// `self.file_pos` (see how next() updates both in lockstep), so the
-    /// current logical read offset is exactly `self.file_pos`.
     fn skipToNextBlock(self: *WalReader) !bool {
         const next_block: u64 = std.mem.alignForward(u64, self.file_pos + 1, BLOCK_SIZE);
 
@@ -121,7 +93,6 @@ pub const WalReader = struct {
         if (next_block >= end_pos) return false;
 
         try self.file.seekTo(next_block);
-        // Reset buffer state — anything we had is now stale.
         self.buf_len = 0;
         self.pos = 0;
         self.file_pos = next_block;
@@ -129,6 +100,7 @@ pub const WalReader = struct {
     }
 
     pub fn close(self: *WalReader) void {
+        std.heap.page_allocator.free(self.buf);
         self.file.close();
     }
 
@@ -139,7 +111,13 @@ pub const WalReader = struct {
     fn ensureBuffered(self: *WalReader, needed: usize) !void {
         if (self.available() >= needed) return;
 
-        // Move remaining bytes to front of buffer
+        if (needed > self.buf.len) {
+            const want = @min(@max(needed, self.buf.len *| 2), MAX_BUF_LEN);
+            if (want >= needed) {
+                self.buf = try std.heap.page_allocator.realloc(self.buf, want);
+            }
+        }
+
         const remaining = self.available();
         if (remaining > 0) {
             std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[self.pos..self.buf_len]);
@@ -147,17 +125,15 @@ pub const WalReader = struct {
         self.buf_len = remaining;
         self.pos = 0;
 
-        // Read more data from file
-        const space = self.buf.len - self.buf_len;
-        if (space > 0) {
+        while (self.buf_len < self.buf.len) {
             const n = try self.file.read(self.buf[self.buf_len..]);
+            if (n == 0) break;
             self.buf_len += n;
+            if (self.buf_len >= needed) break;
         }
     }
 };
 
-/// Opens WAL, reads entries, calls callback for each entry with sequence > min_sequence.
-/// Returns the last sequence number replayed.
 pub fn replayWal(dir: []const u8, min_sequence: u64, callback: anytype) !u64 {
     comptime {
         if (!@hasDecl(@TypeOf(callback.*), "apply")) {
@@ -186,7 +162,6 @@ test "write and read back WAL entries" {
     std.fs.makeDirAbsolute(tmp_dir) catch {};
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
-    // Write entries
     {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
@@ -197,7 +172,6 @@ test "write and read back WAL entries" {
         try writer.sync();
     }
 
-    // Read back and verify
     {
         var reader = (try WalReader.init(tmp_dir)).?;
         defer reader.close();
@@ -217,7 +191,6 @@ test "write and read back WAL entries" {
         try std.testing.expectEqual(wal.OpCode.changeset, e3.op_code);
         try std.testing.expectEqualSlices(u8, "updated-category", e3.data);
 
-        // EOF — next call should return null
         const e4_opt = try reader.next();
         try std.testing.expect(e4_opt == null);
     }
@@ -234,7 +207,6 @@ test "replay with min_sequence filter" {
     std.fs.makeDirAbsolute(tmp_dir) catch {};
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
-    // Write entries
     {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
@@ -246,7 +218,6 @@ test "replay with min_sequence filter" {
         try writer.sync();
     }
 
-    // Replay with min_sequence=2, should only process entries 3 and 4
     const Collector = struct {
         count: usize = 0,
 
@@ -268,7 +239,6 @@ test "corrupted entry stops replay" {
     std.fs.makeDirAbsolute(tmp_dir) catch {};
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
-    // Write valid entries
     {
         var writer = try wal.WalWriter.init(std.testing.allocator, tmp_dir, 32);
         defer writer.deinit();
@@ -277,7 +247,6 @@ test "corrupted entry stops replay" {
         try writer.sync();
     }
 
-    // Corrupt the file by appending garbage
     {
         const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
         defer std.testing.allocator.free(path);
@@ -288,19 +257,17 @@ test "corrupted entry stops replay" {
         const end = try file.getEndPos();
         try file.seekTo(end);
 
-        // Write a header with bad checksum
         const bad_header = wal.WalEntryHeader{
             .sequence = 99,
             .op_code = @intFromEnum(wal.OpCode.changeset),
             .data_len = 5,
-            .checksum = 0xDEADBEEF, // wrong checksum
+            .checksum = 0xDEADBEEF,
         };
         const header_bytes: *const [wal.HEADER_SIZE]u8 = @ptrCast(&bad_header);
         try file.writeAll(header_bytes);
         try file.writeAll("hello");
     }
 
-    // Read: should get first entry, then stop at corrupt one
     {
         var reader = (try WalReader.init(tmp_dir)).?;
         defer reader.close();
@@ -309,7 +276,6 @@ test "corrupted entry stops replay" {
         try std.testing.expectEqual(@as(u64, 1), e1.sequence);
         try std.testing.expectEqualSlices(u8, "valid-entry", e1.data);
 
-        // Corrupted entry should return null
         const e2 = try reader.next();
         try std.testing.expect(e2 == null);
     }
@@ -332,7 +298,6 @@ test "wal_replay: empty WAL replays cleanly" {
     std.fs.makeDirAbsolute(tmp_dir) catch {};
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
-    // Create an empty wal.bin
     const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
     defer std.testing.allocator.free(path);
     const f = try std.fs.cwd().createFile(path, .{});
@@ -418,14 +383,6 @@ test "wal_replay: torn tail discards partial entry without error" {
         try writer.sync();
     }
 
-    // Truncate the file so entry 10 is incomplete. With O_DIRECT the
-    // file extends to PREALLOC_SIZE, so "chop 5 bytes from end" lands in
-    // preallocated tail, not entry data. Chop to an explicit offset
-    // partway through entry 10 instead.
-    //
-    // Each "row-N" entry = HEADER_SIZE (24) + 5 bytes data = 29 bytes.
-    // Entry 10 starts at offset 9 * 29 = 261; truncating to 261 + 5
-    // leaves a partial header for entry 10 (less than HEADER_SIZE).
     {
         const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
         defer std.testing.allocator.free(path);
@@ -436,7 +393,6 @@ test "wal_replay: torn tail discards partial entry without error" {
 
     var collector = TestCollector{};
     const last = try replayWal(tmp_dir, 0, &collector);
-    // Last entry truncated -> 9 entries replay.
     try std.testing.expectEqual(@as(usize, 9), collector.count);
     try std.testing.expectEqual(@as(u64, 9), last);
 }
@@ -473,10 +429,6 @@ test "wal_replay: oversized entry terminates replay cleanly" {
     std.fs.makeDirAbsolute(tmp_dir) catch {};
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
-    // Write a header with data_len > MAX_REPLAY_DATA_LEN (16 MiB). This
-    // shape also matches what the O_DIRECT batch padding (PAD_BYTE=0xFF)
-    // produces (data_len = 0xFFFF_FFFF). The reader treats it as
-    // end-of-WAL and returns null — no error, no infinite allocation.
     const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_dir, "wal.bin" });
     defer std.testing.allocator.free(path);
     const f = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
@@ -485,7 +437,7 @@ test "wal_replay: oversized entry terminates replay cleanly" {
     const bogus_header = wal.WalEntryHeader{
         .sequence = 1,
         .op_code = @intFromEnum(wal.OpCode.changeset),
-        .data_len = 100 * 1024 * 1024, // > MAX_REPLAY_DATA_LEN
+        .data_len = 100 * 1024 * 1024,
         .checksum = 0,
     };
     const header_bytes: *const [wal.HEADER_SIZE]u8 = @ptrCast(&bogus_header);
@@ -494,4 +446,36 @@ test "wal_replay: oversized entry terminates replay cleanly" {
     var reader = (try WalReader.init(tmp_dir)).?;
     defer reader.close();
     try std.testing.expectEqual(@as(?ReplayEntry, null), try reader.next());
+}
+
+const FuzzNoopApplier = struct {
+    pub fn apply(self: *FuzzNoopApplier, entry: ReplayEntry) !void {
+        _ = self;
+        _ = entry;
+    }
+};
+
+fn fuzzWalReaderOne(_: void, input: []const u8) anyerror!void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("wal.bin", .{});
+        defer f.close();
+        try f.writeAll(input);
+    }
+    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_path);
+
+    var applier = FuzzNoopApplier{};
+    _ = replayWal(dir_path, 0, &applier) catch {};
+}
+
+test "fuzz: WAL reader tolerates arbitrary file bytes" {
+    try std.testing.fuzz({}, fuzzWalReaderOne, .{
+        .corpus = &.{
+            &.{},
+            &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 },
+            &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF },
+        },
+    });
 }

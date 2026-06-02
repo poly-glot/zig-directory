@@ -1,6 +1,3 @@
-// Slug-path repair effect handlers split out of apply.zig. The repair
-// worker emits these effects to drain large rename/move tasks in chunks.
-
 const std = @import("std");
 const types = @import("../types.zig");
 const changeset = @import("../changeset.zig");
@@ -26,7 +23,6 @@ test "applySlugPathRepairChunk: applies swaps to categories_by_slug_path" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Seed: an entry exists at "old/path".
     var v: [8]u8 = types.encodeU64(123);
     try db.categories_by_slug_path.insert("old/path", &v);
 
@@ -54,7 +50,6 @@ test "applySlugPathRepairComplete: deletes queue entry by seq" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Seed a queue entry directly.
     var task = types.RepairTask{ .cat_id = 99, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);

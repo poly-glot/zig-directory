@@ -1,30 +1,8 @@
-// Lock-free log-linear latency histogram for the server hot path.
-//
-// Adapted from `bench/common.zig`'s per-worker `Histogram`: same
-// 32-octave × 64-sub-bucket layout, but every counter is a
-// `std.atomic.Value(u64)` so multiple reactor threads can record
-// concurrently without coordination. Each `recordValue` is one or
-// two `fetchAdd`s on the shared counters (~50–100 ns), small
-// enough to leave on the dispatch hot path.
-//
-// The bench's per-worker copy stays scalar — no thread-safety
-// requirement there — and we deliberately do not consolidate the
-// two: the atomic flavour pays a ~10× cost per record vs. the
-// scalar one and is unnecessary for the bench's worker-private
-// histograms.
-
 const std = @import("std");
 
 const NUM_OCTAVES: usize = 32;
 const SUB_BUCKETS: usize = 64;
 
-/// Atomic-bucket histogram. Total memory: ~16 KB per instance
-/// (32 × 64 × 8 byte counters + scalar fields).
-///
-/// All atomic counters default to zero — `std.atomic.Value(u64)` is
-/// just a `u64` wrapper, so a flat zero-init at struct level is the
-/// correct (and cheapest) initialiser. An explicit nested `init(0)`
-/// loop trips the comptime branch quota for the 2048-entry array.
 pub const AtomicHistogram = struct {
     buckets: [NUM_OCTAVES][SUB_BUCKETS]std.atomic.Value(u64) =
         @splat(@splat(std.atomic.Value(u64).init(0))),
@@ -36,9 +14,6 @@ pub const AtomicHistogram = struct {
         _ = self.total_count.fetchAdd(1, .monotonic);
         _ = self.sum.fetchAdd(ns, .monotonic);
 
-        // Update max_recorded with a CAS retry. Falling behind by one
-        // record under contention is acceptable — the percentile path
-        // doesn't depend on max being exact.
         while (true) {
             const cur = self.max_recorded.load(.monotonic);
             if (ns <= cur) break;
@@ -96,7 +71,7 @@ test "AtomicHistogram: percentile resolution within 2% of true value" {
     var h: AtomicHistogram = .{};
     var i: u64 = 0;
     while (i < 1000) : (i += 1) {
-        h.recordValue(1_000 + i * 1_000); // 1us..1ms in 1us steps
+        h.recordValue(1_000 + i * 1_000);
     }
     const p50 = h.percentile(50.0);
     try std.testing.expect(p50 > 490_000 and p50 < 510_000);
@@ -132,6 +107,5 @@ test "AtomicHistogram: concurrent recordValue from multiple threads" {
     t3.join();
 
     try std.testing.expectEqual(@as(u64, 3_000), h.samples());
-    // No record was lost; max is at least the last value.
     try std.testing.expect(h.maxValue() >= 3_999);
 }

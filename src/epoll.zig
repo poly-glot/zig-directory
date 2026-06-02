@@ -12,11 +12,8 @@ const log = std.log.scoped(.epoll);
 pub const MAX_CONNECTIONS = 4096;
 const MAX_EVENTS = 64;
 
-/// Number of I/O buffer pairs kept in the pool.
-/// Only connections actively reading or writing hold a buffer.
 pub const BUFFER_POOL_SIZE: u16 = 256;
 
-/// Connection idle timeout in seconds.
 const CONNECTION_TIMEOUT_S: i64 = 30;
 
 pub const EpollServer = struct {
@@ -27,28 +24,21 @@ pub const EpollServer = struct {
     listen_fd: posix.fd_t,
     connections: [MAX_CONNECTIONS]conn_mod.Connection,
 
-    // O(1) fd -> slot index mapping. Only accessed by the epoll thread.
     fd_to_slot: std.AutoHashMap(posix.fd_t, u16),
 
-    // O(1) free connection slot stack. Only accessed by the epoll thread.
     free_slot_stack: []u16,
     free_slot_count: u32,
 
-    // Buffer pool — avoids large upfront allocation.
     buffer_pairs: []conn_mod.BufferPair,
     free_stack: []u16,
     free_count: u32,
     buf_pool_size: u32,
 
-    // Binary connections with pending responses — written in a batch after
-    // all readable events are processed (Redis-style event loop).
     binary_write_fds: [MAX_CONNECTIONS]posix.fd_t = undefined,
     binary_write_count: u32 = 0,
 
     const Self = @This();
 
-    /// Create N reactors. Each reactor has its own listen socket (SO_REUSEPORT),
-    /// epoll fd, and connections. Kernel distributes incoming connections.
     pub fn createMulti(allocator: std.mem.Allocator, db: *Database, config: Config, count: u32) ![]*Self {
         const reactors = try allocator.alloc(*Self, count);
         errdefer allocator.free(reactors);
@@ -63,7 +53,6 @@ pub const EpollServer = struct {
     }
 
     fn createOne(allocator: std.mem.Allocator, db: *Database, config: Config, register_shutdown: bool) !*Self {
-        // 1. Create binary protocol listen socket (non-blocking).
         const listen_fd = try posix.socket(
             posix.AF.INET,
             @as(u32, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC),
@@ -71,29 +60,23 @@ pub const EpollServer = struct {
         );
         errdefer posix.close(listen_fd);
 
-        // 2. Set SO_REUSEADDR and SO_REUSEPORT.
         try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
         try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
 
-        // 3. Bind to configured address (default 127.0.0.1).
         const addr = std.net.Address.initIp4(config.bind_address, config.port);
         try posix.bind(listen_fd, &addr.any, addr.getOsSockLen());
 
-        // 4. Listen with backlog 4096.
         try posix.listen(listen_fd, 4096);
 
-        // 5. Create epoll instance.
         const epoll_fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         errdefer posix.close(epoll_fd);
 
-        // 6. Register listen socket.
         var listen_event = linux.epoll_event{
             .events = linux.EPOLL.IN,
             .data = .{ .fd = listen_fd },
         };
         try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &listen_event);
 
-        // 7. Register signal shutdown pipe — only on primary reactor.
         if (register_shutdown) {
             const shutdown_fd = signal.getShutdownPipeFd();
             if (shutdown_fd != -1) {
@@ -105,18 +88,15 @@ pub const EpollServer = struct {
             }
         }
 
-        // 8. Allocate buffer pool.
         const buf_pool_size: u32 = @max(BUFFER_POOL_SIZE, config.thread_count * 64);
         const buffer_pairs = try allocator.alloc(conn_mod.BufferPair, buf_pool_size);
         errdefer allocator.free(buffer_pairs);
         const buf_free_stack = try allocator.alloc(u16, buf_pool_size);
         errdefer allocator.free(buf_free_stack);
 
-        // 9. Allocate free connection slot stack.
         const slot_stack = try allocator.alloc(u16, MAX_CONNECTIONS);
         errdefer allocator.free(slot_stack);
 
-        // 10. Heap-allocate the server.
         const server = try allocator.create(Self);
         errdefer allocator.destroy(server);
 
@@ -132,18 +112,15 @@ pub const EpollServer = struct {
         server.free_slot_stack = slot_stack;
         server.binary_write_count = 0;
 
-        // Initialize all connections as empty.
         for (&server.connections) |*c| {
             c.* = conn_mod.Connection{};
         }
 
-        // Initialize free connection slot stack.
         server.free_slot_count = MAX_CONNECTIONS;
         for (0..MAX_CONNECTIONS) |i| {
             server.free_slot_stack[i] = @intCast(i);
         }
 
-        // Initialize buffer free stack.
         server.free_count = buf_pool_size;
         for (0..buf_pool_size) |i| {
             server.free_stack[i] = @intCast(i);
@@ -151,7 +128,7 @@ pub const EpollServer = struct {
 
         log.info("Listening on {d}.{d}.{d}.{d}:{d} (epoll fd={d}, listen fd={d}, buffer pool={d})", .{
             config.bind_address[0], config.bind_address[1], config.bind_address[2], config.bind_address[3],
-            config.port,            epoll_fd,               listen_fd,              BUFFER_POOL_SIZE,
+            config.port,            epoll_fd,               listen_fd,              buf_pool_size,
         });
 
         if (config.isProtectedMode()) {
@@ -162,7 +139,6 @@ pub const EpollServer = struct {
         return server;
     }
 
-    /// Release all resources.
     pub fn destroy(self: *Self) void {
         for (&self.connections) |*c| {
             if (c.isActive() and c.fd != -1) {
@@ -184,9 +160,6 @@ pub const EpollServer = struct {
         allocator.destroy(self);
     }
 
-    /// Main event loop — two-pass Redis-style design.
-    ///   Pass 1: read + parse + execute for all connections.
-    ///   Pass 2: flush all pending responses.
     pub fn run(self: *Self) !void {
         var events: [MAX_EVENTS]linux.epoll_event = undefined;
         const shutdown_fd = signal.getShutdownPipeFd();
@@ -199,7 +172,6 @@ pub const EpollServer = struct {
             self.binary_write_count = 0;
             var got_shutdown = false;
 
-            // Pass 1: accepts, reads, system events.
             for (events[0..n]) |ev| {
                 const fd = ev.data.fd;
 
@@ -215,10 +187,8 @@ pub const EpollServer = struct {
             }
             if (got_shutdown) break;
 
-            // Pass 2: flush all pending binary responses.
             self.flushBinaryWrites();
 
-            // Sweep idle connections for timeout enforcement.
             self.sweepIdleConnections();
         }
 
@@ -228,7 +198,6 @@ pub const EpollServer = struct {
         };
     }
 
-    /// Accept one or more pending connections.
     fn acceptConnection(self: *Self) void {
         while (true) {
             var peer_addr: posix.sockaddr = undefined;
@@ -239,10 +208,6 @@ pub const EpollServer = struct {
                 return;
             };
 
-            // Defense-in-depth: only accept IPv4. The listen socket is
-            // created with AF_INET, so any other family here would
-            // indicate a misconfiguration; the previous check skipped
-            // the allowlist for unknown families instead of rejecting.
             if (peer_addr.family != posix.AF.INET) {
                 log.warn("Rejected connection: unexpected address family {d}", .{peer_addr.family});
                 posix.close(client_fd);
@@ -277,7 +242,6 @@ pub const EpollServer = struct {
     }
 
     fn setupConnection(self: *Self, client_fd: posix.fd_t, slot: *conn_mod.Connection, slot_idx: u16) void {
-        // Disable Nagle for low-latency small frames.
         posix.setsockopt(client_fd, posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
         const bp = self.acquireBuffer() orelse {
@@ -300,7 +264,6 @@ pub const EpollServer = struct {
             return;
         };
 
-        // Register with epoll for reading.
         var ev = linux.epoll_event{
             .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.HUP | linux.EPOLL.ERR,
             .data = .{ .fd = client_fd },
@@ -326,56 +289,22 @@ pub const EpollServer = struct {
             return;
         }
 
-        // Readable — edge-triggered: must drain all available data.
         if (events & linux.EPOLL.IN != 0 and conn.phase == .reading_request) {
             conn.last_activity = std.time.timestamp();
-            const bp = conn.buf orelse {
-                self.closeConnection(fd);
-                return;
-            };
-
-            while (true) {
-                const remaining = bp.request_buf[conn.bytes_read..];
-                if (remaining.len == 0) {
-                    log.warn("Request buffer full for fd={d}, closing", .{fd});
-                    self.closeConnection(fd);
-                    return;
-                }
-
-                const n = posix.read(fd, remaining) catch |err| {
-                    if (err == error.WouldBlock) break;
-                    self.closeConnection(fd);
-                    return;
-                };
-
-                if (n == 0) {
-                    self.closeConnection(fd);
-                    return;
-                }
-
-                conn.bytes_read += n;
-
-                // Process all complete frames inline (Redis model).
-                if (conn.bytes_read >= binary_protocol.HEADER_SIZE) {
-                    binary_protocol.processFrames(self.db, conn);
-                    if (conn.response_len > 0) {
-                        conn.bytes_written = 0;
-                        conn.phase = .writing_response;
-                        self.binary_write_fds[self.binary_write_count] = fd;
-                        self.binary_write_count += 1;
-                        return;
-                    }
-                }
+            if (self.drainAndProcess(fd, conn)) return;
+            if (conn.response_len > 0) {
+                conn.bytes_written = 0;
+                conn.phase = .writing_response;
+                self.binary_write_fds[self.binary_write_count] = fd;
+                self.binary_write_count += 1;
             }
         }
 
-        // Writable — only fires for connections that hit WouldBlock during flush.
         if (events & linux.EPOLL.OUT != 0 and conn.phase == .writing_response) {
             self.finishBinaryWrite(fd, conn);
         }
     }
 
-    /// Flush all pending binary responses in one pass.
     fn flushBinaryWrites(self: *Self) void {
         for (self.binary_write_fds[0..self.binary_write_count]) |fd| {
             const conn = self.findConnection(fd) orelse continue;
@@ -385,26 +314,71 @@ pub const EpollServer = struct {
         self.binary_write_count = 0;
     }
 
-    /// Write a binary connection's response and transition back to reading.
-    fn finishBinaryWrite(self: *Self, fd: posix.fd_t, conn: *conn_mod.Connection) void {
-        var done = false;
-        while (!done) {
-            done = conn.writeChunk() catch {
+    fn drainAndProcess(self: *Self, fd: posix.fd_t, conn: *conn_mod.Connection) bool {
+        const bp = conn.buf orelse {
+            self.closeConnection(fd);
+            return true;
+        };
+        while (true) {
+            const remaining = bp.request_buf[conn.bytes_read..];
+            if (remaining.len == 0) break;
+            const n = posix.read(fd, remaining) catch |err| {
+                if (err == error.WouldBlock) break;
                 self.closeConnection(fd);
-                return;
+                return true;
             };
-            if (!done) {
-                // WouldBlock — arm for EPOLLOUT to retry later.
-                self.armForWrite(conn);
-                return;
+            if (n == 0) {
+                self.closeConnection(fd);
+                return true;
+            }
+            conn.bytes_read += n;
+            if (conn.response_len == 0 and conn.bytes_read >= binary_protocol.HEADER_SIZE) {
+                binary_protocol.processFrames(self.db, conn);
             }
         }
+        if (conn.response_len == 0 and conn.bytes_read >= binary_protocol.HEADER_SIZE) {
+            binary_protocol.processFrames(self.db, conn);
+        }
+        if (conn.response_len == 0 and conn.bytes_read >= bp.request_buf.len) {
+            log.warn("Request frame exceeds buffer for fd={d}, closing", .{fd});
+            self.closeConnection(fd);
+            return true;
+        }
+        return false;
+    }
 
-        // Write completed — go back to reading.
-        conn.bytes_written = 0;
-        conn.response_len = 0;
-        conn.phase = .reading_request;
-        conn.last_activity = std.time.timestamp();
+    fn finishBinaryWrite(self: *Self, fd: posix.fd_t, conn: *conn_mod.Connection) void {
+        while (true) {
+            var done = false;
+            while (!done) {
+                done = conn.writeChunk() catch {
+                    self.closeConnection(fd);
+                    return;
+                };
+                if (!done) {
+                    self.armForWrite(conn);
+                    return;
+                }
+            }
+
+            conn.bytes_written = 0;
+            conn.response_len = 0;
+            conn.phase = .reading_request;
+            conn.last_activity = std.time.timestamp();
+
+            if (self.drainAndProcess(fd, conn)) return;
+            if (conn.response_len > 0) {
+                conn.bytes_written = 0;
+                conn.phase = .writing_response;
+                continue;
+            }
+
+            if (conn.armed_for_write) {
+                self.armForRead(conn);
+                conn.armed_for_write = false;
+            }
+            return;
+        }
     }
 
     fn closeConnection(self: *Self, fd: posix.fd_t) void {
@@ -424,6 +398,17 @@ pub const EpollServer = struct {
     fn armForWrite(self: *Self, conn: *conn_mod.Connection) void {
         var ev = linux.epoll_event{
             .events = linux.EPOLL.OUT | linux.EPOLL.ET | linux.EPOLL.HUP | linux.EPOLL.ERR,
+            .data = .{ .fd = conn.fd },
+        };
+        conn.armed_for_write = true;
+        posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
+            self.closeConnection(conn.fd);
+        };
+    }
+
+    fn armForRead(self: *Self, conn: *conn_mod.Connection) void {
+        var ev = linux.epoll_event{
+            .events = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.HUP | linux.EPOLL.ERR,
             .data = .{ .fd = conn.fd },
         };
         posix.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, conn.fd, &ev) catch {
@@ -493,12 +478,6 @@ pub const EpollServer = struct {
         const idx: u32 = @intCast((addr - base) / @sizeOf(conn_mod.BufferPair));
         if (idx >= self.buf_pool_size) return;
 
-        // Zero the entire pair on release. BufferPair is left `undefined`
-        // at construction; without this, a handler that ever read past
-        // `bytes_read` (by accident or via a future bug) could observe
-        // bytes from the previous connection that held this slot. The
-        // 192 KB memset is on the connection-close path, not the per-
-        // request hot path.
         @memset(std.mem.asBytes(pair), 0);
 
         self.free_stack[self.free_count] = @intCast(idx);

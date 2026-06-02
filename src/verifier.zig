@@ -21,7 +21,6 @@ pub const InvariantHealth = struct {
 
     pub fn driftBp(self: InvariantHealth) u32 {
         if (self.expected == 0) {
-            // If expected is 0 but observed is non-zero, that's full drift.
             if (self.observed == 0) return 0;
             return std.math.maxInt(u32);
         }
@@ -36,6 +35,7 @@ pub const InvariantHealth = struct {
 
 pub const VerifierState = struct {
     last_run_at: i64 = 0,
+    any_drift: bool = false,
     indices: [6]InvariantHealth = .{
         .{ .name = "cat_by_parent", .expected = 0, .observed = 0 },
         .{ .name = "link_by_category", .expected = 0, .observed = 0 },
@@ -59,7 +59,7 @@ pub const VerifierState = struct {
         return .{
             .last_run_at = self.last_run_at,
             .indices = self.indices,
-            .slug_path_repair_queue_depth = db.slug_path_repair_queue.entry_count,
+            .slug_path_repair_queue_depth = db.slug_path_repair_queue.entryCount(),
             .slug_path_repair_worker_last_tick_ms = db.repair_worker_last_tick_ms.load(.acquire),
             .slug_path_repair_worker_tasks_processed = db.repair_worker_tasks_processed.load(.monotonic),
             .slug_path_repair_worker_chunks_processed = db.repair_worker_chunks_processed.load(.monotonic),
@@ -67,17 +67,9 @@ pub const VerifierState = struct {
     }
 };
 
-/// Run the verifier once and populate state. WARN-on-drift only:
-/// drift is logged and surfaced via state, but no invariant is
-/// auto-repaired. Manual intervention is required if any invariant
-/// deviates.
 pub fn runOnce(db: *Database, state: *VerifierState) !void {
     const t0 = std.time.milliTimestamp();
 
-    // Drain memtables into the B+Trees so the scans below observe
-    // authoritative state. Without this the verifier under-counts
-    // freshly created categories/links that haven't been flushed yet,
-    // which produces phantom drift on small/young databases.
     db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
     db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
     db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
@@ -125,21 +117,36 @@ pub fn runOnce(db: *Database, state: *VerifierState) !void {
     const top_count = try countTops(db);
     indices[@intFromEnum(InvariantId.single_top)] = .{
         .name = "single_top",
-        // Empty fixtures legitimately have zero Tops; absorb that case so we
-        // don't surface phantom drift on a fresh DB.
         .expected = if (cat_count == 0) 0 else 1,
         .observed = top_count,
     };
 
-    // Snapshot state for external observers.
     state.mutex.lock();
     state.last_run_at = std.time.timestamp();
     state.indices = indices;
     state.mutex.unlock();
 
-    // WARN-on-drift only. The verifier never mutates DB state; operators
-    // are responsible for remediation.
     var any_drift = false;
+
+    {
+        const slug_path_count = try countTree(&db.categories_by_slug_path, "");
+        if (slug_path_count != cat_count) {
+            any_drift = true;
+            log.warn(
+                "invariant categories_by_slug_path coverage (expected={d} observed={d}) — manual intervention required",
+                .{ cat_count, slug_path_count },
+            );
+        }
+        if (cat_count > 0 and !(try treeNonEmpty(&db.categories_index_tree, ""))) {
+            any_drift = true;
+            log.warn("invariant categories_index empty while {d} categories exist — rebuild required", .{cat_count});
+        }
+        if (link_count > 0 and !(try treeNonEmpty(&db.links_index_tree, ""))) {
+            any_drift = true;
+            log.warn("invariant links_index empty while {d} links exist — rebuild required", .{link_count});
+        }
+    }
+
     for (indices) |inv| {
         const drift = inv.driftBp();
         if (drift == 0) continue;
@@ -150,6 +157,10 @@ pub fn runOnce(db: *Database, state: *VerifierState) !void {
         );
     }
 
+    state.mutex.lock();
+    state.any_drift = any_drift;
+    state.mutex.unlock();
+
     const elapsed = std.time.milliTimestamp() - t0;
     if (any_drift) {
         log.info("verifier: completed in {d}ms with drift (warn-only)", .{elapsed});
@@ -158,12 +169,31 @@ pub fn runOnce(db: *Database, state: *VerifierState) !void {
     }
 }
 
-/// Count entries in a B+Tree via rangeScan. Errors propagate to the caller.
 fn countTree(tree: *btree.BPlusTree, min_key: []const u8) !u64 {
     var iter = try tree.rangeScan(min_key, null);
     var count: u64 = 0;
     while (try iter.next()) |_| count += 1;
     return count;
+}
+
+fn treeNonEmpty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
+    var iter = try tree.rangeScan(min_key, null);
+    return (try iter.next()) != null;
+}
+
+fn collectAllChildIds(db: *Database, parent_id: u64) ![]u64 {
+    const ops = @import("operations/operations.zig");
+    var ids: std.ArrayListUnmanaged(u64) = .{};
+    errdefer ids.deinit(db.allocator);
+    var buf: [4096]types.Category = undefined;
+    var offset: u32 = 0;
+    while (true) {
+        const children = try ops.listChildren(db, parent_id, offset, buf.len, &buf);
+        for (children) |c| try ids.append(db.allocator, c.id);
+        if (children.len < buf.len) break;
+        offset +|= @intCast(children.len);
+    }
+    return ids.toOwnedSlice(db.allocator);
 }
 
 fn countTops(db: *Database) !u64 {
@@ -193,17 +223,9 @@ fn countOrphans(db: *Database) !u64 {
     return orphans;
 }
 
-/// Subtree-count drift detector. Bottom-up walks the category tree and
-/// counts how many categories' stored `link_count_subtree` or
-/// `child_count_subtree` diverges from the recomputed authoritative
-/// value. Read-only — does not mutate the DB.
-///
-/// The walk is rooted at the unique Top (parent_id=0). If no Top exists
-/// (empty fixture), returns 0.
 fn countSubtreeDrift(db: *Database) !u64 {
     const ops = @import("operations/operations.zig");
 
-    // Locate Top.
     var top_id: u64 = 0;
     {
         const min_key = types.encodeU64(0);
@@ -219,7 +241,6 @@ fn countSubtreeDrift(db: *Database) !u64 {
     }
     if (top_id == 0) return 0;
 
-    // Pass 1: per-category direct-link counts from link_by_category.
     var direct_links = std.AutoHashMap(u64, u32).init(db.allocator);
     defer direct_links.deinit();
     {
@@ -234,7 +255,6 @@ fn countSubtreeDrift(db: *Database) !u64 {
         }
     }
 
-    // Recomputed (authoritative) subtree counts per category.
     const Computed = struct { link_subtree: u64, child_subtree: u32 };
     var computed = std.AutoHashMap(u64, Computed).init(db.allocator);
     defer computed.deinit();
@@ -244,15 +264,14 @@ fn countSubtreeDrift(db: *Database) !u64 {
     defer stack.deinit(db.allocator);
     try stack.append(db.allocator, .{ .id = top_id, .expanded = false });
 
-    var children_buf: [4096]types.Category = undefined;
-
     while (stack.items.len > 0) {
         const top = stack.items[stack.items.len - 1];
         if (!top.expanded) {
             stack.items[stack.items.len - 1].expanded = true;
-            const children = try ops.listChildren(db, top.id, 0, children_buf.len, &children_buf);
-            for (children) |c| {
-                try stack.append(db.allocator, .{ .id = c.id, .expanded = false });
+            const child_ids = try collectAllChildIds(db, top.id);
+            defer db.allocator.free(child_ids);
+            for (child_ids) |cid| {
+                try stack.append(db.allocator, .{ .id = cid, .expanded = false });
             }
             continue;
         }
@@ -261,16 +280,16 @@ fn countSubtreeDrift(db: *Database) !u64 {
         const direct = direct_links.get(top.id) orelse 0;
         var sub_links: u64 = direct;
         var sub_children: u32 = 0;
-        const children = try ops.listChildren(db, top.id, 0, children_buf.len, &children_buf);
-        for (children) |c| {
-            const c_comp = computed.get(c.id) orelse Computed{ .link_subtree = 0, .child_subtree = 0 };
+        const child_ids = try collectAllChildIds(db, top.id);
+        defer db.allocator.free(child_ids);
+        for (child_ids) |cid| {
+            const c_comp = computed.get(cid) orelse Computed{ .link_subtree = 0, .child_subtree = 0 };
             sub_links += c_comp.link_subtree;
             sub_children += 1 + c_comp.child_subtree;
         }
         try computed.put(top.id, .{ .link_subtree = sub_links, .child_subtree = sub_children });
     }
 
-    // Compare stored vs computed for every category in the walk.
     var drift: u64 = 0;
     var it = computed.iterator();
     while (it.next()) |kv| {
@@ -335,15 +354,10 @@ test "verifier: detects subtree count drift without repairing (WARN-only)" {
         const slug = try std.fmt.bufPrint(&slug_buf, "c{d}", .{i});
         sibling_ids[i] = try ops.createCategory(db, top_id, name, slug, "");
     }
-    // Add a single link under sibling 0 so its authoritative subtree count is 1.
     _ = try ops.createLink(db, sibling_ids[0], "https://x.example", "x", "");
 
-    // Drain pending writes so the tamper isn't overwritten when the verifier
-    // re-drains. Without this, the original (correct) value sitting in the
-    // memtable wins on the verifier's drain pass.
     db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
 
-    // Tamper sibling 0's stored link_count_subtree to 0 (correct value is 1).
     {
         var cat = (try ops.getCategory(db, sibling_ids[0])).?;
         cat.link_count_subtree = 0;
@@ -354,11 +368,9 @@ test "verifier: detects subtree count drift without repairing (WARN-only)" {
     var state = VerifierState{};
     try runOnce(db, &state);
 
-    // Drift must be reported via the snapshot.
     const subtree = state.indices[@intFromEnum(InvariantId.subtree_counts)];
     try std.testing.expect(subtree.driftBp() > 0);
 
-    // The verifier never repairs — the tampered value must remain.
     const after = (try ops.getCategory(db, sibling_ids[0])).?;
     try std.testing.expectEqual(@as(u64, 0), after.link_count_subtree);
 }
@@ -377,8 +389,6 @@ test "verifier: tampered link_count surfaces drift on link_by_category invariant
 
     db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
 
-    // Drop one of the link_by_category secondary entries by force-walking
-    // and removing the first entry directly.
     {
         const min_key: [16]u8 = .{0} ** 16;
         var iter = try db.link_by_category.rangeScan(&min_key, null);
@@ -411,7 +421,6 @@ test "verifier: tampered child_count_subtree surfaces drift" {
 
     db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
 
-    // Tamper Top's child_count_subtree to a wrong value.
     {
         var cat = (try ops.getCategory(db, top)).?;
         cat.child_count_subtree = 99;
@@ -440,8 +449,6 @@ test "verifier: every InvariantId has a matching snapshot index" {
     const fields = @typeInfo(InvariantId).@"enum".fields;
     try std.testing.expectEqual(fields.len, snap.indices.len);
     inline for (fields, 0..) |f, i| {
-        // Each enum slot's name must appear in the snapshot in the
-        // matching index — guarantees clients can decode by ordinal.
         const idx = snap.indices[i];
         try std.testing.expect(idx.name.len > 0);
         _ = f;
@@ -501,7 +508,6 @@ test "verifier: concurrent writer + verifier does not crash" {
 
     const t = try std.Thread.spawn(.{}, Writer.run, .{ db, top });
 
-    // Run the verifier multiple times in this thread while writer races.
     var state = VerifierState{};
     var i: usize = 0;
     while (i < 5) : (i += 1) {
@@ -509,9 +515,6 @@ test "verifier: concurrent writer + verifier does not crash" {
     }
     t.join();
 
-    // Final run after writer has joined — invariants observed at that
-    // instant should be stable. We don't assert zero drift (writes may
-    // not be fully drained), only that runOnce returns without error.
     try runOnce(db, &state);
 }
 
@@ -526,9 +529,6 @@ test "verifier: op 19 frame matches op 18 frame" {
     try runOnce(db, &state);
     db.verifier_state = state;
 
-    // Both ops snapshot the same VerifierState; their snapshot bytes
-    // must be byte-identical (only differs by op_byte in the frame
-    // header which we don't compare here).
     const snap1 = db.verifier_state.snapshot(db);
     const snap2 = db.verifier_state.snapshot(db);
     try std.testing.expectEqual(snap1.last_run_at, snap2.last_run_at);
@@ -551,13 +551,10 @@ test "verifier: slug_path_repair_queue_depth round-trips through snapshot" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Initially empty.
     var state = VerifierState{};
     var snap = state.snapshot(db);
     try std.testing.expectEqual(@as(u64, 0), snap.slug_path_repair_queue_depth);
 
-    // Inject a repair-queue entry directly so we can observe a non-zero
-    // depth. Key is u64 sequence; value is the cat id we want repaired.
     const seq: u64 = 1;
     const key = types.encodeU64(seq);
     const value = types.encodeU64(42);
@@ -573,18 +570,33 @@ test "verifier: shutdown signal causes verifier loop to exit promptly" {
     defer tmp.cleanup();
     var db = try Database.openTestInstance(allocator, &tmp);
 
-    // openTestInstance does not start background threads. Start the
-    // verifier thread explicitly by hand-mirroring startBackgroundThreads
-    // for just the verifier; if start fails we skip.
     db.startBackgroundThreads();
-    // Give the verifier loop a beat to enter its first timedWait.
     std.Thread.sleep(10 * std.time.ns_per_ms);
 
     const t0 = std.time.milliTimestamp();
-    db.deinitTestInstance(); // signals shutdown + joins thread
+    db.deinitTestInstance();
     const elapsed = std.time.milliTimestamp() - t0;
 
-    // Default verifier_interval_ns is large (5min). Shutdown must wake
-    // the cond var and exit well within a second.
     try std.testing.expect(elapsed < 5_000);
+}
+
+test "H14: verifier flags slug-path coverage divergence" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Database.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const ops = @import("operations/operations.zig");
+    const top = try ops.createCategory(db, 0, "Top", "top", "");
+    _ = try ops.createCategory(db, top, "Child", "child", "");
+
+    var state = VerifierState{};
+    try runOnce(db, &state);
+    try std.testing.expect(!state.any_drift);
+
+    _ = try db.categories_by_slug_path.delete("top/child");
+
+    try runOnce(db, &state);
+    try std.testing.expect(state.any_drift);
 }

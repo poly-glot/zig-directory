@@ -20,49 +20,32 @@ pub const CacheEntry = struct {
     next: ?*CacheEntry = null,
 };
 
-/// Number of independent cache shards.  Each shard has its own lock, LRU
-/// list, and hash map, so concurrent accesses to different pages that hash
-/// to different shards never contend.
 pub const NUM_SHARDS = 64;
 
-/// A single cache shard — a self-contained LRU cache.
 const CacheShard = struct {
     map: std.AutoHashMap(page.PageId, *CacheEntry),
     entries: []CacheEntry,
     free_list: std.ArrayListUnmanaged(*CacheEntry),
-    head: ?*CacheEntry, // MRU end
-    tail: ?*CacheEntry, // LRU end
+    head: ?*CacheEntry,
+    tail: ?*CacheEntry,
     lock: std.Thread.Mutex,
 };
 
-/// Sharded LRU page cache (buffer pool) backed by a data file.
-///
-/// Pages are assigned to shards by `PageId % NUM_SHARDS`. Each shard is
-/// independently locked, so operations on pages in different shards run
-/// fully in parallel.
 pub const PageCache = struct {
     shards: [NUM_SHARDS]CacheShard,
     file: std.fs.File,
     allocator: std.mem.Allocator,
     hit_count: std.atomic.Value(u64),
     miss_count: std.atomic.Value(u64),
-    /// Global page counter — only used by allocatePage.  Protected by
-    /// `alloc_lock` so that concurrent page allocations are safe without
-    /// holding any shard lock.
     page_count: u32,
     alloc_lock: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, file: std.fs.File, capacity: usize) !PageCache {
-        // Determine current page count from file size. Page 0 is reserved
-        // for the FileHeader (in production); freshly-empty test files
-        // start at raw_count==0, which would let allocatePage hand out
-        // page 0 — never valid. Reserve it by starting at 1.
         const file_size = file.getEndPos() catch 0;
         const raw_count = file_size / page.PAGE_SIZE;
         const reserved = @max(raw_count, 1);
         const pc: u32 = if (reserved > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(reserved);
 
-        // Distribute capacity evenly across shards.
         const per_shard = @max(capacity / NUM_SHARDS, 1);
 
         var self = PageCache{
@@ -113,12 +96,10 @@ pub const PageCache = struct {
         return @as(usize, page_id) % NUM_SHARDS;
     }
 
-    /// Get a read-only reference to a page. Pins the page in the cache.
     pub fn getPage(self: *PageCache, page_id: page.PageId) !*const page.Page {
         return self.fetchPage(page_id, false);
     }
 
-    /// Get a mutable reference to a page. Marks it dirty and pins it.
     pub fn getPageMut(self: *PageCache, page_id: page.PageId) !*page.Page {
         return self.fetchPage(page_id, true);
     }
@@ -155,7 +136,6 @@ pub const PageCache = struct {
         return @ptrCast(@alignCast(&entry.data));
     }
 
-    /// Decrement pin count for a page.
     pub fn unpinPage(self: *PageCache, page_id: page.PageId) void {
         const shard = &self.shards[shardIndex(page_id)];
         shard.lock.lock();
@@ -168,7 +148,6 @@ pub const PageCache = struct {
         }
     }
 
-    /// Write a single dirty page to disk.
     pub fn flushPage(self: *PageCache, page_id: page.PageId) !void {
         const shard = &self.shards[shardIndex(page_id)];
         shard.lock.lock();
@@ -181,7 +160,6 @@ pub const PageCache = struct {
         }
     }
 
-    /// Flush all dirty pages to disk and fsync.
     pub fn flushAll(self: *PageCache) !void {
         for (&self.shards) |*shard| {
             shard.lock.lock();
@@ -197,14 +175,12 @@ pub const PageCache = struct {
             }
         }
 
-        // fdatasync: skip metadata update for faster flushes.
         posix.fdatasync(self.file.handle) catch |err| {
             log.err("flushAll: fdatasync failed: {}", .{err});
             return CacheError.DiskError;
         };
     }
 
-    /// Allocate a new page by extending the file. Returns the new PageId.
     pub fn allocatePage(self: *PageCache) !page.PageId {
         self.alloc_lock.lock();
         defer self.alloc_lock.unlock();
@@ -215,7 +191,6 @@ pub const PageCache = struct {
         const new_id = self.page_count;
         self.page_count += 1;
 
-        // Extend the file with zeros using pwrite (position-independent)
         const offset: u64 = @as(u64, new_id) * page.PAGE_SIZE;
         const zeros = [_]u8{0} ** page.PAGE_SIZE;
         var total_written: usize = 0;
@@ -227,8 +202,6 @@ pub const PageCache = struct {
 
         return new_id;
     }
-
-    // ── Internal helpers (operate on a shard, caller holds shard lock) ──
 
     fn moveToFront(shard: *CacheShard, entry: *CacheEntry) void {
         if (shard.head == entry) return;
@@ -282,20 +255,15 @@ pub const PageCache = struct {
         var total_read: usize = 0;
         while (total_read < page.PAGE_SIZE) {
             const n = std.posix.pread(file_handle, buf[total_read..], offset + total_read) catch return CacheError.DiskError;
-            if (n == 0) break; // EOF
+            if (n == 0) break;
             total_read += n;
         }
 
         if (total_read == 0) {
-            // Past EOF: a freshly allocated page that hasn't been written
-            // yet. Zero-fill and return; the caller will overwrite it.
             @memset(buf, 0);
             return;
         }
         if (total_read < page.PAGE_SIZE) {
-            // A page partially on disk is corruption, not a fresh page.
-            // Refuse rather than silently zero-filling and letting the
-            // missing checksum hide the truncation.
             log.err("Short read for page {d}: {d} of {d} bytes — file truncated", .{ page_id, total_read, page.PAGE_SIZE });
             return CacheError.DiskError;
         }
@@ -359,33 +327,25 @@ test "eviction of LRU" {
     defer file.close();
     defer std.fs.cwd().deleteFile("/tmp/test_page_cache.db") catch {};
 
-    // Small cache: NUM_SHARDS shards × 1 entry each
     var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
 
-    // Allocate pages that all land in the same shard for deterministic eviction.
-    // Pages 0, NUM_SHARDS, 2*NUM_SHARDS all hash to shard 0.
     var pids: [2]page.PageId = undefined;
-    // Allocate enough pages so we get two in the same shard.
-    // With 1 entry per shard, the second page in the same shard triggers eviction.
     for (0..NUM_SHARDS) |_| {
         _ = try cache.allocatePage();
     }
-    // Pages 0..NUM_SHARDS-1 exist. Page 0 and NUM_SHARDS both map to shard 0.
     pids[0] = 0;
-    const extra = try cache.allocatePage(); // This is page NUM_SHARDS, maps to shard 0
+    const extra = try cache.allocatePage();
     pids[1] = extra;
 
     const pg0 = try cache.getPageMut(pids[0]);
     _ = pg0;
     cache.unpinPage(pids[0]);
 
-    // Now access extra (same shard) — should evict pids[0]
     const pg1 = try cache.getPageMut(pids[1]);
     _ = pg1;
     cache.unpinPage(pids[1]);
 
-    // Verify hit/miss counts work
     try std.testing.expect(cache.miss_count.load(.monotonic) >= 2);
 }
 
@@ -394,11 +354,9 @@ test "pin prevents eviction" {
     defer file.close();
     defer std.fs.cwd().deleteFile("/tmp/test_page_cache.db") catch {};
 
-    // 1 entry per shard
     var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
 
-    // Allocate two pages in same shard: 0 and NUM_SHARDS
     for (0..NUM_SHARDS + 1) |_| {
         _ = try cache.allocatePage();
     }
@@ -406,15 +364,11 @@ test "pin prevents eviction" {
     const pid1: page.PageId = 0;
     const pid2: page.PageId = @intCast(NUM_SHARDS);
 
-    // Pin page in shard 0
     _ = try cache.getPageMut(pid1);
-    // Don't unpin — pinned
 
-    // Allocate another page in same shard — eviction should fail
     const result = cache.getPageMut(pid2);
     try std.testing.expectError(CacheError.CacheFull, result);
 
-    // Unpin and retry
     cache.unpinPage(pid1);
     const pg2 = try cache.getPageMut(pid2);
     _ = pg2;
@@ -431,24 +385,20 @@ test "LRU evicts oldest unpinned" {
     defer file.close();
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    // 2 entries per shard so we can observe LRU ordering within a shard.
     var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 2);
     defer cache.deinit();
 
-    // Allocate 3 pages all in shard 0 (pid 0, NUM_SHARDS, 2*NUM_SHARDS).
     for (0..2 * NUM_SHARDS + 1) |_| _ = try cache.allocatePage();
 
     const a: page.PageId = 0;
     const b: page.PageId = @intCast(NUM_SHARDS);
     const c: page.PageId = @intCast(2 * NUM_SHARDS);
 
-    // Touch a, then b. a is now LRU.
     _ = try cache.getPage(a);
     cache.unpinPage(a);
     _ = try cache.getPage(b);
     cache.unpinPage(b);
 
-    // Pull c into the same shard — eviction picks a (oldest unpinned).
     _ = try cache.getPage(c);
     cache.unpinPage(c);
 
@@ -477,14 +427,12 @@ test "dirty page persists across re-fetch via flushAll" {
 
     try cache.flushAll();
 
-    // Confirm dirty flag was cleared after flush.
     const shard = &cache.shards[shardIndexExternal(pid)];
     shard.lock.lock();
     const entry = shard.map.get(pid).?;
     try std.testing.expectEqual(false, entry.dirty);
     shard.lock.unlock();
 
-    // Re-read returns the persisted bytes.
     const pg2 = try cache.getPage(pid);
     const p2: *const page.Page = @ptrCast(@alignCast(pg2));
     try std.testing.expectEqual(@as(u32, 1), p2.header.key_count);
@@ -504,7 +452,6 @@ test "cross-shard pages access without contention" {
     var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS * 2);
     defer cache.deinit();
 
-    // Allocate pages 0 and 1 — different shards.
     _ = try cache.allocatePage();
     _ = try cache.allocatePage();
     const pid_a: page.PageId = 0;
@@ -536,7 +483,6 @@ test "re-pin after unpin returns same bytes" {
         cache.unpinPage(pid);
     }
 
-    // Re-pin: same data still readable.
     const again = try cache.getPage(pid);
     const p: *const page.Page = @ptrCast(@alignCast(again));
     const slots = page.getSlots(p);
@@ -551,8 +497,6 @@ test "evicting dirty page flushes to disk first" {
     defer file.close();
     defer std.fs.cwd().deleteFile(path) catch {};
 
-    // 1 entry per shard so writing a second page in the same shard forces
-    // eviction of the first.
     var cache = try PageCache.init(std.testing.allocator, file, NUM_SHARDS);
     defer cache.deinit();
 
@@ -561,7 +505,6 @@ test "evicting dirty page flushes to disk first" {
     const a: page.PageId = 0;
     const b: page.PageId = @intCast(NUM_SHARDS);
 
-    // Make `a` dirty, then unpin so it is evictable.
     {
         const pg = try cache.getPageMut(a);
         page.initLeaf(@ptrCast(@alignCast(pg)), a);
@@ -569,15 +512,12 @@ test "evicting dirty page flushes to disk first" {
         cache.unpinPage(a);
     }
 
-    // Pulling `b` (same shard) forces `a` to be evicted; the eviction path
-    // must flush dirty bytes first.
     {
         const pg = try cache.getPageMut(b);
         page.initLeaf(@ptrCast(@alignCast(pg)), b);
         cache.unpinPage(b);
     }
 
-    // Re-read `a` from disk via a fresh fetch — should land via miss path.
     const before_misses = cache.miss_count.load(.monotonic);
     const re = try cache.getPage(a);
     const p: *const page.Page = @ptrCast(@alignCast(re));
@@ -610,7 +550,6 @@ test "concurrent allocatePage across threads" {
     t1.join();
     t2.join();
 
-    // All 200 ids must be distinct (alloc_lock-protected counter).
     var seen = std.AutoHashMap(page.PageId, void).init(std.testing.allocator);
     defer seen.deinit();
     for (ids_a) |id| {

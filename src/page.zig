@@ -1,13 +1,13 @@
 const std = @import("std");
 
-pub const PAGE_SIZE: u32 = 16384; // 16 KB
+pub const PAGE_SIZE: u32 = 16384;
 pub const PageId = u32;
 pub const INVALID_PAGE: PageId = std.math.maxInt(PageId);
 
 pub const PageType = enum(u8) {
     leaf = 0,
     internal = 1,
-    overflow = 2, // Reserved for future large-value support
+    overflow = 2,
     free = 3,
 };
 
@@ -89,8 +89,6 @@ pub fn initInternal(p: *Page, pid: PageId) void {
     p.header.checksum = 0;
 }
 
-/// Compute CRC32 checksum over all page bytes except the checksum field itself.
-/// This covers both header fields (page_id, key_count, etc.) and body data.
 pub fn computeChecksum(p: *const Page) u32 {
     const bytes = std.mem.asBytes(p);
     const checksum_offset = @offsetOf(PageHeader, "checksum");
@@ -98,7 +96,8 @@ pub fn computeChecksum(p: *const Page) u32 {
     var crc = std.hash.crc.Crc32.init();
     crc.update(bytes[0..checksum_offset]);
     crc.update(bytes[checksum_end..]);
-    return crc.final();
+    const v = crc.final();
+    return if (v == 0) 0xFFFF_FFFF else v;
 }
 
 pub fn verifyChecksum(p: *const Page) bool {
@@ -117,8 +116,6 @@ pub const PageError = error{
     ValueTooLarge,
 };
 
-/// Insert a key-value entry at sorted position `pos`, shifting subsequent slots right.
-/// Key and value data are written at the end of the body (growing downward from free_space_offset).
 pub fn insertEntry(p: *Page, key: []const u8, value: []const u8, pos: u32) !void {
     if (key.len > BODY_SIZE) return PageError.KeyTooLarge;
     if (value.len > BODY_SIZE) return PageError.ValueTooLarge;
@@ -126,7 +123,6 @@ pub fn insertEntry(p: *Page, key: []const u8, value: []const u8, pos: u32) !void
     if (needed > freeSpace(p)) return PageError.NotEnoughSpace;
     if (pos > p.header.key_count) return PageError.InvalidPosition;
 
-    // Value data grows downward from free_space_offset; key follows directly below.
     const value_offset: u32 = p.header.free_space_offset - @as(u32, @intCast(value.len));
     @memcpy(p.body[value_offset..][0..value.len], value);
 
@@ -154,7 +150,6 @@ pub fn insertEntry(p: *Page, key: []const u8, value: []const u8, pos: u32) !void
     p.header.key_count += 1;
 }
 
-/// Remove the slot at position `pos`. Does not compact key/value data but does compact the slot array.
 pub fn removeEntry(p: *Page, pos: u32) void {
     if (pos >= p.header.key_count) return;
 
@@ -196,11 +191,9 @@ test "insert entries" {
     try std.testing.expectEqualSlices(u8, "apple", getKeyAt(&pg, slots[0]));
     try std.testing.expectEqualSlices(u8, "red", getValueAt(&pg, slots[0]));
 
-    // Insert at position 1
     try insertEntry(&pg, "banana", "yellow", 1);
     try std.testing.expectEqual(@as(u32, 2), pg.header.key_count);
 
-    // Insert at position 0 (shift others right)
     try insertEntry(&pg, "aardvark", "brown", 0);
     try std.testing.expectEqual(@as(u32, 3), pg.header.key_count);
 
@@ -219,7 +212,7 @@ test "remove entry" {
     try insertEntry(&pg, "c", "3", 2);
     try std.testing.expectEqual(@as(u32, 3), pg.header.key_count);
 
-    removeEntry(&pg, 1); // remove "b"
+    removeEntry(&pg, 1);
     try std.testing.expectEqual(@as(u32, 2), pg.header.key_count);
 
     const slots = getSlots(&pg);
@@ -235,7 +228,6 @@ test "checksum round-trip" {
     pg.header.checksum = computeChecksum(&pg);
     try std.testing.expect(verifyChecksum(&pg));
 
-    // Flip a byte and verify mismatch
     pg.body[0] ^= 0xFF;
     try std.testing.expect(!verifyChecksum(&pg));
 }

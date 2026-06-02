@@ -511,7 +511,7 @@ test "E2E: snapshot create and load meta" {
     defer db.deinit();
 
     var snap_mgr = snapshot.SnapshotManager.init(dir, 3600);
-    try snap_mgr.createSnapshot(&db.cache, &db.header, 42);
+    try snap_mgr.createSnapshot(db, 42);
 
     const meta = (try snapshot.SnapshotManager.loadSnapshotMeta(dir)).?;
     try testing.expectEqual(@as(u32, 0x534E4150), meta.magic);
@@ -603,28 +603,23 @@ test "E2E: full DMOZ workflow - create hierarchy, browse, search" {
     _ = try ops.createLink(db, zig_cat, "https://github.com/ziglang/zig", "Zig GitHub", "Source repo");
     _ = try ops.createLink(db, science, "https://arxiv.org", "arXiv", "Preprint server");
 
-    // Verify hierarchy
     var path_buf: [16]u64 = undefined;
     const zig_path = try ops.getCategoryPath(db, zig_cat, &path_buf);
     try testing.expectEqual(@as(usize, 4), zig_path.len);
     try testing.expectEqual(computers, zig_path[0]);
     try testing.expectEqual(zig_cat, zig_path[3]);
 
-    // List root categories
     var cat_buf: [64]types.Category = undefined;
     const roots = try ops.listChildren(db, 0, 0, 64, &cat_buf);
     try testing.expect(roots.len >= 2);
 
-    // List links in zig category
     var link_buf: [64]types.Link = undefined;
     const zig_links = (try ops.listLinks(db, zig_cat, 0, 64, &link_buf, null, 0)).items;
     try testing.expectEqual(@as(usize, 2), zig_links.len);
 
-    // Search
     const search_cats = try ops.searchCategories(db, "Zig", 64, &cat_buf);
     try testing.expect(search_cats.len >= 1);
 
-    // Stats
     const stats = db.getStats();
     try testing.expectEqual(@as(u64, 5), stats.category_count);
     try testing.expectEqual(@as(u64, 3), stats.link_count);
@@ -649,19 +644,15 @@ test "e2e: > threshold rename enqueues task, worker drains, queue empties" {
     db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
     db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
 
-    // Trigger > threshold rename.
     try ops.updateCategory(db, parent_id, null, "new", null);
     try std.testing.expect(db.slug_path_repair_queue.entry_count > 0);
 
-    // During the window: validation gate hides stale paths.
     try std.testing.expect((try ops.resolveSlugPath(db, "top/old/c1")) == null);
 
-    // Drain.
     const repair_worker = @import("repair/repair_worker.zig");
     try repair_worker.tickOnce(db);
     try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entry_count);
 
-    // Post-drain: every new path resolves; no old descendant path resolves.
     var j: u32 = 0;
     while (j < 250) : (j += 1) {
         var old_buf: [64]u8 = undefined;
@@ -671,4 +662,73 @@ test "e2e: > threshold rename enqueues task, worker drains, queue empties" {
         try std.testing.expect((try ops.resolveSlugPath(db, old)) == null);
         try std.testing.expect((try ops.resolveSlugPath(db, new)) != null);
     }
+}
+
+test "C1: an acked commit survives an unclean crash via WAL replay" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const link_id = blk: {
+        const a = try Database.openTestInstance(allocator, &tmp);
+        const top = try ops.createCategory(a, 0, "Top", "top", "");
+        const id = try ops.createLink(a, top, "https://crash.example", "Survivor", "");
+        a.deinitCrashTestInstance();
+        break :blk id;
+    };
+
+    const b = try Database.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try b.recover();
+
+    const link = (try ops.getLink(b, link_id)) orelse return error.AckedCommitLostOnCrash;
+    try testing.expectEqualStrings("https://crash.example", link.url.slice());
+    try testing.expectEqualStrings("Survivor", link.title.slice());
+}
+
+test "C4: a duplicate URL is rejected after a restart (bloom reseeded from disk)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const a = try Database.openTestInstance(allocator, &tmp);
+        defer a.deinitTestInstance();
+        const top = try ops.createCategory(a, 0, "Top", "top", "");
+        _ = try ops.createLink(a, top, "https://dup.example", "First", "");
+    }
+
+    const b = try Database.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try b.recover();
+
+    const top = (try ops.resolveSlugPath(b, "top")) orelse return error.TopLost;
+    const retry = ops.createLink(b, top, "https://dup.example", "Second", "");
+    try testing.expectError(error.DuplicateUrl, retry);
+}
+
+test "H1: a snapshot persists the page-0 header so data survives a later crash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const child_id, const link_id = blk: {
+        const a = try Database.openTestInstance(allocator, &tmp);
+        const top = try ops.createCategory(a, 0, "Top", "top", "");
+        const child = try ops.createCategory(a, top, "Child", "child", "");
+        const link = try ops.createLink(a, child, "https://snap.example", "Snap", "");
+        a.drainAllMemtables();
+        _ = try snapshot.forceSnapshot(a);
+        a.deinitCrashTestInstance();
+        break :blk .{ child, link };
+    };
+
+    const b = try Database.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try b.recover();
+
+    const c = (try ops.getCategory(b, child_id)) orelse return error.CategoryLostAfterSnapshot;
+    try testing.expectEqualStrings("child", c.slug.slice());
+    const l = (try ops.getLink(b, link_id)) orelse return error.LinkLostAfterSnapshot;
+    try testing.expectEqualStrings("https://snap.example", l.url.slice());
 }
