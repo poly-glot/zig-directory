@@ -1,21 +1,8 @@
 const std = @import("std");
 
-// Length bounds for every token produced by TokenIterator. Write
-// paths and search must agree on these byte-for-byte, otherwise the
-// on-disk `categories_index_tree` / `links_index_tree` entries won't
-// match query-time tokens.
 pub const MIN_TOKEN_LEN: usize = 2;
 pub const MAX_TOKEN_LEN: usize = 64;
 
-/// Yields lowercase ASCII alphanumeric tokens of length
-/// [MIN_TOKEN_LEN, MAX_TOKEN_LEN] from a UTF-8 text string. Anything
-/// outside `[A-Za-z0-9]` is a separator; runs longer than
-/// MAX_TOKEN_LEN are truncated, runs shorter than MIN_TOKEN_LEN are
-/// dropped.
-///
-/// This is the canonical text-to-token mapping shared by both the
-/// indexing write path and the search dispatcher; behaviour must
-/// stay byte-stable.
 pub const TokenIterator = struct {
     text: []const u8,
     pos: usize = 0,
@@ -24,15 +11,11 @@ pub const TokenIterator = struct {
         return .{ .text = text };
     }
 
-    /// Advance to the next token.  Writes the lowercase token into `buf`
-    /// and returns a slice into it, or null if exhausted.
     pub fn next(self: *TokenIterator, buf: *[MAX_TOKEN_LEN]u8) ?[]const u8 {
         while (self.pos < self.text.len) {
-            // Skip non-alphanumeric.
             while (self.pos < self.text.len and !isAlphaNum(self.text[self.pos])) : (self.pos += 1) {}
             if (self.pos >= self.text.len) return null;
 
-            // Read alphanumeric run into buf, lowercased.
             const start = self.pos;
             var out_len: usize = 0;
             while (self.pos < self.text.len and isAlphaNum(self.text[self.pos])) : (self.pos += 1) {
@@ -42,7 +25,6 @@ pub const TokenIterator = struct {
                 }
             }
 
-            // Discard tokens shorter than MIN_TOKEN_LEN.
             if (self.pos - start < MIN_TOKEN_LEN) continue;
             return buf[0..out_len];
         }
@@ -111,14 +93,9 @@ test "TokenIterator all-punctuation input yields nothing" {
 }
 
 test "TokenIterator mixed unicode treats non-ASCII bytes as separators" {
-    // "café réseau" — ASCII tokens "caf" and "r" and "seau" surrounded
-    // by multibyte UTF-8 bytes (all >= 0x80 and thus not alphanumeric).
-    // Tokens shorter than MIN_TOKEN_LEN are dropped.
     var it = TokenIterator.init("café réseau zigzag");
     var buf: [64]u8 = undefined;
-    // First ASCII run: "caf" (3 chars, kept)
     try std.testing.expectEqualSlices(u8, "caf", it.next(&buf).?);
-    // "r" before "éseau" is a 1-char run -> dropped; "seau" follows
     try std.testing.expectEqualSlices(u8, "seau", it.next(&buf).?);
     try std.testing.expectEqualSlices(u8, "zigzag", it.next(&buf).?);
     try std.testing.expect(it.next(&buf) == null);

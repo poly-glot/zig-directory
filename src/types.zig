@@ -1,13 +1,5 @@
 const std = @import("std");
 
-// ──────────────────────────────────────────────────────────────
-// Serializable — comptime mixin adding toBytes/fromBytes to any
-// extern struct with a deterministic layout.
-// ──────────────────────────────────────────────────────────────
-
-/// Comptime helper that provides serialization functions for any extern struct `T`.
-/// Use as a namespace: `const ser = Serializable(MyStruct);` then call `ser.asBytes(...)`.
-/// Or embed the individual functions into your struct as pub const aliases.
 pub fn Serializable(comptime T: type) type {
     comptime {
         const info = @typeInfo(T);
@@ -16,34 +8,25 @@ pub fn Serializable(comptime T: type) type {
     }
 
     return struct {
-        /// Reinterpret a const pointer to `T` as a byte slice of its in-memory representation.
         pub fn asBytes(ptr: *const T) []const u8 {
             return std.mem.asBytes(ptr);
         }
 
-        /// Reinterpret a mutable pointer to `T` as a mutable byte slice.
         pub fn asMutableBytes(ptr: *T) []u8 {
             return std.mem.asBytes(ptr);
         }
 
-        /// Copy the in-memory representation into a byte array (value semantics).
         pub fn toBytes(ptr: *const T) [@sizeOf(T)]u8 {
             return std.mem.toBytes(ptr.*);
         }
 
-        /// Reinterpret a byte slice as a `T` value.
         pub fn fromBytes(bytes: []const u8) T {
             return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
         }
     };
 }
 
-// ──────────────────────────────────────────────────────────────
-// FixedString — fixed-capacity string for use in extern structs
-// ──────────────────────────────────────────────────────────────
-
 pub fn FixedString(comptime N: usize) type {
-    // Ensure N is even so that the u16 len field after [N]u8 is naturally aligned.
     comptime {
         if (N % 2 != 0) @compileError("FixedString capacity N must be even for alignment");
     }
@@ -54,7 +37,6 @@ pub fn FixedString(comptime N: usize) type {
 
         const Self = @This();
 
-        /// Create a FixedString from a byte slice, copying up to N bytes.
         pub fn fromSlice(s: []const u8) Self {
             var fs = Self{};
             const copy_len = @min(s.len, N);
@@ -63,31 +45,23 @@ pub fn FixedString(comptime N: usize) type {
             return fs;
         }
 
-        /// Return the active portion of the data buffer.
         pub fn slice(self: *const Self) []const u8 {
-            return self.data[0..self.len];
+            return self.data[0..@min(self.len, N)];
         }
 
-        /// Compare the stored string with a byte slice.
         pub fn eql(self: *const Self, other: []const u8) bool {
             return std.mem.eql(u8, self.slice(), other);
         }
 
-        /// Format support for std.fmt — use `{f}` to invoke (Zig 0.15 convention).
         pub fn format(self: *const Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll(self.slice());
         }
 
         comptime {
-            // Verify deterministic size: N bytes data + 2 bytes len
             if (@sizeOf(Self) != N + 2) @compileError("FixedString size mismatch");
         }
     };
 }
-
-// ──────────────────────────────────────────────────────────────
-// Category — on-disk representation of a directory category
-// ──────────────────────────────────────────────────────────────
 
 pub const Category = extern struct {
     id: u64 = 0,
@@ -102,17 +76,10 @@ pub const Category = extern struct {
     created_at: i64 = 0,
     updated_at: i64 = 0,
 
-    /// Total links in this category and all descendants. Materialized;
-    /// maintained by write-time cascade through ancestors. Validated by
-    /// the verifier via bottom-up walk.
     link_count_subtree: u64 = 0,
 
-    /// Total descendant categories (transitively). Same maintenance
-    /// guarantees as link_count_subtree.
     child_count_subtree: u32 = 0,
 
-    /// Reserved bits for future use. Kept as a struct field so on-disk
-    /// Category layout stays size-locked at @sizeOf(Category) == 1288.
     flags: u32 = 0,
 
     const Ser = Serializable(Category);
@@ -123,21 +90,11 @@ pub const Category = extern struct {
 };
 
 comptime {
-    // Verify Category has a deterministic, non-zero size.
-    // The exact size depends on C ABI padding rules for extern struct.
     if (@sizeOf(Category) == 0) @compileError("Category must be non-zero size");
-    // v7 (DMOZ-tuned): name 64, slug 128, description 1024
     if (@sizeOf(Category) != 1288)
         @compileError("Category size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(Category)}) ++ ", expected 1288");
 }
 
-// ──────────────────────────────────────────────────────────────
-// Link — on-disk representation of a directory link / listing
-// ──────────────────────────────────────────────────────────────
-
-/// Editorial state of a Link. Default for every existing record is `approved`
-/// — the index has only ever held curator-approved entries; the migration
-/// from v4 → v5 backfills `approved` everywhere.
 pub const LinkStatus = enum(u8) {
     pending = 0,
     approved = 1,
@@ -155,11 +112,9 @@ pub const Link = extern struct {
     _pad0: u32 = 0,
     created_at: i64 = 0,
     updated_at: i64 = 0,
-    // — v5 (Slice 2b) —
     status: u8 = @intFromEnum(LinkStatus.approved),
     _pad1: [7]u8 = .{0} ** 7,
     submitter_id: u64 = 0,
-    // — v6 (Slice 2c). Drops the v5 _reserved buffer. —
     editor_note: FixedString(1024) = .{},
     tags: FixedString(256) = .{},
     language: FixedString(8) = .{},
@@ -176,33 +131,21 @@ pub const Link = extern struct {
 
 comptime {
     if (@sizeOf(Link) == 0) @compileError("Link must be non-zero size");
-    // v7 (DMOZ-tuned): url 64, title 128, description 256.
     if (@sizeOf(Link) != 1888)
         @compileError("Link size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(Link)}) ++ ", expected 1888");
 }
 
-// ──────────────────────────────────────────────────────────────
-// RepairOp / RepairTask — payload of slug_path_repair_queue
-// ──────────────────────────────────────────────────────────────
-
-/// Kind of structural change that produced a queued repair task.
 pub const RepairOp = enum(u8) {
     renamed_slug = 1,
     moved_parent = 2,
 };
 
-/// A single entry in `slug_path_repair_queue`. Stored as the value of
-/// the queue B+Tree, keyed by `repair_seq` (u64 BE).
-///
-/// `old_slug_prefix` is the renamed/moved cat's OWN old slug path —
-/// not a descendant path. The worker derives each descendant's old
-/// path at drain time as `old_slug_prefix + relative_tail(descendant)`.
 pub const RepairTask = extern struct {
     cat_id: u64 = 0,
     op: RepairOp = .renamed_slug,
     _pad: [7]u8 = [_]u8{0} ** 7,
     created_at: i64 = 0,
-    old_slug_prefix: FixedString(1024) = .{},
+    old_slug_prefix: FixedString(2048) = .{},
 
     const Ser = Serializable(RepairTask);
     pub const asBytes = Ser.asBytes;
@@ -212,21 +155,9 @@ pub const RepairTask = extern struct {
 };
 
 comptime {
-    // On-disk layout: 8 (cat_id) + 1 (op) + 7 (_pad) + 8 (created_at) +
-    // 1026 (FixedString(1024)) = 1050 raw, rounded to 1056 by the i64-driven
-    // 8-byte struct alignment. This exact byte count is the wire/disk format
-    // of slug_path_repair_queue values, so it is locked to catch drift.
-    if (@sizeOf(RepairTask) != 1056)
-        @compileError("RepairTask size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(RepairTask)}) ++ ", expected 1056");
+    if (@sizeOf(RepairTask) != 2080)
+        @compileError("RepairTask size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(RepairTask)}) ++ ", expected 2080");
 }
-
-// ──────────────────────────────────────────────────────────────
-// CompositeKey — comptime generic for multi-field B+Tree keys
-//
-// Generates an extern struct with the named u64 fields and
-// big-endian encode/decode methods. ParentChildKey and
-// CategoryLinkKey are concrete instantiations.
-// ──────────────────────────────────────────────────────────────
 
 pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
     comptime {
@@ -236,7 +167,6 @@ pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
     const num_fields = fields.len;
     const key_size = num_fields * 8;
 
-    // Build the struct fields at comptime.
     const struct_fields = comptime blk: {
         var sf: [num_fields]std.builtin.Type.StructField = undefined;
         for (fields, 0..) |name, i| {
@@ -259,14 +189,10 @@ pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
     } });
 
     return struct {
-        /// The concrete extern struct with the named u64 fields.
         pub const KeyStruct = GeneratedStruct;
 
-        /// Total encoded size in bytes.
         pub const encoded_size = key_size;
 
-        /// Encode field values as big-endian bytes preserving sort order.
-        /// Accepts the field values as positional arguments in declaration order.
         pub fn encode(values: [num_fields]u64) [key_size]u8 {
             var buf: [key_size]u8 = undefined;
             inline for (0..num_fields) |i| {
@@ -277,7 +203,6 @@ pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
             return buf;
         }
 
-        /// Decode a big-endian byte buffer back into the named struct.
         pub fn decode(bytes: []const u8) GeneratedStruct {
             var result: GeneratedStruct = undefined;
             inline for (fields, 0..) |name, i| {
@@ -292,10 +217,6 @@ pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
     };
 }
 
-// ──────────────────────────────────────────────────────────────
-// Concrete composite key types — backwards-compatible wrappers
-// ──────────────────────────────────────────────────────────────
-
 const ParentChildComposite = CompositeKey(&.{ "parent_id", "child_id" });
 const CategoryLinkComposite = CompositeKey(&.{ "category_id", "link_id" });
 const SubmitterLinkComposite = CompositeKey(&.{ "submitter_id", "link_id" });
@@ -304,12 +225,10 @@ pub const ParentChildKey = extern struct {
     parent_id: u64,
     child_id: u64,
 
-    /// Encode as 16 big-endian bytes suitable for B+Tree key ordering.
     pub fn encode(parent_id: u64, child_id: u64) [16]u8 {
         return ParentChildComposite.encode(.{ parent_id, child_id });
     }
 
-    /// Decode a 16-byte big-endian buffer back into a ParentChildKey.
     pub fn decode(bytes: []const u8) ParentChildKey {
         const raw = ParentChildComposite.decode(bytes);
         return .{ .parent_id = raw.parent_id, .child_id = raw.child_id };
@@ -320,12 +239,10 @@ pub const CategoryLinkKey = extern struct {
     category_id: u64,
     link_id: u64,
 
-    /// Encode as 16 big-endian bytes suitable for B+Tree key ordering.
     pub fn encode(category_id: u64, link_id: u64) [16]u8 {
         return CategoryLinkComposite.encode(.{ category_id, link_id });
     }
 
-    /// Decode a 16-byte big-endian buffer back into a CategoryLinkKey.
     pub fn decode(bytes: []const u8) CategoryLinkKey {
         const raw = CategoryLinkComposite.decode(bytes);
         return .{ .category_id = raw.category_id, .link_id = raw.link_id };
@@ -336,21 +253,15 @@ pub const SubmitterLinkKey = extern struct {
     submitter_id: u64,
     link_id: u64,
 
-    /// Encode as 16 big-endian bytes suitable for B+Tree key ordering.
     pub fn encode(submitter_id: u64, link_id: u64) [16]u8 {
         return SubmitterLinkComposite.encode(.{ submitter_id, link_id });
     }
 
-    /// Decode a 16-byte big-endian buffer back into a SubmitterLinkKey.
     pub fn decode(bytes: []const u8) SubmitterLinkKey {
         const raw = SubmitterLinkComposite.decode(bytes);
         return .{ .submitter_id = raw.submitter_id, .link_id = raw.link_id };
     }
 };
-
-// ──────────────────────────────────────────────────────────────
-// Big-endian encoding helpers — preserves sort order in B+Trees
-// ──────────────────────────────────────────────────────────────
 
 pub fn encodeU64(val: u64) [8]u8 {
     return std.mem.toBytes(std.mem.nativeTo(u64, val, .big));
@@ -359,10 +270,6 @@ pub fn encodeU64(val: u64) [8]u8 {
 pub fn decodeU64(bytes: []const u8) u64 {
     return std.mem.toNative(u64, std.mem.bytesToValue(u64, bytes[0..8]), .big);
 }
-
-// ──────────────────────────────────────────────────────────────
-// URL hashing for the link-by-URL-hash index
-// ──────────────────────────────────────────────────────────────
 
 pub fn hashUrl(url: []const u8) u64 {
     return std.hash.Wyhash.hash(0, url);
@@ -402,7 +309,6 @@ test "encodeU64 / decodeU64 roundtrip" {
 }
 
 test "encodeU64 big-endian ordering" {
-    // Big-endian encoding must preserve numeric sort order under lexicographic comparison.
     const a = encodeU64(100);
     const b = encodeU64(200);
     try std.testing.expect(std.mem.order(u8, &a, &b) == .lt);
@@ -446,7 +352,6 @@ test "Serializable Category asBytes roundtrip" {
     const bytes = cat.asBytes();
     try std.testing.expectEqual(@as(usize, @sizeOf(Category)), bytes.len);
 
-    // Reconstruct from bytes.
     const restored = Category.fromBytes(bytes);
     try std.testing.expectEqual(@as(u64, 42), restored.id);
     try std.testing.expectEqual(@as(u64, 7), restored.parent_id);
@@ -550,12 +455,10 @@ test "CompositeKey generic encode/decode" {
 test "CompositeKey preserves sort order" {
     const Pair = CompositeKey(&.{ "x", "y" });
 
-    // Primary field dominates ordering.
     const a = Pair.encode(.{ 1, 999 });
     const b = Pair.encode(.{ 2, 0 });
     try std.testing.expect(std.mem.order(u8, &a, &b) == .lt);
 
-    // Same primary — secondary breaks tie.
     const c = Pair.encode(.{ 5, 10 });
     const d = Pair.encode(.{ 5, 20 });
     try std.testing.expect(std.mem.order(u8, &c, &d) == .lt);
@@ -567,12 +470,8 @@ test "CompositeKey produces identical bytes to ParentChildKey" {
     try std.testing.expectEqualSlices(u8, &via_wrapper, &via_generic);
 }
 
-// On-disk layout: 8 (cat_id) + 1 (op) + 7 (_pad) + 8 (created_at) +
-// 1026 (FixedString(1024)) = 1050 raw, rounded to 1056 by the i64-driven
-// 8-byte struct alignment. This exact byte count must stay locked because
-// it is the wire/disk format of slug_path_repair_queue values.
-test "RepairTask: extern layout is exactly 1056 bytes" {
-    try std.testing.expectEqual(@as(usize, 1056), @sizeOf(RepairTask));
+test "RepairTask: extern layout is exactly 2080 bytes" {
+    try std.testing.expectEqual(@as(usize, 2080), @sizeOf(RepairTask));
 }
 
 test "RepairTask: round-trip via std.mem bytesToValue" {
@@ -580,11 +479,11 @@ test "RepairTask: round-trip via std.mem bytesToValue" {
         .cat_id = 42,
         .op = .renamed_slug,
         .created_at = 1714838400000,
-        .old_slug_prefix = FixedString(1024).fromSlice("top/old"),
+        .old_slug_prefix = FixedString(2048).fromSlice("top/old"),
     };
     const bytes = std.mem.asBytes(&t);
-    try std.testing.expectEqual(@as(usize, 1056), bytes.len);
-    const decoded = std.mem.bytesToValue(RepairTask, bytes[0..1056]);
+    try std.testing.expectEqual(@as(usize, 2080), bytes.len);
+    const decoded = std.mem.bytesToValue(RepairTask, bytes[0..2080]);
     try std.testing.expectEqual(@as(u64, 42), decoded.cat_id);
     try std.testing.expectEqual(RepairOp.renamed_slug, decoded.op);
     try std.testing.expectEqualStrings("top/old", decoded.old_slug_prefix.slice());

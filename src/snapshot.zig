@@ -2,25 +2,13 @@ const std = @import("std");
 const file_header = @import("file_header.zig");
 const page_cache = @import("page_cache.zig");
 
-pub const SNAP_MAGIC: u32 = 0x534E4150; // "SNAP"
+pub const SNAP_MAGIC: u32 = 0x534E4150;
 
-/// Result of a synchronous on-demand snapshot.
 pub const SnapshotResult = struct {
-    /// WAL sequence captured at snapshot time. Replays from later WAL
-    /// entries will resume from this point.
     wal_sequence: u64,
-    /// Wall-clock duration of the snapshot in milliseconds.
     duration_ms: u64,
 };
 
-/// Synchronous, on-demand snapshot trigger. Drains dirty pages, writes
-/// `snapshot.meta` atomically, and returns the captured WAL sequence
-/// plus elapsed time. Callers must serialise their own invocations:
-/// the per-DB `snapshot_in_progress` flag rejects concurrent calls
-/// with `error.SnapshotInProgress`.
-///
-/// `db` is `anytype` so `snapshot.zig` can stay free of an explicit
-/// `database.zig` import (the two would otherwise import each other).
 pub fn forceSnapshot(db: anytype) !SnapshotResult {
     if (db.snapshot_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
         return error.SnapshotInProgress;
@@ -29,12 +17,10 @@ pub fn forceSnapshot(db: anytype) !SnapshotResult {
 
     const start_ns = std.time.nanoTimestamp();
 
-    // Capture the WAL sequence first so the snapshot meta records
-    // exactly the prefix that has been durably committed.
     const wal_seq: u64 = if (db.wal_writer) |*w| w.getSequence() else 0;
 
     var mgr = SnapshotManager.init(db.config.data_dir, 0);
-    try mgr.createSnapshot(&db.cache, &db.header, wal_seq);
+    try mgr.createSnapshot(db, wal_seq);
 
     const end_ns = std.time.nanoTimestamp();
     const duration_ms: u64 = @intCast(@divTrunc(end_ns - start_ns, std.time.ns_per_ms));
@@ -69,35 +55,34 @@ pub const SnapshotManager = struct {
         };
     }
 
-    /// Returns true if interval_s has elapsed since last snapshot.
     pub fn shouldSnapshot(self: *const SnapshotManager) bool {
         const now = std.time.timestamp();
         return (now - self.last_snapshot_time) >= @as(i64, self.interval_s);
     }
 
-    /// Create a snapshot:
-    /// 1. Flush all dirty pages in cache
-    /// 2. Write snapshot marker file using write-to-temp-then-rename for atomicity
-    /// 3. Update last_snapshot_time
     pub fn createSnapshot(
         self: *SnapshotManager,
-        cache: *page_cache.PageCache,
-        header: *const file_header.FileHeader,
+        db: anytype,
         wal_sequence: u64,
     ) !void {
-        // 1. Flush all dirty pages
-        try cache.flushAll();
+        {
+            db.apply_mutex.lock();
+            defer db.apply_mutex.unlock();
+            db.mt_drain_mutex.lock();
+            defer db.mt_drain_mutex.unlock();
+
+            try db.cache.flushAll();
+            try db.flushHeader();
+        }
 
         const now = std.time.timestamp();
 
-        // 2. Build snapshot header
         const snap_header = SnapshotHeader{
             .wal_sequence = wal_sequence,
             .timestamp = now,
-            .page_count = header.page_count,
+            .page_count = db.header.page_count,
         };
 
-        // 3. Write to temp file, fsync, then rename for atomicity
         const tmp_path = try std.fs.path.join(std.heap.page_allocator, &.{ self.data_dir, "snapshot.meta.tmp" });
         defer std.heap.page_allocator.free(tmp_path);
 
@@ -113,18 +98,10 @@ pub const SnapshotManager = struct {
             try tmp_file.sync();
         }
 
-        // Atomic rename
         try std.fs.cwd().rename(tmp_path, final_path);
 
-        // fsync the parent directory so the rename is durable. Without
-        // this, a power failure between rename and the dirent flush can
-        // leave the directory pointing at the previous (or no) snapshot,
-        // forcing a longer WAL replay or losing the new checkpoint.
-        // Use posix.open directly with O_RDONLY|O_DIRECTORY — std.fs.Dir
-        // may use O_PATH on Linux, which does not support fsync.
         fsyncDir(self.data_dir);
 
-        // 4. Update last snapshot time
         self.last_snapshot_time = now;
     }
 
@@ -141,8 +118,6 @@ pub const SnapshotManager = struct {
         };
     }
 
-    /// Read snapshot.meta if it exists. Returns null if not found.
-    /// Validates magic number.
     pub fn loadSnapshotMeta(data_dir: []const u8) !?SnapshotHeader {
         const path = try std.fs.path.join(std.heap.page_allocator, &.{ data_dir, "snapshot.meta" });
         defer std.heap.page_allocator.free(path);
@@ -164,7 +139,6 @@ pub const SnapshotManager = struct {
         return snap.*;
     }
 
-    /// Load snapshot meta and return wal_sequence, or 0 if no snapshot.
     pub fn getWalSequence(data_dir: []const u8) !u64 {
         const snap = try loadSnapshotMeta(data_dir);
         if (snap) |s| {
@@ -189,7 +163,6 @@ test "create and load snapshot meta roundtrip" {
     std.fs.makeDirAbsolute(tmp_dir) catch {};
     defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
 
-    // Write a snapshot header directly (without PageCache) for unit test
     const snap_header = SnapshotHeader{
         .magic = 0x534E4150,
         .version = 1,
@@ -208,7 +181,6 @@ test "create and load snapshot meta roundtrip" {
         try file.writeAll(header_bytes);
     }
 
-    // Load it back
     const loaded = (try SnapshotManager.loadSnapshotMeta(tmp_dir)).?;
     try std.testing.expectEqual(@as(u32, 0x534E4150), loaded.magic);
     try std.testing.expectEqual(@as(u32, 1), loaded.version);
@@ -251,10 +223,8 @@ test "getWalSequence returns stored sequence" {
 test "shouldSnapshot respects interval" {
     var mgr = SnapshotManager.init("/tmp", 300);
 
-    // With last_snapshot_time=0 and interval=300, should always be true
     try std.testing.expect(mgr.shouldSnapshot());
 
-    // Set last_snapshot_time to now — should not need snapshot yet
     mgr.last_snapshot_time = std.time.timestamp();
     try std.testing.expect(!mgr.shouldSnapshot());
 }
