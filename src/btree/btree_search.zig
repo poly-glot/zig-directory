@@ -1,6 +1,3 @@
-//! Search and traversal: search, findLeaf, findLeafWithPath, findInsertPos.
-//! Aliased back into BPlusTree in btree.zig.
-
 const std = @import("std");
 const page = @import("../page.zig");
 const btree = @import("btree.zig");
@@ -18,8 +15,6 @@ const compareKeys = btree.compareKeys;
 const slotsFromConstPage = btree.slotsFromConstPage;
 const isLeaf = btree.isLeaf;
 
-/// Find value by key. Copies the value bytes into `out_buf` and returns
-/// a slice over them; returns null if the key is not found.
 pub fn search(self: *BPlusTree, key: []const u8, out_buf: []u8) !?[]const u8 {
     self.lock.lockShared();
     defer self.lock.unlockShared();
@@ -49,15 +44,8 @@ pub fn search(self: *BPlusTree, key: []const u8, out_buf: []u8) !?[]const u8 {
     return null;
 }
 
-/// Traverse from root to the leaf that should contain the given key.
-/// Used by read-only operations (search, rangeScan) that do not need
-/// the traversal path.
 pub fn findLeaf(self: *BPlusTree, key: []const u8) !PageId {
     var current = self.root_page;
-    // Page 0 is the file header; an internal-node pointer of 0 means
-    // a corrupted tree, not a valid leaf. Refuse rather than loading +
-    // checksumming the header as a Page (the read fails with
-    // "Checksum mismatch for page 0" and floods the log).
     if (current == 0) return BTreeError.Corrupted;
 
     while (true) {
@@ -68,7 +56,6 @@ pub fn findLeaf(self: *BPlusTree, key: []const u8) !PageId {
             return current;
         }
 
-        // Internal node — find child pointer to follow
         const count = pg.header.key_count;
         const slots = slotsFromConstPage(pg);
 
@@ -87,7 +74,6 @@ pub fn findLeaf(self: *BPlusTree, key: []const u8) !PageId {
         }
 
         if (!found) {
-            // key >= all separator keys — follow rightmost pointer
             child = pg.header.right_sibling;
         }
 
@@ -97,9 +83,6 @@ pub fn findLeaf(self: *BPlusTree, key: []const u8) !PageId {
     }
 }
 
-/// Traverse from root to the leaf, recording the path of internal nodes.
-/// Used by write operations (insert, delete) that may need to modify
-/// ancestors during splits or merges.
 pub fn findLeafWithPath(self: *BPlusTree, key: []const u8) !LeafWithPath {
     var current = self.root_page;
     var path = PathStack{};
@@ -112,18 +95,11 @@ pub fn findLeafWithPath(self: *BPlusTree, key: []const u8) !LeafWithPath {
             return LeafWithPath{ .leaf = current, .path = path };
         }
 
-        // Record this internal node on the path
         path.push(current);
 
-        // Internal node — find child pointer to follow
         const count = pg.header.key_count;
         const slots = slotsFromConstPage(pg);
 
-        // Sanity check on slot directory before reading keys: a runaway
-        // key_offset/key_len means the page slots got clobbered. Without
-        // this guard, getKeyAt returns a slice with a junk pointer and
-        // compareKeys walks unmapped memory until SIGSEGV — on real
-        // workloads that looks identical to a hang.
         if (count > MAX_ENTRIES_PER_PAGE) {
             std.debug.print(
                 "btree: corrupt internal page {d}: key_count={d} > MAX={d}\n",
@@ -162,7 +138,6 @@ pub fn findLeafWithPath(self: *BPlusTree, key: []const u8) !LeafWithPath {
         }
 
         if (!found) {
-            // key >= all separator keys — follow rightmost pointer
             child = pg.header.right_sibling;
         }
 
@@ -172,7 +147,6 @@ pub fn findLeafWithPath(self: *BPlusTree, key: []const u8) !LeafWithPath {
     }
 }
 
-/// Binary-ish scan to find sorted insert position for a key in a page.
 pub fn findInsertPos(_: *BPlusTree, pg: *const Page, key: []const u8) u32 {
     const count = pg.header.key_count;
     const slots = slotsFromConstPage(pg);

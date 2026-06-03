@@ -1,15 +1,3 @@
-// Category CRUD + traversal helpers split from the original monolithic
-// operations.zig. Public surface:
-//   - createCategory   - listChildren
-//   - getCategory      - getCategoryPath
-//   - updateCategory   - walkAncestors
-//   - deleteCategory
-//   - moveCategory
-//
-// ChangeSet construction lives in `operations_changeset_compute.zig`.
-// Link-side operations (`deleteLink`, `listLinks`) used by
-// `deleteCategory` are imported from `operations_link.zig`.
-
 const std = @import("std");
 const types = @import("../types.zig");
 const Database = @import("../database.zig").Database;
@@ -22,14 +10,6 @@ const MAX_NAME_LEN = shared.MAX_NAME_LEN;
 const MAX_SLUG_LEN = shared.MAX_SLUG_LEN;
 const MAX_CATEGORY_DESC_LEN = shared.MAX_CATEGORY_DESC_LEN;
 
-/// Create a new category under parent_id, returning the new category's id.
-///
-/// Builds a `category_inserted` ChangeSet and routes it through `db.commit`,
-/// which encodes + WAL-appends + fsyncs + applies under `apply_mutex`. All
-/// index writes (primary `categories_by_id`, secondary `cat_by_parent`,
-/// slug-path B+Trees, inverted-index `categories_index_tree`, ancestor
-/// count cascade, direct child_count bump on the parent, subtree_cache
-/// invalidation) are performed by `applyCategoryInserted` — see `src/apply.zig`.
 pub fn createCategory(
     db: *Database,
     parent_id: u64,
@@ -41,12 +21,10 @@ pub fn createCategory(
         slug_str.len > MAX_SLUG_LEN or
         desc.len > MAX_CATEGORY_DESC_LEN) return OperationError.FieldTooLong;
 
-    // Validate parent exists if non-zero. parent_id == 0 means root.
     if (parent_id != 0) {
         if ((try getCategory(db, parent_id)) == null) return OperationError.ParentNotFound;
     }
 
-    // Allocate a new category id via lock-free atomic increment.
     const id = db.next_category_id.fetchAdd(1, .monotonic);
     const now = std.time.timestamp();
 
@@ -73,10 +51,6 @@ pub fn createCategory(
     return id;
 }
 
-/// Retrieve a category by its id. Returns null if not found.
-/// Checks the memtable first (recent writes), falls through to the
-/// B+Tree. Counts are mutated only via the ancestor-cascade path through
-/// the memtable, so the value returned here is authoritative.
 pub fn getCategory(db: *Database, id: u64) !?types.Category {
     const key = types.encodeU64(id);
     const mt_result = db.mt_categories_by_id.get(&key);
@@ -90,23 +64,6 @@ pub fn getCategory(db: *Database, id: u64) !?types.Category {
     return std.mem.bytesToValue(types.Category, val[0..@sizeOf(types.Category)]);
 }
 
-/// Update mutable fields of an existing category.
-///
-/// Splits on whether the slug actually changes:
-///
-///  * Slug unchanged (text-only edit: name and/or description) → builds a
-///    `category_text_updated` ChangeSet and routes through `db.commit`,
-///    which encodes + WAL-appends + fsyncs + applies under `apply_mutex`.
-///    All index writes (primary `categories_by_id`, inverted-index
-///    `categories_index_tree` token swap, subtree_cache invalidation) are
-///    performed by `applyCategoryTextUpdated` — see `src/apply.zig`.
-///
-///  * Slug changed → builds a `category_renamed` ChangeSet (via
-///    `computeCategoryRenameChangeSet`) and routes through `db.commit`.
-///    All on-disk writes (primary `categories_by_id`, `categories_by_slug_path`
-///    swap for self, slug-only maintenance, descendant slug-path rebuild,
-///    subtree_cache invalidation) are performed by `applyCategoryRenamed`
-///    — see `src/apply.zig`.
 pub fn updateCategory(
     db: *Database,
     id: u64,
@@ -120,10 +77,6 @@ pub fn updateCategory(
 
     const old_cat = (try getCategory(db, id)) orelse return OperationError.CategoryNotFound;
 
-    // Detect a real slug change: only treat this as a rename if the
-    // caller passed a slug AND it differs from the stored slug. A no-op
-    // slug update (passing the same slug) routes through the cheaper
-    // text-update path.
     const slug_changed = if (slug_str) |s|
         !std.mem.eql(u8, s, old_cat.slug.slice())
     else
@@ -143,8 +96,6 @@ pub fn updateCategory(
         return;
     }
 
-    // Build a category_renamed ChangeSet and route through db.commit so
-    // the slug-path B+Trees swap atomically with the primary row.
     var new_cat = old_cat;
     if (name) |n| new_cat.name = types.FixedString(64).fromSlice(n);
     if (slug_str) |s| new_cat.slug = types.FixedString(128).fromSlice(s);
@@ -158,32 +109,13 @@ pub fn updateCategory(
     try db.commit(cs);
 }
 
-/// Delete a category. Pre-condition: category has no children and no links.
-///
-/// Builds a `category_deleted` ChangeSet and routes it through `db.commit`,
-/// which encodes + WAL-appends + fsyncs + applies under `apply_mutex`. All
-/// index tombstones (primary `categories_by_id`, secondary `cat_by_parent`,
-/// slug-path B+Trees, inverted-index `categories_index_tree`, ancestor
-/// count cascade, parent's direct `child_count` decrement, subtree_cache
-/// invalidation) are performed by `applyCategoryDeleted` — see `src/apply.zig`.
 pub fn deleteCategory(db: *Database, id: u64) !void {
-    // Pre-condition checks stay outside the ChangeSet path: they're caller
-    // contract, not state mutations.
     if ((try getCategory(db, id)) == null) return OperationError.CategoryNotFound;
 
-    // Reject deletion if category has children.
     var children_buf: [1]types.Category = undefined;
     const children = try listChildren(db, id, 0, 1, &children_buf);
     if (children.len > 0) return OperationError.CategoryHasChildren;
 
-    // Delete all links in this category. deleteLink takes apply_mutex
-    // itself (via db.commit), so this loop runs BEFORE our own ChangeSet
-    // commit. Each deleteLink decrements link_count_subtree on every
-    // ancestor — by the time the loop drains, the cat's own subtree
-    // contribution to ancestors is zero.
-    // Always use offset 0 because each deletion removes entries from the
-    // index, so the remaining entries shift down. Incrementing offset
-    // would skip entries.
     var links_buf: [64]types.Link = undefined;
     while (true) {
         const links = (try link_mod.listLinks(db, id, 0, 64, &links_buf, null, 0)).items;
@@ -193,9 +125,6 @@ pub fn deleteCategory(db: *Database, id: u64) !void {
         }
     }
 
-    // Re-read the cat AFTER the link cascade so the ChangeSet captures the
-    // post-drain link_count_subtree (each deleteLink above drove this
-    // category's count toward zero by mutating the memtable copy).
     const cat = (try getCategory(db, id)) orelse return OperationError.CategoryNotFound;
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
@@ -205,27 +134,13 @@ pub fn deleteCategory(db: *Database, id: u64) !void {
     try db.commit(cs);
 }
 
-/// Move a category to a new parent.
-///
-/// Builds a `category_moved` ChangeSet (via `computeCategoryMoveChangeSet`)
-/// and routes it through `db.commit`, which encodes + WAL-appends + fsyncs
-/// + applies under `apply_mutex`. All on-disk writes (primary
-/// `categories_by_id` parent_id flip, `cat_by_parent` swap, slug-path B+Tree
-/// swap for self + descendant rebuild, both chain subtree cascades, immediate
-/// parents' direct `child_count` adjustment, subtree_cache invalidation) are
-/// performed by `applyCategoryMoved` — see `src/apply.zig`.
 pub fn moveCategory(db: *Database, id: u64, new_parent_id: u64) !void {
     const old_cat = (try getCategory(db, id)) orelse return OperationError.CategoryNotFound;
 
-    // Validate new parent exists.
     if (new_parent_id != 0) {
         if ((try getCategory(db, new_parent_id)) == null) return OperationError.ParentNotFound;
     }
 
-    // Check for circular hierarchy: walk from new_parent up to root.
-    // A chain longer than MAX_HIERARCHY_DEPTH is itself an error: we
-    // cannot prove the absence of a cycle, so refuse rather than
-    // silently allowing a potentially circular move.
     if (new_parent_id != 0) {
         const MAX_HIERARCHY_DEPTH = 256;
         var walk_id = new_parent_id;
@@ -238,11 +153,8 @@ pub fn moveCategory(db: *Database, id: u64, new_parent_id: u64) !void {
         }
     }
 
-    if (old_cat.parent_id == new_parent_id) return; // no-op move
+    if (old_cat.parent_id == new_parent_id) return;
 
-    // computeCategoryMoveChangeSet takes the pre-move cat and flips parent_id
-    // + bumps updated_at internally (the post-move snapshot lands in the
-    // ChangeSet's `.cat` field).
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
     const cs = try compute.computeCategoryMoveChangeSet(
@@ -255,7 +167,6 @@ pub fn moveCategory(db: *Database, id: u64, new_parent_id: u64) !void {
     try db.commit(cs);
 }
 
-/// List child categories of a parent, with pagination.
 pub fn listChildren(
     db: *Database,
     parent_id: u64,
@@ -263,10 +174,8 @@ pub fn listChildren(
     limit: u32,
     buf: []types.Category,
 ) ![]types.Category {
-    // Drain memtable so range scan sees fresh data. Serialized via drain mutex.
     db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
 
-    // Build range prefix for cat_by_parent: all keys starting with parent_id.
     const start_key = types.ParentChildKey.encode(parent_id, 0);
     const end_key = types.ParentChildKey.encode(parent_id, std.math.maxInt(u64));
 
@@ -282,7 +191,6 @@ pub fn listChildren(
         }
         if (count >= max) break;
 
-        // The value is the encoded category id.
         if (entry.value.len < 8) return OperationError.DatabaseCorrupted;
         const child_id = types.decodeU64(entry.value);
         if (try getCategory(db, child_id)) |cat| {
@@ -294,8 +202,6 @@ pub fn listChildren(
     return buf[0..count];
 }
 
-/// Walk from a category up to root, returning the path of category ids.
-/// The result is ordered from root to the given id.
 pub fn getCategoryPath(db: *Database, id: u64, buf: []u64) ![]u64 {
     var path_len: usize = 0;
     var current_id = id;
@@ -309,7 +215,6 @@ pub fn getCategoryPath(db: *Database, id: u64, buf: []u64) ![]u64 {
         current_id = cat.parent_id;
     }
 
-    // Reverse to get root-first order.
     if (path_len > 1) {
         std.mem.reverse(u64, buf[0..path_len]);
     }
@@ -317,15 +222,11 @@ pub fn getCategoryPath(db: *Database, id: u64, buf: []u64) ![]u64 {
     return buf[0..path_len];
 }
 
-/// Walk from `id` up to root, returning ancestors EXCLUDING the target itself.
-/// Order: root first, target's parent last. Empty list when the target is itself
-/// a root (parent_id == 0). Caller's buffer caps the depth.
 pub fn walkAncestors(
     db: *Database,
     id: u64,
     buf: []types.Category,
 ) ![]types.Category {
-    // First collect ids walking up; then reverse and look up each Category.
     var id_buf: [64]u64 = undefined;
     var depth: usize = 0;
 
@@ -337,7 +238,6 @@ pub fn walkAncestors(
         const ancestor = (try getCategory(db, cur)) orelse break;
         cur = ancestor.parent_id;
     }
-    // id_buf[0..depth] is leaf-up; reverse into the result buffer (root-first).
     if (depth > buf.len) depth = buf.len;
     var i: usize = 0;
     while (i < depth) : (i += 1) {
@@ -345,6 +245,192 @@ pub fn walkAncestors(
         buf[i] = (try getCategory(db, aid)) orelse return buf[0..i];
     }
     return buf[0..depth];
+}
+
+const SubtreeAgg = struct { link_subtree: u64, child_subtree: u32 };
+
+pub fn recomputeCategoryCounts(db: *Database) !void {
+    const allocator = db.allocator;
+
+    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
+    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
+
+    var direct_links = std.AutoHashMap(u64, u32).init(allocator);
+    defer direct_links.deinit();
+    {
+        const min_key: [16]u8 = .{0} ** 16;
+        var iter = try db.link_by_category.rangeScan(&min_key, null);
+        while (try iter.next()) |entry| {
+            if (entry.key.len < 8) continue;
+            const cid = std.mem.readInt(u64, entry.key[0..8], .big);
+            const gop = try direct_links.getOrPut(cid);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* +|= 1;
+        }
+    }
+
+    var children_of = std.AutoHashMap(u64, std.ArrayListUnmanaged(u64)).init(allocator);
+    defer {
+        var vit = children_of.valueIterator();
+        while (vit.next()) |list| list.deinit(allocator);
+        children_of.deinit();
+    }
+    {
+        const min_key: [16]u8 = .{0} ** 16;
+        var iter = try db.cat_by_parent.rangeScan(&min_key, null);
+        while (try iter.next()) |entry| {
+            if (entry.key.len < 16) continue;
+            const parent = std.mem.readInt(u64, entry.key[0..8], .big);
+            const child = std.mem.readInt(u64, entry.key[8..16], .big);
+            const gop = try children_of.getOrPut(parent);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.append(allocator, child);
+        }
+    }
+
+    var all_ids: std.ArrayListUnmanaged(u64) = .{};
+    defer all_ids.deinit(allocator);
+    {
+        const min_key = types.encodeU64(0);
+        var iter = try db.categories_by_id.rangeScan(&min_key, null);
+        while (try iter.next()) |entry| {
+            if (entry.value.len < @sizeOf(types.Category)) continue;
+            const cat = std.mem.bytesToValue(types.Category, entry.value[0..@sizeOf(types.Category)]);
+            try all_ids.append(allocator, cat.id);
+        }
+    }
+
+    var computed = std.AutoHashMap(u64, SubtreeAgg).init(allocator);
+    defer computed.deinit();
+
+    const Frame = struct { id: u64, expanded: bool };
+    var stack: std.ArrayListUnmanaged(Frame) = .{};
+    defer stack.deinit(allocator);
+    var on_path = std.AutoHashMap(u64, void).init(allocator);
+    defer on_path.deinit();
+
+    for (all_ids.items) |root| {
+        if (computed.contains(root)) continue;
+        stack.clearRetainingCapacity();
+        on_path.clearRetainingCapacity();
+        try stack.append(allocator, .{ .id = root, .expanded = false });
+        while (stack.items.len > 0) {
+            const idx = stack.items.len - 1;
+            const cur = stack.items[idx];
+            if (!cur.expanded) {
+                stack.items[idx].expanded = true;
+                if (computed.contains(cur.id)) {
+                    _ = stack.pop();
+                    continue;
+                }
+                try on_path.put(cur.id, {});
+                if (children_of.get(cur.id)) |kids| {
+                    for (kids.items) |c| {
+                        if (computed.contains(c)) continue;
+                        if (on_path.contains(c)) continue;
+                        try stack.append(allocator, .{ .id = c, .expanded = false });
+                    }
+                }
+                continue;
+            }
+            _ = stack.pop();
+            _ = on_path.remove(cur.id);
+            if (computed.contains(cur.id)) continue;
+
+            var sub_l: u64 = direct_links.get(cur.id) orelse 0;
+            var sub_c: u32 = 0;
+            if (children_of.get(cur.id)) |kids| {
+                for (kids.items) |c| {
+                    const cc = computed.get(c) orelse SubtreeAgg{ .link_subtree = 0, .child_subtree = 0 };
+                    sub_l +%= cc.link_subtree;
+                    sub_c +|= 1 +| cc.child_subtree;
+                }
+            }
+            try computed.put(cur.id, .{ .link_subtree = sub_l, .child_subtree = sub_c });
+        }
+    }
+
+    const now = std.time.timestamp();
+    var rewritten: u64 = 0;
+    {
+        const min_key = types.encodeU64(0);
+        var iter = try db.categories_by_id.rangeScan(&min_key, null);
+        while (try iter.next()) |entry| {
+            if (entry.value.len < @sizeOf(types.Category)) continue;
+            var cat = std.mem.bytesToValue(types.Category, entry.value[0..@sizeOf(types.Category)]);
+
+            const new_link: u32 = direct_links.get(cat.id) orelse 0;
+            const new_child: u32 = if (children_of.get(cat.id)) |k| @intCast(k.items.len) else 0;
+            const agg = computed.get(cat.id) orelse SubtreeAgg{ .link_subtree = new_link, .child_subtree = 0 };
+
+            if (cat.link_count == new_link and cat.child_count == new_child and
+                cat.link_count_subtree == agg.link_subtree and cat.child_count_subtree == agg.child_subtree)
+            {
+                continue;
+            }
+            cat.link_count = new_link;
+            cat.child_count = new_child;
+            cat.link_count_subtree = agg.link_subtree;
+            cat.child_count_subtree = agg.child_subtree;
+            cat.updated_at = now;
+            const id_key = types.encodeU64(cat.id);
+            try db.mt_categories_by_id.put(&id_key, std.mem.asBytes(&cat));
+            rewritten += 1;
+        }
+    }
+
+    if (rewritten > 0) {
+        std.log.scoped(.recover).info(
+            "recomputeCategoryCounts: corrected {d} categor{s}",
+            .{ rewritten, if (rewritten == 1) "y" else "ies" },
+        );
+    }
+}
+
+test "recomputeCategoryCounts: rebuilds drifted counts from indexes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Database.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try createCategory(db, 0, "Top", "top", "");
+    const a_id = try createCategory(db, top_id, "A", "a", "");
+    const b_id = try createCategory(db, a_id, "B", "b", "");
+    _ = try link_mod.createLink(db, b_id, "https://x1.example", "X1", "");
+    _ = try link_mod.createLink(db, b_id, "https://x2.example", "X2", "");
+    _ = try link_mod.createLink(db, a_id, "https://x3.example", "X3", "");
+
+    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
+    {
+        var tampered = (try getCategory(db, top_id)).?;
+        tampered.link_count = 99;
+        tampered.child_count = 99;
+        tampered.link_count_subtree = 99;
+        tampered.child_count_subtree = 99;
+        const id_key = types.encodeU64(top_id);
+        try db.categories_by_id.insert(&id_key, std.mem.asBytes(&tampered));
+    }
+    try std.testing.expectEqual(@as(u64, 99), (try getCategory(db, top_id)).?.link_count_subtree);
+
+    try recomputeCategoryCounts(db);
+
+    const top = (try getCategory(db, top_id)).?;
+    try std.testing.expectEqual(@as(u32, 0), top.link_count);
+    try std.testing.expectEqual(@as(u32, 1), top.child_count);
+    try std.testing.expectEqual(@as(u64, 3), top.link_count_subtree);
+    try std.testing.expectEqual(@as(u32, 2), top.child_count_subtree);
+
+    const a = (try getCategory(db, a_id)).?;
+    try std.testing.expectEqual(@as(u32, 1), a.link_count);
+    try std.testing.expectEqual(@as(u32, 1), a.child_count);
+    try std.testing.expectEqual(@as(u64, 3), a.link_count_subtree);
+    try std.testing.expectEqual(@as(u32, 1), a.child_count_subtree);
+
+    const b = (try getCategory(db, b_id)).?;
+    try std.testing.expectEqual(@as(u32, 2), b.link_count);
+    try std.testing.expectEqual(@as(u64, 2), b.link_count_subtree);
 }
 
 test "createCategory cascades child_count_subtree up the chain" {
@@ -360,8 +446,8 @@ test "createCategory cascades child_count_subtree up the chain" {
 
     const top = (try getCategory(db, top_id)).?;
     const a = (try getCategory(db, a_id)).?;
-    try std.testing.expectEqual(@as(u32, 1), a.child_count_subtree); // B
-    try std.testing.expectEqual(@as(u32, 2), top.child_count_subtree); // A + B
+    try std.testing.expectEqual(@as(u32, 1), a.child_count_subtree);
+    try std.testing.expectEqual(@as(u32, 2), top.child_count_subtree);
 }
 
 test "createCategory: indexing B+Trees populated by category_inserted ChangeSet" {
@@ -371,25 +457,18 @@ test "createCategory: indexing B+Trees populated by category_inserted ChangeSet"
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Set up: top + child cat. Both pass through computeCategoryInsertChangeSet
-    // → db.commit → applyCategoryInserted, which is what we're verifying here.
     const top_id = try createCategory(db, 0, "Top", "top", "");
     const child_id = try createCategory(db, top_id, "Programming", "programming", "Code stuff");
 
     var v_buf: [64]u8 = undefined;
     const child_id_be = types.encodeU64(child_id);
 
-    // categories_by_slug_path: full canonical path → child_id (8-byte BE).
     const slug_path_val = (try db.categories_by_slug_path.search("top/programming", &v_buf)).?;
     try std.testing.expectEqualSlices(u8, &child_id_be, slug_path_val);
 
-    // categories_by_slug_only: leaf slug → child_id (since this is the
-    // shallowest holder of "programming").
     const slug_only_val = (try db.categories_by_slug_only.search("programming", &v_buf)).?;
     try std.testing.expectEqualSlices(u8, &child_id_be, slug_only_val);
 
-    // categories_index_tree: token entries for name + slug + description.
-    // Key = token_bytes || encodeU64(child_id), value empty.
     var key_buf: [128]u8 = undefined;
     const expected_tokens = [_][]const u8{ "programming", "code", "stuff" };
     for (expected_tokens) |tok| {
@@ -399,7 +478,6 @@ test "createCategory: indexing B+Trees populated by category_inserted ChangeSet"
         try std.testing.expect(found != null);
     }
 
-    // Parent's child_count_subtree was bumped by the cascade.
     const top = (try getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u32, 1), top.child_count_subtree);
 }
@@ -426,28 +504,21 @@ test "deleteCategory: indexing B+Trees tombstoned by category_deleted ChangeSet"
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // createCategory + deleteCategory: both routed through the ChangeSet
-    // path, so this test covers the round-trip on the on-disk indexes.
     const top_id = try createCategory(db, 0, "Top", "top", "");
     const child_id = try createCategory(db, top_id, "Programming", "programming", "Code stuff");
 
     var v_buf: [64]u8 = undefined;
     const child_id_be = types.encodeU64(child_id);
 
-    // Sanity: insert populated everything.
     try std.testing.expect((try db.categories_by_slug_path.search("top/programming", &v_buf)) != null);
     try std.testing.expect((try db.categories_by_slug_only.search("programming", &v_buf)) != null);
 
     try deleteCategory(db, child_id);
 
-    // categories_by_slug_path: full canonical path entry gone.
     try std.testing.expect((try db.categories_by_slug_path.search("top/programming", &v_buf)) == null);
 
-    // categories_by_slug_only: leaf "programming" entry gone (it pointed at
-    // this cat — the only holder of that slug).
     try std.testing.expect((try db.categories_by_slug_only.search("programming", &v_buf)) == null);
 
-    // categories_index_tree: every token entry for name/slug/desc absent.
     var key_buf: [128]u8 = undefined;
     const expected_tokens = [_][]const u8{ "programming", "code", "stuff" };
     for (expected_tokens) |tok| {
@@ -456,7 +527,6 @@ test "deleteCategory: indexing B+Trees tombstoned by category_deleted ChangeSet"
         try std.testing.expect((try db.categories_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf)) == null);
     }
 
-    // Parent's child_count_subtree back to 0 (the cascade ran).
     const top = (try getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u32, 0), top.child_count_subtree);
 }
@@ -468,9 +538,6 @@ test "updateCategory (text): name/desc tokens swapped in categories_index_tree" 
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Create a cat then update its name + description WITHOUT touching the
-    // slug. Routes through computeCategoryTextUpdateChangeSet → db.commit
-    // → applyCategoryTextUpdated, which is what we're verifying.
     const top_id = try createCategory(db, 0, "Top", "top", "");
     const child_id = try createCategory(db, top_id, "Programming", "programming", "Code stuff");
 
@@ -478,7 +545,6 @@ test "updateCategory (text): name/desc tokens swapped in categories_index_tree" 
     var key_buf: [128]u8 = undefined;
     const child_id_be = types.encodeU64(child_id);
 
-    // Sanity: old text-only tokens exist before the update.
     {
         const tokens = [_][]const u8{ "code", "stuff" };
         for (tokens) |tok| {
@@ -489,11 +555,8 @@ test "updateCategory (text): name/desc tokens swapped in categories_index_tree" 
         }
     }
 
-    // Update name + description, leaving slug "programming" untouched so we
-    // exercise the text-only path (not the slug-rename path).
     try updateCategory(db, child_id, "Hacking", "programming", "Network tricks");
 
-    // Old text-only tokens are gone for this cat.
     {
         const tokens = [_][]const u8{ "code", "stuff" };
         for (tokens) |tok| {
@@ -504,7 +567,6 @@ test "updateCategory (text): name/desc tokens swapped in categories_index_tree" 
         }
     }
 
-    // New text-only tokens are present.
     {
         const tokens = [_][]const u8{ "hacking", "network", "tricks" };
         for (tokens) |tok| {
@@ -515,10 +577,6 @@ test "updateCategory (text): name/desc tokens swapped in categories_index_tree" 
         }
     }
 
-    // The slug token persists across the swap because the slug bytes are
-    // identical in old_tokens and new_tokens; the new_tokens insert
-    // (overwrite-on-key) reinstates the entry the old_tokens delete
-    // removed.
     {
         const tok = "programming";
         @memcpy(key_buf[0..tok.len], tok);
@@ -527,7 +585,6 @@ test "updateCategory (text): name/desc tokens swapped in categories_index_tree" 
         try std.testing.expect(found != null);
     }
 
-    // Primary reflects the new fields; slug is unchanged.
     const cat = (try getCategory(db, child_id)).?;
     try std.testing.expect(cat.name.eql("Hacking"));
     try std.testing.expect(cat.slug.eql("programming"));
@@ -541,9 +598,6 @@ test "updateCategory (slug rename): slug-path B+Trees swapped + descendants rebu
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Set up: top → cat (slug "old") → child (slug "leaf"). Renaming `cat`
-    // exercises both the self-swap in categories_by_slug_path AND the
-    // descendant rebuild path inside applyCategoryRenamed (via db.commit).
     const top_id = try createCategory(db, 0, "Top", "top", "");
     const cat_id = try createCategory(db, top_id, "Cat", "old", "");
     const child_id = try createCategory(db, cat_id, "Child", "leaf", "");
@@ -552,7 +606,6 @@ test "updateCategory (slug rename): slug-path B+Trees swapped + descendants rebu
     const cat_id_be = types.encodeU64(cat_id);
     const child_id_be = types.encodeU64(child_id);
 
-    // Sanity: initial slug-path entries are present.
     try std.testing.expectEqualSlices(
         u8,
         &cat_id_be,
@@ -569,12 +622,8 @@ test "updateCategory (slug rename): slug-path B+Trees swapped + descendants rebu
         (try db.categories_by_slug_only.search("old", &v_buf)).?,
     );
 
-    // Rename cat: "old" → "new". Routes through computeCategoryRenameChangeSet
-    // → db.commit → applyCategoryRenamed.
     try updateCategory(db, cat_id, null, "new", null);
 
-    // categories_by_slug_path: old self path gone, new self path present,
-    // descendant present under the new ancestor slug.
     try std.testing.expect((try db.categories_by_slug_path.search("top/old", &v_buf)) == null);
     try std.testing.expectEqualSlices(
         u8,
@@ -587,7 +636,6 @@ test "updateCategory (slug rename): slug-path B+Trees swapped + descendants rebu
         (try db.categories_by_slug_path.search("top/new/leaf", &v_buf)).?,
     );
 
-    // categories_by_slug_only: old leaf-slug entry gone, new entry holds the cat.
     try std.testing.expect((try db.categories_by_slug_only.search("old", &v_buf)) == null);
     try std.testing.expectEqualSlices(
         u8,
@@ -595,7 +643,6 @@ test "updateCategory (slug rename): slug-path B+Trees swapped + descendants rebu
         (try db.categories_by_slug_only.search("new", &v_buf)).?,
     );
 
-    // Primary reflects the new slug.
     const got = (try getCategory(db, cat_id)).?;
     try std.testing.expect(got.slug.eql("new"));
 }
@@ -615,9 +662,9 @@ test "deep chain: createCategory cascades to all ancestors" {
     const top = (try getCategory(db, top_id)).?;
     const a = (try getCategory(db, a_id)).?;
     const b = (try getCategory(db, b_id)).?;
-    try std.testing.expectEqual(@as(u32, 1), b.child_count_subtree); // C
-    try std.testing.expectEqual(@as(u32, 2), a.child_count_subtree); // B + C
-    try std.testing.expectEqual(@as(u32, 3), top.child_count_subtree); // A + B + C
+    try std.testing.expectEqual(@as(u32, 1), b.child_count_subtree);
+    try std.testing.expectEqual(@as(u32, 2), a.child_count_subtree);
+    try std.testing.expectEqual(@as(u32, 3), top.child_count_subtree);
 }
 
 test "moveCategory cascades counts in both old and new chains" {
@@ -633,7 +680,6 @@ test "moveCategory cascades counts in both old and new chains" {
     _ = try link_mod.createLink(db, b_id, "https://x.example", "x", "");
     const c_id = try createCategory(db, top_id, "C", "c", "");
 
-    // Pre-move state
     {
         const a = (try getCategory(db, a_id)).?;
         try std.testing.expectEqual(@as(u64, 1), a.link_count_subtree);
@@ -645,14 +691,12 @@ test "moveCategory cascades counts in both old and new chains" {
 
     try moveCategory(db, b_id, c_id);
 
-    // Post-move state
     const a = (try getCategory(db, a_id)).?;
     try std.testing.expectEqual(@as(u64, 0), a.link_count_subtree);
     try std.testing.expectEqual(@as(u32, 0), a.child_count_subtree);
     const c = (try getCategory(db, c_id)).?;
     try std.testing.expectEqual(@as(u64, 1), c.link_count_subtree);
     try std.testing.expectEqual(@as(u32, 1), c.child_count_subtree);
-    // Top unchanged (link still under it via C now).
     const top = (try getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u64, 1), top.link_count_subtree);
 }
@@ -672,22 +716,14 @@ test "moveCategory carrying multiple descendants" {
     _ = try link_mod.createLink(db, a1_id, "https://1.example", "1", "");
     _ = try link_mod.createLink(db, a_id, "https://2.example", "2", "");
 
-    // Before move:
-    // A.subtree: links=2, children=2 (A1, A2)
-    // X.subtree: links=0, children=0
-    // Top.subtree: links=2, children=4 (X, A, A1, A2)
     {
         const a = (try getCategory(db, a_id)).?;
         try std.testing.expectEqual(@as(u64, 2), a.link_count_subtree);
         try std.testing.expectEqual(@as(u32, 2), a.child_count_subtree);
     }
 
-    // Move A under X.
     try moveCategory(db, a_id, x_id);
 
-    // After move:
-    // X.subtree: links=2, children=3 (A, A1, A2)
-    // Top.subtree: links=2, children=4 (unchanged — same total)
     const x = (try getCategory(db, x_id)).?;
     try std.testing.expectEqual(@as(u64, 2), x.link_count_subtree);
     try std.testing.expectEqual(@as(u32, 3), x.child_count_subtree);
@@ -708,7 +744,7 @@ test "moveCategory same parent is no-op for counts" {
     _ = try link_mod.createLink(db, a_id, "https://x.example", "x", "");
 
     const before = (try getCategory(db, top_id)).?.link_count_subtree;
-    try moveCategory(db, a_id, top_id); // same parent
+    try moveCategory(db, a_id, top_id);
     const after = (try getCategory(db, top_id)).?.link_count_subtree;
     try std.testing.expectEqual(before, after);
 }
@@ -720,16 +756,11 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    // Set up: top → A, top → B, A → C. Move C from A to B.
-    // Expect: cat_by_parent has (B, C) not (A, C); categories_by_slug_path
-    // has "top/b/c" not "top/a/c"; A.child_count_subtree decremented,
-    // B.child_count_subtree incremented.
     const top_id = try createCategory(db, 0, "Top", "top", "");
     const a_id = try createCategory(db, top_id, "A", "a", "");
     const b_id = try createCategory(db, top_id, "B", "b", "");
     const c_id = try createCategory(db, a_id, "C", "c", "");
 
-    // Pre-move state — sanity: A has C as a child, B has none.
     {
         const a = (try getCategory(db, a_id)).?;
         const b = (try getCategory(db, b_id)).?;
@@ -739,7 +770,6 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
 
     try moveCategory(db, c_id, b_id);
 
-    // cat_by_parent: (A, C) absent, (B, C) present. Memtable-then-B+Tree.
     var v_buf: [64]u8 = undefined;
     {
         const old_pc_key = types.ParentChildKey.encode(a_id, c_id);
@@ -761,12 +791,10 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
         try std.testing.expect(new_present);
     }
 
-    // categories_by_slug_path: "top/b/c" present, "top/a/c" absent.
     const c_id_be = types.encodeU64(c_id);
     try std.testing.expectEqualSlices(u8, &c_id_be, (try db.categories_by_slug_path.search("top/b/c", &v_buf)).?);
     try std.testing.expect((try db.categories_by_slug_path.search("top/a/c", &v_buf)) == null);
 
-    // Subtree counts: A drained, B bumped. Top unchanged (C still under it).
     const a = (try getCategory(db, a_id)).?;
     const b = (try getCategory(db, b_id)).?;
     try std.testing.expectEqual(@as(u32, 0), a.child_count_subtree);

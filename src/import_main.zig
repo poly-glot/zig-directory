@@ -1,19 +1,3 @@
-// One-shot DMOZ importer. Reads two TSV files produced by
-// `data-import/extract.py` and inserts them into a fresh database via the
-// operations API.
-//
-// Usage:
-//   dmoz_import <data_dir> <cats.tsv> <links.tsv>
-//
-// Expected TSV formats:
-//   cats.tsv:  full_path \t parent_path \t name \t slug
-//              (sorted depth-first so parents always precede children;
-//               root entries have parent_path == "Top" or empty.)
-//   links.tsv: topic_path \t url \t title \t description
-//
-// Aborts the entire import if the data dir is non-empty: the importer is
-// only meant to populate fresh databases, never to merge into existing ones.
-
 const std = @import("std");
 const Database = @import("database.zig").Database;
 const operations = @import("operations/operations.zig");
@@ -154,8 +138,6 @@ fn importLinks(
         };
         n_created += 1;
         if (n_created % 5000 == 0) {
-            // Drain memtables to B+Trees, flush dirty pages, then truncate the WAL
-            // so the import doesn't accumulate gigabytes of in-memory state.
             db.drainAllMemtables();
             const snap = snapshot.forceSnapshot(db) catch |e| blk: {
                 log.warn("forceSnapshot failed: {}", .{e});
@@ -183,7 +165,6 @@ pub fn main() !void {
     const cats_path = argv[2];
     const links_path = argv[3];
 
-    // Resolve data_dir to an absolute path so Database.init's makeDirAbsolute works.
     const abs_data_dir = std.fs.cwd().realpathAlloc(allocator, data_dir) catch |err| switch (err) {
         error.FileNotFound => blk: {
             std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {

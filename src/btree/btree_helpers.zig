@@ -1,7 +1,3 @@
-//! Misc small methods for BPlusTree: init, getRootPage, truncate, rangeScan,
-//! getMutablePage. Aliased back into the BPlusTree struct in btree.zig so
-//! callers can keep using `tree.init(...)`, `tree.rangeScan(...)`, etc.
-
 const std = @import("std");
 const page = @import("../page.zig");
 const page_cache = @import("../page_cache.zig");
@@ -32,13 +28,12 @@ pub fn getRootPage(self: *const BPlusTree) PageId {
     return self.root_page;
 }
 
-/// Truncate the tree to empty. Frees every page reachable from the
-/// current root back to the freelist, then allocates a fresh empty
-/// root leaf. Resets `entry_count` and the cached rightmost path.
-///
-/// Used by the schema migration to drop a derived secondary index
-/// (e.g. `cat_by_parent`) before rebuilding it deterministically
-/// from the authoritative `categories_by_id` tree.
+pub fn entryCount(self: *BPlusTree) u64 {
+    self.lock.lockShared();
+    defer self.lock.unlockShared();
+    return self.entry_count;
+}
+
 pub fn truncate(self: *BPlusTree, allocator: std.mem.Allocator) !void {
     self.lock.lock();
     defer self.lock.unlock();
@@ -58,10 +53,6 @@ pub fn truncate(self: *BPlusTree, allocator: std.mem.Allocator) !void {
     self.cached_rightmost_path = .{};
 }
 
-/// Recursively free `page_id` and every descendant page back to the
-/// freelist. For internal nodes, the children are collected from the
-/// slot values (4-byte LE PageId) plus `right_sibling` (rightmost
-/// child) before the parent itself is unpinned and freed.
 pub fn freeSubtree(self: *BPlusTree, allocator: std.mem.Allocator, page_id: PageId) !void {
     if (page_id == INVALID_PAGE) return;
 
@@ -89,8 +80,6 @@ pub fn freeSubtree(self: *BPlusTree, allocator: std.mem.Allocator, page_id: Page
     try self.free_list.freePage(page_id);
 }
 
-/// Create an iterator for keys in [start_key, end_key).
-/// If end_key is null, iterates to the end of the tree.
 pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) !RangeScanIterator {
     self.lock.lockShared();
     defer self.lock.unlockShared();
@@ -107,8 +96,7 @@ pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) 
     const leaf_id = try self.findLeaf(start_key);
     const pg = try self.cache.getPage(leaf_id);
 
-    // Find first slot whose key >= start_key
-    var start_slot: u32 = pg.header.key_count; // past-end by default
+    var start_slot: u32 = pg.header.key_count;
     const count = pg.header.key_count;
     const slots = slotsFromConstPage(pg);
     for (0..count) |i| {
@@ -130,7 +118,6 @@ pub fn rangeScan(self: *BPlusTree, start_key: []const u8, end_key: ?[]const u8) 
     };
 }
 
-/// Get a mutable Page pointer from the cache.
 pub fn getMutablePage(self: *BPlusTree, pid: PageId) !*Page {
     return self.cache.getPageMut(pid);
 }
