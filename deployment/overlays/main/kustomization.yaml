@@ -15,4 +15,4 @@ patches:
 images:
 - name: dmozdb
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: a7670e5d3e0dd4d863a83931892d07615b8459ee
+  newTag: 7c9f389007d9fd9e3eb8082102e92bffcfc8e87e
