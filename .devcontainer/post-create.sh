@@ -95,9 +95,10 @@ alias fresh="deno run -A -r jsr:@fresh/init"
 alias dev="bash /workspaces/zig-directory/.devcontainer/run.sh dev"
 alias prod="bash /workspaces/zig-directory/.devcontainer/run.sh prod"
 
-# Docker shortcuts
-alias db="docker build -t dmozdb ."
-alias dr="docker run --rm -p 8080:8080 dmozdb"
+# Docker shortcuts (split images: backend = Zig, web = Deno/Fresh)
+alias db="docker build -f Dockerfile.backend -t dmozdb-backend ."
+alias dbw="docker build -f Dockerfile.web -t dmozdb-web ."
+alias dr="docker run --rm -p 8080:8080 dmozdb-backend"
 
 # Load testing
 alias loadtest="wrk -t4 -c100 -d30s http://localhost:8080/"
@@ -112,4 +113,4 @@ ALIASES
 echo ""
 echo "=== Setup complete ==="
 echo "Run 'zig build' to compile, 'zig build test' to test, 'zig build run' to run."
-echo "Run 'db' to docker build, 'dr' to docker run, 'loadtest' for wrk load test."
+echo "Run 'db'/'dbw' to docker build backend/web, 'dr' to docker run backend, 'loadtest' for wrk load test."

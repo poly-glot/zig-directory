@@ -1,0 +1,24 @@
+# Standalone install of metrics-server into kube-system — the prerequisite for
+# the web HPA. Kept OUT of the dmozdb overlay so its `namespace: dmozdb`
+# transform doesn't rewrite metrics-server into the wrong namespace.
+#
+# Apply with:  kubectl apply -k deployment/metrics-server
+#
+# --kubelet-insecure-tls is required on OKE: the kubelet serving certs aren't
+# signed by a CA metrics-server trusts, so the secure handshake otherwise fails
+# and every node reports "no metrics".
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: metrics-server
+      namespace: kube-system
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --kubelet-insecure-tls

@@ -11,6 +11,6 @@ spec:
             path: /
             backend:
               service:
-                name: dmozdb
+                name: web
                 port:
                   number: 8000
