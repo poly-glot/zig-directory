@@ -8,11 +8,16 @@ namespace: dmozdb
 
 patches:
 - path: statefulset.yaml
+- path: web.yaml
 - path: ingress.yaml
 
-# The CD pipeline rewrites newTag to the built image's commit SHA via
-# `kustomize edit set image dmozdb=<repo>:<sha>` before applying.
+# The CD pipeline rewrites both newTags to the built commit SHA via
+# `kustomize edit set image dmozdb-backend=<repo>:<sha>-backend dmozdb-web=<repo>:<sha>-web`
+# before applying. Both images share the one OCIR repo, distinguished by tag suffix.
 images:
-- name: dmozdb
+- name: dmozdb-backend
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: 7c9f389007d9fd9e3eb8082102e92bffcfc8e87e
+  newTag: 7c9f389007d9fd9e3eb8082102e92bffcfc8e87e-backend
+- name: dmozdb-web
+  newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
+  newTag: 7c9f389007d9fd9e3eb8082102e92bffcfc8e87e-web

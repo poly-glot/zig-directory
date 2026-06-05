@@ -153,16 +153,29 @@ DMOZDB_PORT=8080 DMOZDB_DATA_DIR=./data ./zig-out/bin/dmozdb
 
 ### Run with Docker
 
-```bash
-# Build the Docker image
-docker build -t dmozdb:latest .
+The backend (Zig) and the web frontend (Deno/Fresh) build as two separate images.
 
-# Run the container
+```bash
+# Build the backend image
+docker build -f Dockerfile.backend -t dmozdb-backend:latest .
+
+# Run the backend (binary protocol on 8080)
 docker run -d \
   --name dmozdb \
   -p 8080:8080 \
   -v dmozdb-data:/var/lib/dmozdb \
-  dmozdb:latest
+  dmozdb-backend:latest
+
+# Build the web frontend image
+docker build -f Dockerfile.web -t dmozdb-web:latest .
+
+# Run the web frontend (point it at the backend + a denokv instance)
+docker run -d \
+  --name dmozdb-web \
+  -p 8000:8000 \
+  -e DMOZDB_HOST=host.docker.internal -e DMOZDB_PORT=8080 \
+  -e KV_PATH=http://host.docker.internal:4512 -e DENO_KV_ACCESS_TOKEN=dev-token \
+  dmozdb-web:latest
 ```
 
 ### Development Container
@@ -180,8 +193,9 @@ The project includes a full [Dev Container](.devcontainer/devcontainer.json) con
 | `zt`    | `zig build test`                      | Run all tests           |
 | `zr`    | `zig build run`                       | Run the server          |
 | `zfmt`  | `zig fmt src/`                        | Format all source files |
-| `db`    | `docker build -t dmozdb .`            | Build Docker image      |
-| `dr`    | `docker run --rm -p 8080:8080 dmozdb` | Run Docker container    |
+| `db`    | `docker build -f Dockerfile.backend -t dmozdb-backend .` | Build backend image |
+| `dbw`   | `docker build -f Dockerfile.web -t dmozdb-web .`         | Build web image     |
+| `dr`    | `docker run --rm -p 8080:8080 dmozdb-backend`            | Run backend container |
 
 ---
 
@@ -486,7 +500,8 @@ zig-directory/
 ├── .devcontainer/                Dev Container configuration
 ├── build.zig                     Zig build configuration
 ├── bench_binary.zig              Binary protocol benchmark tool
-└── Dockerfile                    Alpine-based container image
+├── Dockerfile.backend            Backend (Zig) container image
+└── Dockerfile.web                Web frontend (Deno/Fresh) container image
 ```
 
 ---

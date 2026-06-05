@@ -1,0 +1,55 @@
+# ============================================================
+# dmozdb backend — Zig binary only (no Deno)
+# ============================================================
+# Split out of the former combined image so the backend runs as its
+# own OKE workload. It listens on the pod network (DMOZDB_BIND set by
+# the manifest) and trusts the cluster's pod + node CIDRs via
+# DMOZDB_TRUSTED; the Deno frontend reaches it over a ClusterIP service.
+#
+# Build: docker build -f Dockerfile.backend --platform linux/arm64 -t dmozdb-backend .
+# ============================================================
+
+# ── Stage 1: build the dmozdb backend ──────────────────────
+FROM ubuntu:24.04 AS zig-builder
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    curl xz-utils ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG ZIG_VERSION=0.15.2
+RUN ZIG_ARCH="$(uname -m)" && \
+    curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /usr/local && \
+    ln -s /usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
+
+WORKDIR /build
+COPY build.zig ./
+COPY src/ src/
+# -Dcpu=baseline: the CI builder and the OKE Ampere A1 nodes are different arm64
+# microarchitectures. A default (native-CPU) build emits instructions the build
+# host supports but Ampere may not, crashing the pod with SIGILL. Baseline armv8-a
+# runs on every arm64 target.
+RUN zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+
+# ── Stage 2: runtime ───────────────────────────────────────
+FROM ubuntu:24.04
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    tini ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=zig-builder /build/zig-out/bin/dmozdb /usr/local/bin/dmozdb
+COPY entrypoint.backend.sh /usr/local/bin/entrypoint.backend.sh
+RUN chmod +x /usr/local/bin/entrypoint.backend.sh
+
+ENV DMOZDB_BIND=0.0.0.0
+ENV DMOZDB_PORT=8080
+ENV DMOZDB_DATA_DIR=/var/lib/dmozdb
+ENV DMOZDB_CACHE_SIZE_MB=256
+
+EXPOSE 8080
+VOLUME ["/var/lib/dmozdb"]
+
+# tini as PID 1 reaps zombies and forwards SIGTERM to dmozdb (via the
+# exec in the entrypoint), which drains its WAL / snapshots before exit.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.backend.sh"]

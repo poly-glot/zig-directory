@@ -1,0 +1,44 @@
+# ============================================================
+# dmozdb web frontend — Deno/Fresh SSR only (no Zig backend)
+# ============================================================
+# Split out of the former combined image so the frontend runs as its own
+# horizontally-scaled OKE Deployment. It reaches the backend over a
+# ClusterIP service (DMOZDB_HOST/DMOZDB_PORT) and stores users/sessions in
+# the shared denokv service (KV_PATH + DENO_KV_ACCESS_TOKEN) — both injected
+# by the Deployment manifest, not baked here.
+#
+# Build: docker build -f Dockerfile.web --platform linux/arm64 -t dmozdb-web .
+# ============================================================
+
+# ── Stage 1: build the Deno/Fresh web frontend ─────────────
+FROM denoland/deno:2.8.1 AS web-builder
+
+WORKDIR /web
+
+# Resolve dependencies first so the layer caches across source edits.
+# nodeModulesDir is "manual", so deno install populates node_modules from
+# the lockfile; vite (run by `deno task build`) needs it present.
+COPY web/deno.json web/deno.lock ./
+RUN deno install
+
+COPY web/ ./
+RUN deno task build
+
+# ── Stage 2: runtime ───────────────────────────────────────
+FROM denoland/deno:2.8.1
+
+WORKDIR /web
+
+# The built Fresh SSR bundle (_fresh/server.js) is self-contained — vite inlines
+# its deps, so node_modules is NOT shipped at runtime. Ship the bundle, the
+# static assets, and the import map / lockfile the entry resolves.
+COPY --from=web-builder /web/_fresh ./_fresh
+COPY --from=web-builder /web/static ./static
+COPY --from=web-builder /web/deno.json /web/deno.lock ./
+
+EXPOSE 8000
+
+# tini (shipped in the deno base image at /tini) as PID 1 reaps zombies and
+# forwards SIGTERM to the Deno server for a clean shutdown. --unstable-kv is
+# required for Deno.openKv against the remote denokv service.
+ENTRYPOINT ["/tini", "--", "deno", "serve", "-A", "--unstable-kv", "--port", "8000", "/web/_fresh/server.js"]
