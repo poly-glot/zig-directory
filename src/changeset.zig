@@ -1,5 +1,6 @@
 const std = @import("std");
 const codec = @import("zigstore").codec;
+const wire_codec = @import("zigstore").wire_codec;
 const schema = @import("schema.zig");
 pub const Op = enum(u8) {
     link_inserted = 1,
@@ -139,11 +140,6 @@ pub const ChangeSet = union(Op) {
 
 pub const SCHEMA_VERSION: u8 = 1;
 
-pub const EncodeError = error{
-    OutOfMemory,
-    StringTooLong,
-};
-
 pub const DecodeError = error{
     BufferTooShort,
     UnknownOpTag,
@@ -161,7 +157,7 @@ pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
 
     inline for (@typeInfo(ChangeSet).@"union".fields) |uf| {
         if (std.mem.eql(u8, uf.name, @tagName(std.meta.activeTag(cs)))) {
-            try encodeStruct(allocator, &buf, @field(cs, uf.name));
+            try wire_codec.encodeStruct(allocator, &buf, @field(cs, uf.name));
         }
     }
 
@@ -176,99 +172,11 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
     var cur: usize = 2;
     inline for (@typeInfo(ChangeSet).@"union".fields) |uf| {
         if (@field(Op, uf.name) == tag) {
-            const variant = try decodeStruct(arena, uf.type, bytes, &cur);
+            const variant = try wire_codec.decodeStruct(arena, uf.type, bytes, &cur);
             return @unionInit(ChangeSet, uf.name, variant);
         }
     }
     unreachable;
-}
-
-fn encodeStruct(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
-    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |f| {
-        try encodeField(a, buf, @field(value, f.name));
-    }
-}
-
-fn encodeField(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .int => |info| {
-            var b: [@divExact(info.bits, 8)]u8 = undefined;
-            std.mem.writeInt(T, &b, value, .big);
-            try buf.appendSlice(a, &b);
-        },
-        .bool => try buf.append(a, if (value) 1 else 0),
-        .@"enum" => try buf.append(a, @intFromEnum(value)),
-        .@"struct" => |s| {
-            if (s.layout == .@"extern") {
-                try buf.appendSlice(a, std.mem.asBytes(&value));
-            } else try encodeStruct(a, buf, value);
-        },
-        .pointer => |p| {
-            comptime std.debug.assert(p.size == .slice);
-            if (value.len > std.math.maxInt(u32)) return EncodeError.StringTooLong;
-            try encodeField(a, buf, @as(u32, @intCast(value.len)));
-            if (p.child == u8) {
-                try buf.appendSlice(a, value);
-            } else for (value) |item| try encodeField(a, buf, item);
-        },
-        else => @compileError("changeset: unsupported field type " ++ @typeName(T)),
-    }
-}
-
-fn decodeStruct(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cur: *usize) DecodeError!T {
-    var out: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        @field(out, f.name) = try decodeField(arena, f.type, bytes, cur);
-    }
-    return out;
-}
-
-fn decodeField(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cur: *usize) DecodeError!T {
-    switch (@typeInfo(T)) {
-        .int => |info| {
-            const sz = @divExact(info.bits, 8);
-            if (cur.* + sz > bytes.len) return DecodeError.BufferTooShort;
-            const v = std.mem.readInt(T, bytes[cur.*..][0..sz], .big);
-            cur.* += sz;
-            return v;
-        },
-        .bool => {
-            if (cur.* >= bytes.len) return DecodeError.BufferTooShort;
-            const v = bytes[cur.*] != 0;
-            cur.* += 1;
-            return v;
-        },
-        .@"enum" => {
-            if (cur.* >= bytes.len) return DecodeError.BufferTooShort;
-            const v = std.meta.intToEnum(T, bytes[cur.*]) catch return DecodeError.InvalidEnumValue;
-            cur.* += 1;
-            return v;
-        },
-        .@"struct" => |s| {
-            if (s.layout == .@"extern") {
-                if (cur.* + @sizeOf(T) > bytes.len) return DecodeError.BufferTooShort;
-                const v = std.mem.bytesToValue(T, bytes[cur.*..][0..@sizeOf(T)]);
-                cur.* += @sizeOf(T);
-                return v;
-            } else return try decodeStruct(arena, T, bytes, cur);
-        },
-        .pointer => |p| {
-            comptime std.debug.assert(p.size == .slice);
-            const n = try decodeField(arena, u32, bytes, cur);
-            if (p.child == u8) {
-                if (cur.* + n > bytes.len) return DecodeError.BufferTooShort;
-                const out = try arena.dupe(u8, bytes[cur.* .. cur.* + n]);
-                cur.* += n;
-                return out;
-            }
-            if (n > bytes.len - cur.*) return DecodeError.BufferTooShort;
-            const out = try arena.alloc(p.child, n);
-            for (out) |*item| item.* = try decodeField(arena, p.child, bytes, cur);
-            return out;
-        },
-        else => @compileError("changeset: unsupported field type " ++ @typeName(T)),
-    }
 }
 
 test "ChangeSet variant tags match Op enum" {
