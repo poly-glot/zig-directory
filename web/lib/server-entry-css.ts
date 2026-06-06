@@ -20,10 +20,13 @@ let cached: string | null | undefined;
 export function serverEntryCssHref(): string | null {
   if (cached !== undefined) return cached;
   try {
-    // Path is relative to the cwd of `deno serve _fresh/server.js` (the web/
-    // dir). `css[0]` is a build-relative path like "assets/server-entry-*.css".
+    // Resolve relative to this module's own directory (the built _fresh/server
+    // dir), not the process cwd: that loads under both `deno serve` (cwd = web/)
+    // and a `deno compile` binary, which extracts embedded files to a temp dir
+    // that is never the cwd. `css[0]` is a build-relative path like
+    // "assets/server-entry-*.css".
     const manifest = JSON.parse(
-      Deno.readTextFileSync("_fresh/server/.vite/manifest.json"),
+      Deno.readTextFileSync(`${import.meta.dirname}/.vite/manifest.json`),
     ) as Record<string, { css?: string[] }>;
     const css = manifest["fresh:server_entry"]?.css?.[0];
     cached = css ? `/${css}` : null;
