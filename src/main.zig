@@ -27,6 +27,8 @@ const EpollServer = epoll_server.EpollServer;
 
 const log = std.log.scoped(.dmozdb);
 
+const Cidr = struct { network: u32, prefix: u6 };
+
 pub const Config = struct {
     port: u16 = 8080,
     data_dir: []const u8 = "/var/lib/dmozdb",
@@ -43,6 +45,8 @@ pub const Config = struct {
     bind_address: [4]u8 = .{ 127, 0, 0, 1 },
     trusted_ips: [MAX_TRUSTED_IPS][4]u8 = undefined,
     trusted_count: u8 = 0,
+    trusted_cidrs: [MAX_TRUSTED_IPS]Cidr = undefined,
+    trusted_cidr_count: u8 = 0,
 
     const MAX_TRUSTED_IPS = 16;
 
@@ -92,7 +96,8 @@ pub const Config = struct {
     }
 
     fn parseTrustedIps(self: *Config, raw: []const u8) void {
-        var count: u8 = 0;
+        var ip_count: u8 = 0;
+        var cidr_count: u8 = 0;
         var rest = raw;
         while (rest.len > 0) {
             var end: usize = 0;
@@ -101,18 +106,33 @@ pub const Config = struct {
             rest = if (end < rest.len) rest[end + 1 ..] else &.{};
 
             if (token.len == 0) continue;
-            if (count >= MAX_TRUSTED_IPS) {
-                log.warn("DMOZDB_TRUSTED: dropping '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
-                continue;
-            }
-            if (parseIpv4(token)) |ip| {
-                self.trusted_ips[count] = ip;
-                count += 1;
+
+            if (std.mem.indexOfScalar(u8, token, '/') != null) {
+                if (cidr_count >= MAX_TRUSTED_IPS) {
+                    log.warn("DMOZDB_TRUSTED: dropping CIDR '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
+                    continue;
+                }
+                if (parseCidr(token)) |cidr| {
+                    self.trusted_cidrs[cidr_count] = cidr;
+                    cidr_count += 1;
+                } else {
+                    log.warn("DMOZDB_TRUSTED: ignoring unparseable CIDR token '{s}'", .{token});
+                }
             } else {
-                log.warn("DMOZDB_TRUSTED: ignoring unparseable IPv4 token '{s}'", .{token});
+                if (ip_count >= MAX_TRUSTED_IPS) {
+                    log.warn("DMOZDB_TRUSTED: dropping '{s}' — exceeds MAX_TRUSTED_IPS={d}", .{ token, MAX_TRUSTED_IPS });
+                    continue;
+                }
+                if (parseIpv4(token)) |ip| {
+                    self.trusted_ips[ip_count] = ip;
+                    ip_count += 1;
+                } else {
+                    log.warn("DMOZDB_TRUSTED: ignoring unparseable IPv4 token '{s}'", .{token});
+                }
             }
         }
-        self.trusted_count = count;
+        self.trusted_count = ip_count;
+        self.trusted_cidr_count = cidr_count;
     }
 
     pub fn isAllowed(self: *const Config, addr: [4]u8) bool {
@@ -120,13 +140,35 @@ pub const Config = struct {
         for (self.trusted_ips[0..self.trusted_count]) |trusted| {
             if (std.mem.eql(u8, &addr, &trusted)) return true;
         }
+        const addr_u32 = octetsToU32(addr);
+        for (self.trusted_cidrs[0..self.trusted_cidr_count]) |cidr| {
+            if ((addr_u32 & maskU32(cidr.prefix)) == cidr.network) return true;
+        }
         return false;
     }
 
     pub fn isProtectedMode(self: *const Config) bool {
-        return self.bind_address[0] != 127 and self.trusted_count == 0;
+        return self.bind_address[0] != 127 and self.trusted_count == 0 and self.trusted_cidr_count == 0;
     }
 };
+
+fn octetsToU32(a: [4]u8) u32 {
+    return (@as(u32, a[0]) << 24) | (@as(u32, a[1]) << 16) | (@as(u32, a[2]) << 8) | @as(u32, a[3]);
+}
+
+fn maskU32(prefix: u6) u32 {
+    if (prefix == 0) return 0;
+    const shift: u5 = @intCast(32 - @as(u8, prefix));
+    return @as(u32, 0xFFFFFFFF) << shift;
+}
+
+fn parseCidr(s: []const u8) ?Cidr {
+    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return null;
+    const ip = parseIpv4(s[0..slash]) orelse return null;
+    const prefix = std.fmt.parseInt(u6, s[slash + 1 ..], 10) catch return null;
+    if (prefix > 32) return null;
+    return Cidr{ .network = octetsToU32(ip) & maskU32(prefix), .prefix = prefix };
+}
 
 fn parseIpv4(s: []const u8) ?[4]u8 {
     var octets: [4]u8 = undefined;
@@ -314,6 +356,43 @@ test "Config.parseTrustedIps" {
     try std.testing.expectEqual([4]u8{ 10, 0, 0, 1 }, config.trusted_ips[0]);
     try std.testing.expectEqual([4]u8{ 192, 168, 1, 50 }, config.trusted_ips[1]);
     try std.testing.expectEqual([4]u8{ 172, 16, 0, 1 }, config.trusted_ips[2]);
+}
+
+test "Config.parseTrustedIps separates CIDRs from exact IPs" {
+    var config = Config{};
+    config.parseTrustedIps("10.244.0.0/16, 10.0.1.0/24, 192.168.1.5");
+    try std.testing.expectEqual(@as(u8, 1), config.trusted_count);
+    try std.testing.expectEqual(@as(u8, 2), config.trusted_cidr_count);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 5 }, config.trusted_ips[0]);
+}
+
+test "isAllowed accepts an address inside a trusted CIDR" {
+    var config = Config{};
+    config.parseTrustedIps("10.244.0.0/16,10.0.1.0/24");
+    try std.testing.expect(config.isAllowed(.{ 10, 244, 2, 14 }));
+    try std.testing.expect(config.isAllowed(.{ 10, 244, 1, 200 }));
+    try std.testing.expect(config.isAllowed(.{ 10, 0, 1, 53 }));
+}
+
+test "isAllowed rejects an address outside every trusted CIDR" {
+    var config = Config{};
+    config.parseTrustedIps("10.244.0.0/16,10.0.1.0/24");
+    try std.testing.expect(!config.isAllowed(.{ 10, 245, 0, 1 }));
+    try std.testing.expect(!config.isAllowed(.{ 10, 0, 2, 1 }));
+    try std.testing.expect(!config.isAllowed(.{ 192, 168, 1, 1 }));
+}
+
+test "isProtectedMode is false when only a CIDR is trusted" {
+    var config = Config{};
+    config.bind_address = .{ 0, 0, 0, 0 };
+    config.parseTrustedIps("10.244.0.0/16");
+    try std.testing.expect(!config.isProtectedMode());
+}
+
+test "parseCidr rejects malformed tokens" {
+    try std.testing.expect(parseCidr("10.0.0.0/33") == null);
+    try std.testing.expect(parseCidr("10.0.0.0/abc") == null);
+    try std.testing.expect(parseCidr("not-an-ip/24") == null);
 }
 
 test "Config: rename_inline_threshold default and env override" {

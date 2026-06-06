@@ -4,7 +4,10 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - statefulset.yaml
+  - denokv.yaml
+  - web.yaml
   - service.yaml
   - ingress.yaml
+  - networkpolicy.yaml
 
 namespace: dmozdb

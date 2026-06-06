@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: denokv
+spec:
+  serviceName: denokv
+  # Single SQLite-backed writer, like dmozdb. The shared users/sessions store
+  # the multi-replica web frontend reads and writes over KV Connect.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: denokv
+  template:
+    metadata:
+      labels:
+        app: denokv
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: denokv
+          # Pin to a digest/version once confirmed against the cluster.
+          image: ghcr.io/denoland/denokv:latest
+          # Global --sqlite-path precedes the `serve` subcommand. The access
+          # token is read from the secret via env and substituted into args by
+          # kubelet ($(VAR) expansion); the same token is handed to the web
+          # frontend as DENO_KV_ACCESS_TOKEN.
+          command: ["denokv"]
+          args:
+            - "--sqlite-path"
+            - "/data/denokv.sqlite"
+            - "serve"
+            - "--access-token"
+            - "$(DENO_KV_ACCESS_TOKEN)"
+          env:
+            - name: DENO_KV_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: denokv-auth
+                  key: token
+          ports:
+            - containerPort: 4512
+              name: kv
+          volumeMounts:
+            - name: kv-data
+              mountPath: /data
+          # KV Connect is HTTP, but a bare TCP connect is enough to know the
+          # server is accepting; a dead process stops listening on 4512.
+          livenessProbe:
+            tcpSocket:
+              port: 4512
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 4512
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+  volumeClaimTemplates:
+    - metadata:
+        name: kv-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: denokv
+  labels:
+    app: denokv
+spec:
+  type: ClusterIP
+  selector:
+    app: denokv
+  ports:
+    - port: 4512
+      targetPort: 4512
+      protocol: TCP
+      name: kv

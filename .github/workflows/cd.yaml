@@ -5,6 +5,11 @@ on:
     branches:
       - main
       - master
+  # PRs build + push the images (so a controlled manual cutover can use them)
+  # but do NOT deploy — the cd job is gated to push events below.
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -22,7 +27,7 @@ jobs:
     # backend and runs a Vite build, both of which crawl under QEMU emulation.
     # The OKE nodes are Ampere A1 (arm64), so this also matches the target arch.
     runs-on: ubuntu-24.04-arm
-    name: Build & Push Docker Image
+    name: Build & Push Docker Images
     outputs:
       REPO_PATH: ${{ steps.get-ocir-repository.outputs.repo_path }}
     steps:
@@ -45,20 +50,38 @@ jobs:
         with:
           auth_token: ${{ secrets.OCI_AUTH_TOKEN }}
 
-      # One combined image: the Zig backend and the Deno/Fresh frontend. The
-      # OKE nodes are Ampere A1 (arm64), so the build targets linux/arm64.
-      - name: Build and push
+      # Two images sharing one OCIR repo, distinguished by tag suffix: the Zig
+      # backend and the Deno/Fresh frontend now run as separate OKE workloads.
+      # Both target linux/arm64 (the OKE Ampere A1 nodes); separate gha cache
+      # scopes keep the two builds from evicting each other.
+      - name: Build and push backend
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.backend
           platforms: linux/arm64
           push: true
-          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.sha }}"
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-backend"
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build and push web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          platforms: linux/arm64
+          push: true
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-web"
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
 
   cd:
     needs: ci
+    # Deploy only on a real push to main/master — never on a PR build. The first
+    # split cutover is done manually (the StatefulSet needs a one-time
+    # --cascade=orphan recreate); after that, push-to-main applies normally.
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     name: Deploy
     steps:
@@ -94,7 +117,9 @@ jobs:
         run: |
           cd deployment/overlays/main
 
-          kustomize edit set image dmozdb=$REPO_PATH:$SHA
+          kustomize edit set image \
+            dmozdb-backend=$REPO_PATH:$SHA-backend \
+            dmozdb-web=$REPO_PATH:$SHA-web
 
           # Record the resolved tag back to the branch — best-effort only. A
           # re-run of an already-deployed SHA produces no diff (empty commit
