@@ -1,6 +1,6 @@
 const std = @import("std");
-const types = @import("types.zig");
-
+const codec = @import("zigstore").codec;
+const schema = @import("schema.zig");
 pub const Op = enum(u8) {
     link_inserted = 1,
     link_deleted = 2,
@@ -36,39 +36,39 @@ pub const SlugPathSwap = struct {
 
 pub const EnqueueOnApply = struct {
     seq: u64 = 0,
-    op: types.RepairOp = .renamed_slug,
+    op: schema.RepairOp = .renamed_slug,
     old_slug_prefix: []const u8 = &.{},
     created_at: i64 = 0,
 };
 
 pub const LinkInsertEffect = struct {
-    link: types.Link,
+    link: schema.Link,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
 };
 
 pub const LinkDeleteEffect = struct {
-    link: types.Link,
+    link: schema.Link,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
 };
 
 pub const LinkTextUpdateEffect = struct {
-    old_link: types.Link,
-    new_link: types.Link,
+    old_link: schema.Link,
+    new_link: schema.Link,
     old_tokens: []const Token,
     new_tokens: []const Token,
 };
 
 pub const LinkRecatEffect = struct {
-    link: types.Link,
+    link: schema.Link,
     old_category_id: u64,
     old_chain_updates: []const AncestorUpdate,
     new_chain_updates: []const AncestorUpdate,
 };
 
 pub const CategoryInsertEffect = struct {
-    cat: types.Category,
+    cat: schema.Category,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
     slug_path: []const u8,
@@ -76,22 +76,22 @@ pub const CategoryInsertEffect = struct {
 };
 
 pub const CategoryDeleteEffect = struct {
-    cat: types.Category,
+    cat: schema.Category,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
     slug_path: []const u8,
 };
 
 pub const CategoryTextUpdateEffect = struct {
-    old_cat: types.Category,
-    new_cat: types.Category,
+    old_cat: schema.Category,
+    new_cat: schema.Category,
     old_tokens: []const Token,
     new_tokens: []const Token,
 };
 
 pub const CategoryRenameEffect = struct {
-    old_cat: types.Category,
-    new_cat: types.Category,
+    old_cat: schema.Category,
+    new_cat: schema.Category,
     old_slug_path: []const u8,
     new_slug_path: []const u8,
     descendant_swaps: []const SlugPathSwap,
@@ -100,7 +100,7 @@ pub const CategoryRenameEffect = struct {
 };
 
 pub const CategoryMoveEffect = struct {
-    cat: types.Category,
+    cat: schema.Category,
     old_parent_id: u64,
     new_parent_id: u64,
     old_chain_updates: []const AncestorUpdate,
@@ -282,12 +282,12 @@ test "encode/decode roundtrip — link_inserted" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const link = types.Link{
+    const link = schema.Link{
         .id = 42,
         .category_id = 7,
-        .url = types.FixedString(64).fromSlice("https://example.com"),
-        .title = types.FixedString(128).fromSlice("Example"),
-        .description = types.FixedString(256).fromSlice("desc"),
+        .url = codec.FixedString(64).fromSlice("https://example.com"),
+        .title = codec.FixedString(128).fromSlice("Example"),
+        .description = codec.FixedString(256).fromSlice("desc"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -328,7 +328,7 @@ test "encode/decode roundtrip — link_deleted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const link = types.Link{ .id = 99, .category_id = 5 };
+    const link = schema.Link{ .id = 99, .category_id = 5 };
     const ancestors = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 5, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
@@ -355,8 +355,8 @@ test "encode/decode roundtrip — link_text_updated" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const old_link = types.Link{ .id = 11, .title = types.FixedString(128).fromSlice("Old") };
-    const new_link = types.Link{ .id = 11, .title = types.FixedString(128).fromSlice("New") };
+    const old_link = schema.Link{ .id = 11, .title = codec.FixedString(128).fromSlice("Old") };
+    const new_link = schema.Link{ .id = 11, .title = codec.FixedString(128).fromSlice("New") };
     const old_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .title }});
     const new_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "new"), .field = .title }});
     const cs = ChangeSet{ .link_text_updated = .{
@@ -387,7 +387,7 @@ test "encode/decode roundtrip — link_recategorized" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const link = types.Link{ .id = 7, .category_id = 22 };
+    const link = schema.Link{ .id = 7, .category_id = 22 };
     const old_chain = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 5, .link_count_subtree_delta = 3, .child_count_subtree_delta = 1 },
     });
@@ -422,11 +422,11 @@ test "encode/decode roundtrip — category_inserted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cat = types.Category{
+    const cat = schema.Category{
         .id = 50,
         .parent_id = 1,
-        .name = types.FixedString(64).fromSlice("Books"),
-        .slug = types.FixedString(128).fromSlice("books"),
+        .name = codec.FixedString(64).fromSlice("Books"),
+        .slug = codec.FixedString(128).fromSlice("books"),
     };
     const ancestors = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
@@ -460,7 +460,7 @@ test "encode/decode roundtrip — category_deleted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cat = types.Category{ .id = 60, .parent_id = 1 };
+    const cat = schema.Category{ .id = 60, .parent_id = 1 };
     const ancestors = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
@@ -491,8 +491,8 @@ test "encode/decode roundtrip — category_text_updated" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const old_cat = types.Category{ .id = 70, .description = types.FixedString(1024).fromSlice("Old desc") };
-    const new_cat = types.Category{ .id = 70, .description = types.FixedString(1024).fromSlice("New desc") };
+    const old_cat = schema.Category{ .id = 70, .description = codec.FixedString(1024).fromSlice("Old desc") };
+    const new_cat = schema.Category{ .id = 70, .description = codec.FixedString(1024).fromSlice("New desc") };
     const old_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .desc }});
     const new_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "new"), .field = .desc }});
     const cs = ChangeSet{ .category_text_updated = .{
@@ -521,8 +521,8 @@ test "encode/decode roundtrip — category_renamed" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const old_cat = types.Category{ .id = 80, .slug = types.FixedString(128).fromSlice("old") };
-    const new_cat = types.Category{ .id = 80, .slug = types.FixedString(128).fromSlice("new") };
+    const old_cat = schema.Category{ .id = 80, .slug = codec.FixedString(128).fromSlice("old") };
+    const new_cat = schema.Category{ .id = 80, .slug = codec.FixedString(128).fromSlice("new") };
     const cs = ChangeSet{ .category_renamed = .{
         .old_cat = old_cat,
         .new_cat = new_cat,
@@ -553,7 +553,7 @@ test "encode/decode roundtrip — category_moved" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cat = types.Category{ .id = 90, .parent_id = 200 };
+    const cat = schema.Category{ .id = 90, .parent_id = 200 };
     const old_chain = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 100, .link_count_subtree_delta = 4, .child_count_subtree_delta = 2 },
     });

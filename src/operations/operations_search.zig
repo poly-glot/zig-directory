@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const schema = @import("../schema.zig");
 const Database = @import("../database.zig").Database;
 const inverted = @import("../inverted_index.zig");
 const category = @import("operations_category.zig");
@@ -12,10 +12,10 @@ pub fn searchCategories(
     db: *Database,
     query: []const u8,
     limit: u32,
-    buf: []types.Category,
-) ![]types.Category {
+    buf: []schema.Category,
+) ![]schema.Category {
     return searchViaIndexTree(
-        types.Category,
+        schema.Category,
         db,
         &db.categories_index_tree,
         query,
@@ -29,10 +29,10 @@ pub fn searchLinks(
     db: *Database,
     query: []const u8,
     limit: u32,
-    buf: []types.Link,
-) ![]types.Link {
+    buf: []schema.Link,
+) ![]schema.Link {
     return searchViaIndexTree(
-        types.Link,
+        schema.Link,
         db,
         &db.links_index_tree,
         query,
@@ -154,7 +154,7 @@ test "search: B+Tree-backed link search finds tokenised title" {
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const link_id = try link_mod.createLink(db, top_id, "https://example.com/c", "Cannabis Stuff", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "cannabis", 8, &buf);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(link_id, hits[0].id);
@@ -170,7 +170,7 @@ test "search: B+Tree-backed category search finds tokenised name" {
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const cat_id = try category.createCategory(db, top_id, "Computers", "computers", "");
 
-    var buf: [8]types.Category = undefined;
+    var buf: [8]schema.Category = undefined;
     const hits = try searchCategories(db, "computers", 8, &buf);
 
     var found = false;
@@ -191,7 +191,7 @@ test "search: multi-token query AND-intersects per-token posting lists" {
     const l1 = try link_mod.createLink(db, top_id, "https://example.com/1", "Alpha Beta", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/2", "Alpha Only", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "alpha beta", 8, &buf);
 
     try std.testing.expectEqual(@as(usize, 1), hits.len);
@@ -209,7 +209,7 @@ test "search: AND-of-tokens — \"foo bar\" excludes the foo-only doc" {
     const foo_bar_test = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "foo bar", 8, &buf);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(foo_bar_test, hits[0].id);
@@ -226,7 +226,7 @@ test "search: shared token \"test\" returns both docs in ascending id order" {
     const a = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
     const b = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "test", 8, &buf);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expect(hits[0].id < hits[1].id);
@@ -245,7 +245,7 @@ test "search: token absent from corpus returns empty result set" {
     _ = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "nonexistent", 8, &buf);
     try std.testing.expectEqual(@as(usize, 0), hits.len);
 }

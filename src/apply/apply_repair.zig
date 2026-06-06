@@ -1,12 +1,13 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
 const Database = @import("../database.zig").Database;
 
 pub fn applySlugPathRepairChunk(db: *Database, e: changeset.SlugPathRepairChunkEffect) !void {
     for (e.swaps) |s| {
         _ = try db.categories_by_slug_path.delete(s.old_path);
-        const id_key = types.encodeU64(s.cat_id);
+        const id_key = codec.encodeU64(s.cat_id);
         try db.categories_by_slug_path.insert(s.new_path, &id_key);
     }
 }
@@ -23,7 +24,7 @@ test "applySlugPathRepairChunk: applies swaps to categories_by_slug_path" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var v: [8]u8 = types.encodeU64(123);
+    var v: [8]u8 = codec.encodeU64(123);
     try db.categories_by_slug_path.insert("old/path", &v);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -50,7 +51,7 @@ test "applySlugPathRepairComplete: deletes queue entry by seq" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var task = types.RepairTask{ .cat_id = 99, .op = .renamed_slug };
+    var task = schema.RepairTask{ .cat_id = 99, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
     try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));

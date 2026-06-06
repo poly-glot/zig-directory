@@ -1,5 +1,6 @@
 const std = @import("std");
-const types = @import("types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("schema.zig");
 const btree = @import("btree/btree.zig");
 const Database = @import("database.zig").Database;
 
@@ -76,11 +77,11 @@ pub fn runOnce(db: *Database, state: *VerifierState) !void {
     db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
     db.drainOneMemtable(&db.mt_link_by_url_hash, &db.link_by_url_hash);
 
-    const cat_count = try countTree(&db.categories_by_id, types.encodeU64(0)[0..]);
-    const link_count = try countTree(&db.links_by_id, types.encodeU64(0)[0..]);
+    const cat_count = try countTree(&db.categories_by_id, codec.encodeU64(0)[0..]);
+    const link_count = try countTree(&db.links_by_id, codec.encodeU64(0)[0..]);
     const cat_by_parent_count = try countTree(&db.cat_by_parent, &([_]u8{0} ** 16));
     const link_by_category_count = try countTree(&db.link_by_category, &([_]u8{0} ** 16));
-    const link_by_url_hash_count = try countTree(&db.link_by_url_hash, types.encodeU64(0)[0..]);
+    const link_by_url_hash_count = try countTree(&db.link_by_url_hash, codec.encodeU64(0)[0..]);
 
     var indices: [6]InvariantHealth = undefined;
 
@@ -185,7 +186,7 @@ fn collectAllChildIds(db: *Database, parent_id: u64) ![]u64 {
     const ops = @import("operations/operations.zig");
     var ids: std.ArrayListUnmanaged(u64) = .{};
     errdefer ids.deinit(db.allocator);
-    var buf: [4096]types.Category = undefined;
+    var buf: [4096]schema.Category = undefined;
     var offset: u32 = 0;
     while (true) {
         const children = try ops.listChildren(db, parent_id, offset, buf.len, &buf);
@@ -197,12 +198,12 @@ fn collectAllChildIds(db: *Database, parent_id: u64) ![]u64 {
 }
 
 fn countTops(db: *Database) !u64 {
-    const min_key = types.encodeU64(0);
+    const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id.rangeScan(&min_key, null);
     var n: u64 = 0;
     while (try iter.next()) |entry| {
-        if (entry.value.len < @sizeOf(types.Category)) continue;
-        const cat = std.mem.bytesToValue(types.Category, entry.value[0..@sizeOf(types.Category)]);
+        if (entry.value.len < @sizeOf(schema.Category)) continue;
+        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
         if (cat.parent_id == 0) n += 1;
     }
     return n;
@@ -210,12 +211,12 @@ fn countTops(db: *Database) !u64 {
 
 fn countOrphans(db: *Database) !u64 {
     const ops = @import("operations/operations.zig");
-    const min_key = types.encodeU64(0);
+    const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id.rangeScan(&min_key, null);
     var orphans: u64 = 0;
     while (try iter.next()) |entry| {
-        if (entry.value.len < @sizeOf(types.Category)) continue;
-        const cat = std.mem.bytesToValue(types.Category, entry.value[0..@sizeOf(types.Category)]);
+        if (entry.value.len < @sizeOf(schema.Category)) continue;
+        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
         if (cat.parent_id == 0) continue;
         const parent = ops.getCategory(db, cat.parent_id) catch null;
         if (parent == null) orphans += 1;
@@ -228,11 +229,11 @@ fn countSubtreeDrift(db: *Database) !u64 {
 
     var top_id: u64 = 0;
     {
-        const min_key = types.encodeU64(0);
+        const min_key = codec.encodeU64(0);
         var iter = try db.categories_by_id.rangeScan(&min_key, null);
         while (try iter.next()) |entry| {
-            if (entry.value.len < @sizeOf(types.Category)) continue;
-            const cat = std.mem.bytesToValue(types.Category, entry.value[0..@sizeOf(types.Category)]);
+            if (entry.value.len < @sizeOf(schema.Category)) continue;
+            const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
             if (cat.parent_id == 0) {
                 top_id = cat.id;
                 break;
@@ -361,7 +362,7 @@ test "verifier: detects subtree count drift without repairing (WARN-only)" {
     {
         var cat = (try ops.getCategory(db, sibling_ids[0])).?;
         cat.link_count_subtree = 0;
-        const id_key = types.encodeU64(sibling_ids[0]);
+        const id_key = codec.encodeU64(sibling_ids[0]);
         try db.categories_by_id.insert(&id_key, std.mem.asBytes(&cat));
     }
 
@@ -424,7 +425,7 @@ test "verifier: tampered child_count_subtree surfaces drift" {
     {
         var cat = (try ops.getCategory(db, top)).?;
         cat.child_count_subtree = 99;
-        const id_key = types.encodeU64(top);
+        const id_key = codec.encodeU64(top);
         try db.categories_by_id.insert(&id_key, std.mem.asBytes(&cat));
     }
 
@@ -556,8 +557,8 @@ test "verifier: slug_path_repair_queue_depth round-trips through snapshot" {
     try std.testing.expectEqual(@as(u64, 0), snap.slug_path_repair_queue_depth);
 
     const seq: u64 = 1;
-    const key = types.encodeU64(seq);
-    const value = types.encodeU64(42);
+    const key = codec.encodeU64(seq);
+    const value = codec.encodeU64(42);
     try db.slug_path_repair_queue.insert(&key, &value);
 
     snap = state.snapshot(db);

@@ -1,6 +1,6 @@
 const std = @import("std");
 const Database = @import("../database.zig").Database;
-const types = @import("../types.zig");
+const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
 const operations = @import("../operations/operations.zig");
 
@@ -42,16 +42,16 @@ pub fn tickOnce(db: *Database) !void {
 
 const QueuedTask = struct {
     seq: u64,
-    task: types.RepairTask,
+    task: schema.RepairTask,
 };
 
 fn peekMin(db: *Database) !?QueuedTask {
     const start_key = [_]u8{0} ** 8;
     var iter = try db.slug_path_repair_queue.rangeScan(&start_key, null);
     if (try iter.next()) |entry| {
-        if (entry.value.len < @sizeOf(types.RepairTask)) return null;
+        if (entry.value.len < @sizeOf(schema.RepairTask)) return null;
         if (entry.key.len < 8) return null;
-        const t = std.mem.bytesToValue(types.RepairTask, entry.value[0..@sizeOf(types.RepairTask)]);
+        const t = std.mem.bytesToValue(schema.RepairTask, entry.value[0..@sizeOf(schema.RepairTask)]);
         const seq = std.mem.readInt(u64, entry.key[0..8], .big);
         return QueuedTask{ .seq = seq, .task = t };
     }
@@ -119,7 +119,7 @@ fn processChunk(
         const cur_id = stack.items[f_idx].id;
         const cur_off = stack.items[f_idx].child_offset;
 
-        var children_buf: [256]types.Category = undefined;
+        var children_buf: [256]schema.Category = undefined;
         const children = try operations.listChildren(db, cur_id, cur_off, 256, &children_buf);
         if (children.len == 0) {
             _ = stack.pop();
@@ -245,7 +245,7 @@ test "repair_worker: handles cat deleted before drain" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var task = types.RepairTask{ .cat_id = 9999, .op = .renamed_slug };
+    var task = schema.RepairTask{ .cat_id = 9999, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
     try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));

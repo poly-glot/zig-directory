@@ -6,7 +6,7 @@ pub const file_header = @import("file_header.zig");
 pub const btree = @import("btree/btree.zig");
 pub const page_cache = @import("page_cache.zig");
 pub const freelist = @import("freelist.zig");
-pub const types = @import("types.zig");
+pub const schema = @import("schema.zig");
 pub const inverted_index = @import("inverted_index.zig");
 pub const memtable = @import("memtable.zig");
 pub const bloom = @import("bloom.zig");
@@ -255,7 +255,7 @@ test {
     _ = btree;
     _ = page_cache;
     _ = freelist;
-    _ = types;
+    _ = schema;
     _ = inverted_index;
     _ = operations;
     _ = database;

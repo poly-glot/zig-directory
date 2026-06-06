@@ -1,14 +1,15 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
 const Database = @import("../database.zig").Database;
 const apply = @import("apply.zig");
 
 fn linkStatusCounter(db: *Database, status: u8) ?*std.atomic.Value(u64) {
     return switch (status) {
-        @intFromEnum(types.LinkStatus.pending) => &db.links_pending_count,
-        @intFromEnum(types.LinkStatus.approved) => &db.links_approved_count,
-        @intFromEnum(types.LinkStatus.rejected) => &db.links_rejected_count,
+        @intFromEnum(schema.LinkStatus.pending) => &db.links_pending_count,
+        @intFromEnum(schema.LinkStatus.approved) => &db.links_approved_count,
+        @intFromEnum(schema.LinkStatus.rejected) => &db.links_rejected_count,
         else => null,
     };
 }
@@ -25,16 +26,16 @@ fn decrLinkStatus(db: *Database, status: u8) void {
 }
 
 pub fn applyLinkInserted(db: *Database, e: changeset.LinkInsertEffect) !void {
-    const id_key = types.encodeU64(e.link.id);
+    const id_key = codec.encodeU64(e.link.id);
 
-    const cl_key = types.CategoryLinkKey.encode(e.link.category_id, e.link.id);
+    const cl_key = schema.CategoryLinkKey.encode(e.link.category_id, e.link.id);
     try db.mt_link_by_category.put(&cl_key, &id_key);
 
-    const hash_key = types.encodeU64(types.hashUrl(e.link.url.slice()));
+    const hash_key = codec.encodeU64(codec.hash(e.link.url.slice()));
     try db.mt_link_by_url_hash.put(&hash_key, &id_key);
 
     if (e.link.submitter_id != 0) {
-        const sl_key = types.SubmitterLinkKey.encode(e.link.submitter_id, e.link.id);
+        const sl_key = schema.SubmitterLinkKey.encode(e.link.submitter_id, e.link.id);
         try db.mt_link_by_submitter.put(&sl_key, &id_key);
     }
 
@@ -43,7 +44,7 @@ pub fn applyLinkInserted(db: *Database, e: changeset.LinkInsertEffect) !void {
         const key_len = t.text.len + 8;
         if (key_len > key_buf.len) continue;
         @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = types.encodeU64(e.link.id);
+        const id_be = codec.encodeU64(e.link.id);
         @memcpy(key_buf[t.text.len..][0..8], &id_be);
         try db.links_index_tree.insert(key_buf[0..key_len], &.{});
     }
@@ -58,16 +59,16 @@ pub fn applyLinkInserted(db: *Database, e: changeset.LinkInsertEffect) !void {
 }
 
 pub fn applyLinkDeleted(db: *Database, e: changeset.LinkDeleteEffect) !void {
-    const id_key = types.encodeU64(e.link.id);
+    const id_key = codec.encodeU64(e.link.id);
 
-    const cl_key = types.CategoryLinkKey.encode(e.link.category_id, e.link.id);
+    const cl_key = schema.CategoryLinkKey.encode(e.link.category_id, e.link.id);
     try db.mt_link_by_category.delete(&cl_key);
 
-    const hash_key = types.encodeU64(types.hashUrl(e.link.url.slice()));
+    const hash_key = codec.encodeU64(codec.hash(e.link.url.slice()));
     try db.mt_link_by_url_hash.delete(&hash_key);
 
     if (e.link.submitter_id != 0) {
-        const sl_key = types.SubmitterLinkKey.encode(e.link.submitter_id, e.link.id);
+        const sl_key = schema.SubmitterLinkKey.encode(e.link.submitter_id, e.link.id);
         try db.mt_link_by_submitter.delete(&sl_key);
     }
 
@@ -76,7 +77,7 @@ pub fn applyLinkDeleted(db: *Database, e: changeset.LinkDeleteEffect) !void {
         const key_len = t.text.len + 8;
         if (key_len > key_buf.len) continue;
         @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = types.encodeU64(e.link.id);
+        const id_be = codec.encodeU64(e.link.id);
         @memcpy(key_buf[t.text.len..][0..8], &id_be);
         _ = try db.links_index_tree.delete(key_buf[0..key_len]);
     }
@@ -91,7 +92,7 @@ pub fn applyLinkDeleted(db: *Database, e: changeset.LinkDeleteEffect) !void {
 }
 
 pub fn applyLinkTextUpdated(db: *Database, e: changeset.LinkTextUpdateEffect) !void {
-    const id_key = types.encodeU64(e.new_link.id);
+    const id_key = codec.encodeU64(e.new_link.id);
 
     try db.mt_links_by_id.put(&id_key, std.mem.asBytes(&e.new_link));
 
@@ -100,7 +101,7 @@ pub fn applyLinkTextUpdated(db: *Database, e: changeset.LinkTextUpdateEffect) !v
         const key_len = t.text.len + 8;
         if (key_len > key_buf.len) continue;
         @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = types.encodeU64(e.new_link.id);
+        const id_be = codec.encodeU64(e.new_link.id);
         @memcpy(key_buf[t.text.len..][0..8], &id_be);
         _ = try db.links_index_tree.delete(key_buf[0..key_len]);
     }
@@ -109,15 +110,15 @@ pub fn applyLinkTextUpdated(db: *Database, e: changeset.LinkTextUpdateEffect) !v
         const key_len = t.text.len + 8;
         if (key_len > key_buf.len) continue;
         @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = types.encodeU64(e.new_link.id);
+        const id_be = codec.encodeU64(e.new_link.id);
         @memcpy(key_buf[t.text.len..][0..8], &id_be);
         try db.links_index_tree.insert(key_buf[0..key_len], &.{});
     }
 
     if (!std.mem.eql(u8, e.old_link.url.slice(), e.new_link.url.slice())) {
-        const old_hash_key = types.encodeU64(types.hashUrl(e.old_link.url.slice()));
+        const old_hash_key = codec.encodeU64(codec.hash(e.old_link.url.slice()));
         try db.mt_link_by_url_hash.delete(&old_hash_key);
-        const new_hash_key = types.encodeU64(types.hashUrl(e.new_link.url.slice()));
+        const new_hash_key = codec.encodeU64(codec.hash(e.new_link.url.slice()));
         try db.mt_link_by_url_hash.put(&new_hash_key, &id_key);
         db.url_bloom.add(e.new_link.url.slice());
     }
@@ -131,14 +132,14 @@ pub fn applyLinkTextUpdated(db: *Database, e: changeset.LinkTextUpdateEffect) !v
 }
 
 pub fn applyLinkRecategorized(db: *Database, e: changeset.LinkRecatEffect) !void {
-    const id_key = types.encodeU64(e.link.id);
+    const id_key = codec.encodeU64(e.link.id);
 
-    const old_cl_key = types.CategoryLinkKey.encode(e.old_category_id, e.link.id);
+    const old_cl_key = schema.CategoryLinkKey.encode(e.old_category_id, e.link.id);
     try db.mt_link_by_category.delete(&old_cl_key);
 
     try db.mt_links_by_id.put(&id_key, std.mem.asBytes(&e.link));
 
-    const new_cl_key = types.CategoryLinkKey.encode(e.link.category_id, e.link.id);
+    const new_cl_key = schema.CategoryLinkKey.encode(e.link.category_id, e.link.id);
     try db.mt_link_by_category.put(&new_cl_key, &id_key);
 
     try apply.cascadeAncestorCounts(db, e.old_chain_updates, e.old_category_id, .link_count, false);
@@ -165,12 +166,12 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
     const aa = arena.allocator();
 
     const link_id: u64 = 100;
-    const link = types.Link{
+    const link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice("https://x.example"),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("World"),
+        .url = codec.FixedString(64).fromSlice("https://x.example"),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("World"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -194,7 +195,7 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
     const got_link = (try ops.getLink(db, link_id)).?;
     try std.testing.expectEqual(link_id, got_link.id);
 
-    const cl_key = types.CategoryLinkKey.encode(cat_id, link_id);
+    const cl_key = schema.CategoryLinkKey.encode(cat_id, link_id);
     var v_buf: [64]u8 = undefined;
     const cl_in_mt = db.mt_link_by_category.get(&cl_key);
     const cl_present = switch (cl_in_mt) {
@@ -204,7 +205,7 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
     };
     try std.testing.expect(cl_present);
 
-    const hash_key = types.encodeU64(types.hashUrl("https://x.example"));
+    const hash_key = codec.encodeU64(codec.hash("https://x.example"));
     const hash_in_mt = db.mt_link_by_url_hash.get(&hash_key);
     const hash_present = switch (hash_in_mt) {
         .found => true,
@@ -215,7 +216,7 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
 
     var token_key_buf: [32]u8 = undefined;
     @memcpy(token_key_buf[0..5], "hello");
-    const link_id_be = types.encodeU64(link_id);
+    const link_id_be = codec.encodeU64(link_id);
     @memcpy(token_key_buf[5..13], &link_id_be);
     try std.testing.expect((try db.links_index_tree.search(token_key_buf[0..13], &v_buf)) != null);
 
@@ -246,12 +247,12 @@ test "applyLinkInserted: retry is index-idempotent; recount reconciles delta dou
     const aa = arena.allocator();
 
     const link_id: u64 = 200;
-    const link = types.Link{
+    const link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice("https://idempotent.example"),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("World"),
+        .url = codec.FixedString(64).fromSlice("https://idempotent.example"),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("World"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -305,12 +306,12 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
     const aa = arena.allocator();
 
     const link_id: u64 = 300;
-    const link = types.Link{
+    const link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice("https://reverse.example"),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("World"),
+        .url = codec.FixedString(64).fromSlice("https://reverse.example"),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("World"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -346,7 +347,7 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
 
     try std.testing.expect((try ops.getLink(db, link_id)) == null);
 
-    const cl_key = types.CategoryLinkKey.encode(cat_id, link_id);
+    const cl_key = schema.CategoryLinkKey.encode(cat_id, link_id);
     var v_buf: [64]u8 = undefined;
     const cl_in_mt = db.mt_link_by_category.get(&cl_key);
     const cl_present = switch (cl_in_mt) {
@@ -356,7 +357,7 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
     };
     try std.testing.expect(!cl_present);
 
-    const hash_key = types.encodeU64(types.hashUrl("https://reverse.example"));
+    const hash_key = codec.encodeU64(codec.hash("https://reverse.example"));
     const hash_in_mt = db.mt_link_by_url_hash.get(&hash_key);
     const hash_present = switch (hash_in_mt) {
         .found => true,
@@ -367,7 +368,7 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
 
     var token_key_buf: [32]u8 = undefined;
     @memcpy(token_key_buf[0..5], "hello");
-    const link_id_be = types.encodeU64(link_id);
+    const link_id_be = codec.encodeU64(link_id);
     @memcpy(token_key_buf[5..13], &link_id_be);
     try std.testing.expect((try db.links_index_tree.search(token_key_buf[0..13], &v_buf)) == null);
 
@@ -396,12 +397,12 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
 
     const link_id: u64 = 400;
     const url = "https://text-update.example";
-    const old_link = types.Link{
+    const old_link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice(url),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("Old desc"),
+        .url = codec.FixedString(64).fromSlice(url),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("Old desc"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -421,12 +422,12 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
     } };
     try db.commit(insert_cs);
 
-    const new_link = types.Link{
+    const new_link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice(url),
-        .title = types.FixedString(128).fromSlice("World"),
-        .description = types.FixedString(256).fromSlice("New desc"),
+        .url = codec.FixedString(64).fromSlice(url),
+        .title = codec.FixedString(128).fromSlice("World"),
+        .description = codec.FixedString(256).fromSlice("New desc"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 2000,
@@ -452,7 +453,7 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
     var v_buf: [64]u8 = undefined;
     var old_token_key: [32]u8 = undefined;
     @memcpy(old_token_key[0..5], "hello");
-    const link_id_be = types.encodeU64(link_id);
+    const link_id_be = codec.encodeU64(link_id);
     @memcpy(old_token_key[5..13], &link_id_be);
     try std.testing.expect((try db.links_index_tree.search(old_token_key[0..13], &v_buf)) == null);
 
@@ -461,7 +462,7 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
     @memcpy(new_token_key[5..13], &link_id_be);
     try std.testing.expect((try db.links_index_tree.search(new_token_key[0..13], &v_buf)) != null);
 
-    const hash_key = types.encodeU64(types.hashUrl(url));
+    const hash_key = codec.encodeU64(codec.hash(url));
     const hash_in_mt = db.mt_link_by_url_hash.get(&hash_key);
     const hash_present = switch (hash_in_mt) {
         .found => true,
@@ -495,12 +496,12 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     const link_id: u64 = 401;
     const old_url = "https://old.example";
     const new_url = "https://new.example";
-    const old_link = types.Link{
+    const old_link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice(old_url),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("Old desc"),
+        .url = codec.FixedString(64).fromSlice(old_url),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("Old desc"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -520,12 +521,12 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     } };
     try db.commit(insert_cs);
 
-    const new_link = types.Link{
+    const new_link = schema.Link{
         .id = link_id,
         .category_id = cat_id,
-        .url = types.FixedString(64).fromSlice(new_url),
-        .title = types.FixedString(128).fromSlice("World"),
-        .description = types.FixedString(256).fromSlice("New desc"),
+        .url = codec.FixedString(64).fromSlice(new_url),
+        .title = codec.FixedString(128).fromSlice("World"),
+        .description = codec.FixedString(256).fromSlice("New desc"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 2000,
@@ -550,7 +551,7 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
 
     var v_buf: [64]u8 = undefined;
 
-    const old_hash_key = types.encodeU64(types.hashUrl(old_url));
+    const old_hash_key = codec.encodeU64(codec.hash(old_url));
     const old_hash_in_mt = db.mt_link_by_url_hash.get(&old_hash_key);
     const old_hash_present = switch (old_hash_in_mt) {
         .found => true,
@@ -559,7 +560,7 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     };
     try std.testing.expect(!old_hash_present);
 
-    const new_hash_key = types.encodeU64(types.hashUrl(new_url));
+    const new_hash_key = codec.encodeU64(codec.hash(new_url));
     const new_hash_in_mt = db.mt_link_by_url_hash.get(&new_hash_key);
     const new_hash_present = switch (new_hash_in_mt) {
         .found => true,
@@ -568,7 +569,7 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     };
     try std.testing.expect(new_hash_present);
 
-    const link_id_be = types.encodeU64(link_id);
+    const link_id_be = codec.encodeU64(link_id);
     var old_token_key: [32]u8 = undefined;
     @memcpy(old_token_key[0..5], "hello");
     @memcpy(old_token_key[5..13], &link_id_be);
@@ -601,12 +602,12 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     const aa = arena.allocator();
 
     const link_id: u64 = 500;
-    const link_in_a = types.Link{
+    const link_in_a = schema.Link{
         .id = link_id,
         .category_id = cat_a_id,
-        .url = types.FixedString(64).fromSlice("https://recat.example"),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("World"),
+        .url = codec.FixedString(64).fromSlice("https://recat.example"),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("World"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -626,12 +627,12 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     } };
     try db.commit(insert_cs);
 
-    const link_in_b = types.Link{
+    const link_in_b = schema.Link{
         .id = link_id,
         .category_id = cat_b_id,
-        .url = types.FixedString(64).fromSlice("https://recat.example"),
-        .title = types.FixedString(128).fromSlice("Hello"),
-        .description = types.FixedString(256).fromSlice("World"),
+        .url = codec.FixedString(64).fromSlice("https://recat.example"),
+        .title = codec.FixedString(128).fromSlice("Hello"),
+        .description = codec.FixedString(256).fromSlice("World"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 2000,
@@ -654,7 +655,7 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
 
     var v_buf: [64]u8 = undefined;
 
-    const old_cl_key = types.CategoryLinkKey.encode(cat_a_id, link_id);
+    const old_cl_key = schema.CategoryLinkKey.encode(cat_a_id, link_id);
     const old_cl_in_mt = db.mt_link_by_category.get(&old_cl_key);
     const old_cl_present = switch (old_cl_in_mt) {
         .found => true,
@@ -663,7 +664,7 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     };
     try std.testing.expect(!old_cl_present);
 
-    const new_cl_key = types.CategoryLinkKey.encode(cat_b_id, link_id);
+    const new_cl_key = schema.CategoryLinkKey.encode(cat_b_id, link_id);
     const new_cl_in_mt = db.mt_link_by_category.get(&new_cl_key);
     const new_cl_present = switch (new_cl_in_mt) {
         .found => true,

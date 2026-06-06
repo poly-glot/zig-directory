@@ -1,7 +1,6 @@
 const std = @import("std");
 const protocol = @import("binary_protocol.zig");
-const types = @import("types.zig");
-
+const schema = @import("schema.zig");
 const FixedStringMeta = struct { capacity: usize };
 
 pub fn main() !void {
@@ -27,13 +26,13 @@ pub fn main() !void {
     try writeStatusEnum(w, "SubStatus", protocol.SubStatus);
     try writeStatusMap(w, "STATUS_MSG", protocol.Status);
     try writeStatusMap(w, "SUB_STATUS_MSG", protocol.SubStatus);
-    try writeStructSize(w, "CATEGORY_SIZE", types.Category);
-    try writeStructSize(w, "LINK_SIZE", types.Link);
+    try writeStructSize(w, "CATEGORY_SIZE", schema.Category);
+    try writeStructSize(w, "LINK_SIZE", schema.Link);
     try writeLinkStatusEnum(w);
-    try writeStructInterface(w, "Category", types.Category);
-    try writeStructInterface(w, "Link", types.Link);
-    try writeStructReader(w, "Category", types.Category);
-    try writeStructReader(w, "Link", types.Link);
+    try writeStructInterface(w, "Category", schema.Category);
+    try writeStructInterface(w, "Link", schema.Link);
+    try writeStructReader(w, "Category", schema.Category);
+    try writeStructReader(w, "Link", schema.Link);
     try writeFooter(w);
     try w.flush();
 }
@@ -94,7 +93,7 @@ fn writeLinkStatusEnum(w: anytype) !void {
         \\export function linkStatusFromByte(b: number): LinkStatus {
         \\
     );
-    inline for (@typeInfo(types.LinkStatus).@"enum".fields) |f| {
+    inline for (@typeInfo(schema.LinkStatus).@"enum".fields) |f| {
         try w.print("    if (b === {d}) return \"{s}\";\n", .{ f.value, f.name });
     }
     try w.writeAll(
@@ -104,7 +103,7 @@ fn writeLinkStatusEnum(w: anytype) !void {
         \\export function statusToCode(s: LinkStatus): number {
         \\
     );
-    inline for (@typeInfo(types.LinkStatus).@"enum".fields) |f| {
+    inline for (@typeInfo(schema.LinkStatus).@"enum".fields) |f| {
         try w.print("    if (s === \"{s}\") return {d};\n", .{ f.name, f.value });
     }
     try w.writeAll(

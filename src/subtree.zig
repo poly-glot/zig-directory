@@ -1,5 +1,6 @@
 const std = @import("std");
-const types = @import("types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("schema.zig");
 const btree = @import("btree/btree.zig");
 const page_cache = @import("page_cache.zig");
 const freelist = @import("freelist.zig");
@@ -87,12 +88,12 @@ pub fn collectDescendants(
 
     while (queue.items.len > 0) {
         const cur = queue.pop().?;
-        const start_key = types.ParentChildKey.encode(cur, 0);
+        const start_key = schema.ParentChildKey.encode(cur, 0);
         var iter = try cat_by_parent.rangeScan(&start_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
-            if (types.decodeU64(entry.key[0..8]) != cur) break;
-            const child = types.decodeU64(entry.key[8..16]);
+            if (codec.decodeU64(entry.key[0..8]) != cur) break;
+            const child = codec.decodeU64(entry.key[8..16]);
             const gop = try visited.getOrPut(child);
             if (gop.found_existing) continue;
             if (visited.count() > MAX_DESCENDANTS) return SubtreeError.SubtreeTooLarge;
@@ -125,18 +126,18 @@ pub fn listSubtreeLinkIds(
     const offset_u64: u64 = offset;
 
     for (descendants) |cat_id| {
-        const start_key = types.CategoryLinkKey.encode(cat_id, 0);
+        const start_key = schema.CategoryLinkKey.encode(cat_id, 0);
         var iter = try link_by_category.rangeScan(&start_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
-            if (types.decodeU64(entry.key[0..8]) != cat_id) break;
+            if (codec.decodeU64(entry.key[0..8]) != cat_id) break;
             total += 1;
             if (skipped < offset_u64) {
                 skipped += 1;
                 continue;
             }
             if (page_ids.items.len >= limit) continue;
-            const link_id = types.decodeU64(entry.key[8..16]);
+            const link_id = codec.decodeU64(entry.key[8..16]);
             try page_ids.append(allocator, link_id);
         }
     }
@@ -233,8 +234,8 @@ test "collectDescendants returns inclusive sorted set on a tiny synthetic tree" 
 
     const edges = [_][2]u64{ .{ 1, 2 }, .{ 1, 3 }, .{ 2, 4 }, .{ 2, 5 } };
     inline for (edges) |edge| {
-        const k = types.ParentChildKey.encode(edge[0], edge[1]);
-        const v = types.encodeU64(edge[1]);
+        const k = schema.ParentChildKey.encode(edge[0], edge[1]);
+        const v = codec.encodeU64(edge[1]);
         try cat_by_parent.insert(&k, &v);
     }
 
@@ -257,8 +258,8 @@ test "collectDescendants tolerates cycles via the visited set" {
 
     const edges = [_][2]u64{ .{ 1, 1 }, .{ 1, 2 }, .{ 2, 1 }, .{ 2, 3 } };
     inline for (edges) |edge| {
-        const k = types.ParentChildKey.encode(edge[0], edge[1]);
-        const v = types.encodeU64(edge[1]);
+        const k = schema.ParentChildKey.encode(edge[0], edge[1]);
+        const v = codec.encodeU64(edge[1]);
         try cat_by_parent.insert(&k, &v);
     }
 
@@ -284,8 +285,8 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
         var lid: u64 = 1;
         while (lid <= 10) : (lid += 1) {
             const link_id = cid * 100 + lid;
-            const k = types.CategoryLinkKey.encode(cid, link_id);
-            const v = types.encodeU64(link_id);
+            const k = schema.CategoryLinkKey.encode(cid, link_id);
+            const v = codec.encodeU64(link_id);
             try link_by_category.insert(&k, &v);
         }
     }

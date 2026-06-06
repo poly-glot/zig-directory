@@ -1,5 +1,6 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("../schema.zig");
 const Database = @import("../database.zig").Database;
 const category = @import("operations_category.zig");
 
@@ -69,7 +70,7 @@ pub fn buildSlugPath(db: *Database, id: u64, buf: []u8) !?[]const u8 {
     return buf[0..pos];
 }
 
-pub fn buildCanonicalSlugPath(db: *Database, cat: *const types.Category, buf: []u8) !?[]const u8 {
+pub fn buildCanonicalSlugPath(db: *Database, cat: *const schema.Category, buf: []u8) !?[]const u8 {
     var id_path: [64]u64 = undefined;
     const path_ids = try category.getCategoryPath(db, cat.id, &id_path);
     var pos: usize = 0;
@@ -157,12 +158,12 @@ test "resolveSlugPath: validation gate hides orphans during repair window" {
     db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
     db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
 
-    var v: [8]u8 = types.encodeU64(a_id);
+    var v: [8]u8 = codec.encodeU64(a_id);
     try db.categories_by_slug_path.insert("top/old-a", &v);
 
     try std.testing.expectEqual(a_id, (try resolveSlugPath(db, "top/old-a")).?);
 
-    var task = types.RepairTask{ .cat_id = a_id, .op = .renamed_slug };
+    var task = schema.RepairTask{ .cat_id = a_id, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
     try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));
