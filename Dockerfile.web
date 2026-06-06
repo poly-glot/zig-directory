@@ -1,16 +1,27 @@
 # ============================================================
-# dmozdb web frontend — Deno/Fresh SSR only (no Zig backend)
+# dmozdb web frontend — Deno/Fresh compiled to a self-contained binary
 # ============================================================
-# Split out of the former combined image so the frontend runs as its own
-# horizontally-scaled OKE Deployment. It reaches the backend over a
-# ClusterIP service (DMOZDB_HOST/DMOZDB_PORT) and stores users/sessions in
-# the shared denokv service (KV_PATH + DENO_KV_ACCESS_TOKEN) — both injected
-# by the Deployment manifest, not baked here.
+# The frontend runs as its own horizontally-scaled OKE Deployment, reaching the
+# backend over a ClusterIP service. We follow Fresh's deno-compile deployment
+# recipe (https://usefresh.dev/docs/deployment/deno-compile): `deno task build`
+# then `deno compile` the _fresh/compiled-entry.js into one executable that
+# embeds the Deno runtime, the built bundle, and the static assets. The runtime
+# stage therefore needs no Deno install — just a glibc base.
 #
-# Build: docker build -f Dockerfile.web --platform linux/arm64 -t dmozdb-web .
+# Two deviations from the doc's bare command, both load-bearing here:
+#   --unstable-kv   the app calls Deno.openKv (lib/kv-users.ts); the flag must
+#                   be baked into the binary or KV access throws at runtime.
+#   --include static  favicon.ico / logo.svg are served from static/ at runtime.
+#
+# It reaches the backend over DMOZDB_HOST/DMOZDB_PORT and stores users/sessions
+# in the denokv service (KV_PATH + DENO_KV_ACCESS_TOKEN) — both injected by the
+# Deployment manifest (deployment/base/web.yaml), not baked here.
+#
+# Built and deployed by .github/workflows/cd.yaml on push to main.
+# Build locally: docker build -f Dockerfile.web --platform linux/arm64 -t dmozdb-web .
 # ============================================================
 
-# ── Stage 1: build the Deno/Fresh web frontend ─────────────
+# ── Stage 1: build the bundle, then compile the binary ─────
 FROM denoland/deno:2.8.1 AS web-builder
 
 WORKDIR /web
@@ -22,23 +33,48 @@ COPY web/deno.json web/deno.lock ./
 RUN deno install
 
 COPY web/ ./
-RUN deno task build
+# Build with vite (needs node_modules), then drop node_modules before compiling:
+# the _fresh SSR bundle is self-contained, so deno compile would otherwise embed
+# ~65 MB of unused node_modules into the binary (verified: it still boots, serves,
+# and opens KV without them).
+RUN deno task build && rm -rf node_modules
+RUN deno compile \
+    --output dmozdb-web \
+    --include _fresh \
+    --include static \
+    --unstable-kv \
+    -A \
+    _fresh/compiled-entry.js
 
 # ── Stage 2: runtime ───────────────────────────────────────
-FROM denoland/deno:2.8.1
+# The compiled binary bundles the Deno runtime, so no Deno here — just glibc,
+# CA roots for outbound TLS, and tini for PID-1 signal handling. It MUST be a
+# glibc base: `deno compile` only emits glibc-linked binaries (its targets are
+# all *-linux-gnu — there is no musl target), so Alpine/musl cannot load it and
+# fails with "exec: no such file or directory". gcr.io/distroless/cc-debian12
+# is a verified, smaller glibc alternative (no shell/tini; use WORKDIR to make
+# the KV dir).
+FROM debian:bookworm-slim
 
-WORKDIR /web
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    ca-certificates tini && \
+    rm -rf /var/lib/apt/lists/*
 
-# The built Fresh SSR bundle (_fresh/server.js) is self-contained — vite inlines
-# its deps, so node_modules is NOT shipped at runtime. Ship the bundle, the
-# static assets, and the import map / lockfile the entry resolves.
-COPY --from=web-builder /web/_fresh ./_fresh
-COPY --from=web-builder /web/static ./static
-COPY --from=web-builder /web/deno.json /web/deno.lock ./
+COPY --from=web-builder /web/dmozdb-web /usr/local/bin/dmozdb-web
+
+# compiled-entry.js reads PORT and HOSTNAME; bind all interfaces in-container.
+ENV HOSTNAME=0.0.0.0
+ENV PORT=8000
+
+# Users/sessions live in a local Deno KV file. lib/kv-users.ts defaults to the
+# cwd-relative ./data/users.db, but the compiled binary's cwd is / with no such
+# dir, so any session/auth request 500s on openKv. Point KV_PATH at an absolute
+# writable path and create it. In k8s this is overridden to the remote denokv
+# service (see deployment/base/web.yaml); mount a volume to persist restarts.
+RUN mkdir -p /data
+ENV KV_PATH=/data/users.db
 
 EXPOSE 8000
 
-# tini (shipped in the deno base image at /tini) as PID 1 reaps zombies and
-# forwards SIGTERM to the Deno server for a clean shutdown. --unstable-kv is
-# required for Deno.openKv against the remote denokv service.
-ENTRYPOINT ["/tini", "--", "deno", "serve", "-A", "--unstable-kv", "--port", "8000", "/web/_fresh/server.js"]
+# tini as PID 1 reaps zombies and forwards SIGTERM to the server for a clean exit.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/dmozdb-web"]
