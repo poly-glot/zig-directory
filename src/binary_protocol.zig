@@ -1276,15 +1276,19 @@ fn handleCountsByStatus(db: *Database, resp: []u8, op_byte: u8) usize {
 
 fn handleStats(db: *Database, resp: []u8, op_byte: u8) usize {
     const s = db.getStats();
-    var off: usize = RESPONSE_HEADER_SIZE;
-    inline for (.{
+    const values = [_]u64{
         s.category_count,
         s.link_count,
         @as(u64, s.page_count),
         s.cache_hits,
         s.cache_misses,
         s.wal_pending_batch_entries,
-    }) |val| {
+    };
+    if (resp.len < RESPONSE_HEADER_SIZE + values.len * @sizeOf(u64)) {
+        return writeErrorResp(resp, op_byte, .err);
+    }
+    var off: usize = RESPONSE_HEADER_SIZE;
+    for (values) |val| {
         std.mem.writeInt(u64, resp[off..][0..8], val, .little);
         off += 8;
     }
@@ -1661,6 +1665,24 @@ test "op_latency_stats (23): records latency through processFrames + reports per
         p += 7 * 8;
     }
     try std.testing.expect(found_ping);
+}
+
+test "handleStats refuses an undersized response buffer instead of overflowing it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Database.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    var tail: [RESPONSE_HEADER_SIZE + 8]u8 = undefined;
+    const refused = handleStats(db, &tail, @intFromEnum(Op.stats));
+    try std.testing.expect(refused <= tail.len);
+    try std.testing.expectEqual(@intFromEnum(Status.err), tail[5]);
+
+    var exact: [RESPONSE_HEADER_SIZE + 6 * 8]u8 = undefined;
+    const written = handleStats(db, &exact, @intFromEnum(Op.stats));
+    try std.testing.expectEqual(@as(usize, RESPONSE_HEADER_SIZE + 6 * 8), written);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), exact[5]);
 }
 
 test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration_ms" {
