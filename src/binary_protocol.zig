@@ -309,6 +309,12 @@ const category_fields = &[_]struct { []const u8, type }{
 const CreateLinks = BatchCreateHandler(link_fields, @intFromEnum(Op.create_link), operations.createLink);
 const CreateCategories = BatchCreateHandler(category_fields, @intFromEnum(Op.create_category), operations.createCategory);
 
+const RESPONSE_RESERVE = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(types.Category);
+
+fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
+    return resp_off == 0 or buf_len - resp_off >= RESPONSE_RESERVE;
+}
+
 pub fn processFrames(
     db: *Database,
     conn: *conn_mod.Connection,
@@ -319,6 +325,7 @@ pub fn processFrames(
     var resp_off: usize = 0;
 
     while (consumed + REQUEST_HEADER_SIZE <= data.len) {
+        if (!pipelineHasRoom(resp_off, bp.response_buf.len)) break;
         if (resp_off + RESPONSE_HEADER_SIZE > bp.response_buf.len) break;
 
         const frame = data[consumed..];
@@ -1683,6 +1690,13 @@ test "handleStats refuses an undersized response buffer instead of overflowing i
     const written = handleStats(db, &exact, @intFromEnum(Op.stats));
     try std.testing.expectEqual(@as(usize, RESPONSE_HEADER_SIZE + 6 * 8), written);
     try std.testing.expectEqual(@intFromEnum(Status.ok), exact[5]);
+}
+
+test "pipelineHasRoom defers a frame once the buffer can't hold a worst-case response" {
+    const buf = conn_mod.RESPONSE_BUF_SIZE;
+    try std.testing.expect(pipelineHasRoom(0, buf));
+    try std.testing.expect(pipelineHasRoom(buf - RESPONSE_RESERVE, buf));
+    try std.testing.expect(!pipelineHasRoom(buf - RESPONSE_RESERVE + 1, buf));
 }
 
 test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration_ms" {
