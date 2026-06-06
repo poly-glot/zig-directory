@@ -10,12 +10,15 @@ pub fn build(b: *std.Build) void {
     // break a deploy, and the image needn't copy their sources.
     const build_tools = b.option(bool, "tools", "Also build dev tools: bench, dmoz_import") orelse false;
 
+    const zigstore = b.dependency("zigstore", .{ .target = target, .optimize = optimize }).module("zigstore");
+
     // Main executable
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("zigstore", zigstore);
     const exe = b.addExecutable(.{
         .name = "dmozdb",
         .root_module = exe_mod,
@@ -37,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_mod.addImport("zigstore", zigstore);
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
     });
@@ -51,6 +55,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
         });
+        bench_mod.addImport("zigstore", zigstore);
         const bench = b.addExecutable(.{
             .name = "bench",
             .root_module = bench_mod,
@@ -63,6 +68,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
         });
+        import_mod.addImport("zigstore", zigstore);
         const import_exe = b.addExecutable(.{
             .name = "dmoz_import",
             .root_module = import_mod,
@@ -81,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    gen_client_mod.addImport("zigstore", zigstore);
     const gen_client_exe = b.addExecutable(.{
         .name = "gen_client_ts",
         .root_module = gen_client_mod,

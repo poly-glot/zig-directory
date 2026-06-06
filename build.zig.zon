@@ -1,0 +1,14 @@
+.{
+    .name = .dmozdb,
+    .version = "0.6.0",
+    .fingerprint = 0xdb0bfb17443efa77,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .zigstore = .{ .path = "../zigstore" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
