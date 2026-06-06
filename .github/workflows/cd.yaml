@@ -5,6 +5,11 @@ on:
     branches:
       - main
       - master
+  # PRs build + push the images (so a controlled manual cutover can use them)
+  # but do NOT deploy — the cd job is gated to push events below.
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -56,7 +61,7 @@ jobs:
           file: Dockerfile.backend
           platforms: linux/arm64
           push: true
-          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.sha }}-backend"
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-backend"
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
@@ -67,12 +72,16 @@ jobs:
           file: Dockerfile.web
           platforms: linux/arm64
           push: true
-          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.sha }}-web"
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-web"
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
 
   cd:
     needs: ci
+    # Deploy only on a real push to main/master — never on a PR build. The first
+    # split cutover is done manually (the StatefulSet needs a one-time
+    # --cascade=orphan recreate); after that, push-to-main applies normally.
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     name: Deploy
     steps:
