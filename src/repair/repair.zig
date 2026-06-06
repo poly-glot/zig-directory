@@ -1,5 +1,6 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("../schema.zig");
 const Database = @import("../database.zig").Database;
 const operations_slug = @import("../operations/operations_slug.zig");
 const inverted = @import("../inverted_index.zig");
@@ -57,16 +58,16 @@ fn rebuildCategoryIndices(db: *Database) !u64 {
 
     var written: u64 = 0;
 
-    const min_key = types.encodeU64(0);
+    const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id.rangeScan(&min_key, null);
     var path_buf: [2048]u8 = undefined;
     var key_buf: [4096]u8 = undefined;
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
 
     while (try iter.next()) |entry| {
-        if (entry.value.len != @sizeOf(types.Category)) continue;
-        const cat = std.mem.bytesToValue(types.Category, entry.value[0..@sizeOf(types.Category)]);
-        const id_key = types.encodeU64(cat.id);
+        if (entry.value.len != @sizeOf(schema.Category)) continue;
+        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+        const id_key = codec.encodeU64(cat.id);
 
         const slug = cat.slug.slice();
         if (slug.len > 0) {
@@ -110,7 +111,7 @@ fn rebuildCategoryIndices(db: *Database) !u64 {
 
     var sit = slug_best.iterator();
     while (sit.next()) |kv| {
-        const id_key = types.encodeU64(kv.value_ptr.cat_id);
+        const id_key = codec.encodeU64(kv.value_ptr.cat_id);
         try db.categories_by_slug_only.insert(kv.key_ptr.*, &id_key);
         written += 1;
     }
@@ -123,15 +124,15 @@ fn rebuildLinkIndex(db: *Database) !u64 {
 
     var written: u64 = 0;
 
-    const min_key = types.encodeU64(0);
+    const min_key = codec.encodeU64(0);
     var iter = try db.links_by_id.rangeScan(&min_key, null);
     var key_buf: [4096]u8 = undefined;
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
 
     while (try iter.next()) |entry| {
-        if (entry.value.len != @sizeOf(types.Link)) continue;
-        const link = std.mem.bytesToValue(types.Link, entry.value[0..@sizeOf(types.Link)]);
-        const id_key = types.encodeU64(link.id);
+        if (entry.value.len != @sizeOf(schema.Link)) continue;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
+        const id_key = codec.encodeU64(link.id);
 
         const fields = [_][]const u8{
             link.title.slice(),
@@ -228,7 +229,7 @@ test "rebuildAllIndices: stale token entry removed and re-added" {
     const stale_tok = "programming";
     var stale_key: [stale_tok.len + 8]u8 = undefined;
     @memcpy(stale_key[0..stale_tok.len], stale_tok);
-    const stale_cat_id = types.encodeU64(99999);
+    const stale_cat_id = codec.encodeU64(99999);
     @memcpy(stale_key[stale_tok.len..][0..8], &stale_cat_id);
     try db.categories_index_tree.insert(&stale_key, &.{});
 

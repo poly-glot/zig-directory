@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
 const changeset = @import("../changeset.zig");
 const Database = @import("../database.zig").Database;
 
@@ -64,7 +64,7 @@ pub fn cascadeAncestorCounts(
                 @field(cat, fld) -= 1;
             }
         }
-        const ancestor_key = types.encodeU64(upd.cat_id);
+        const ancestor_key = codec.encodeU64(upd.cat_id);
         try db.mt_categories_by_id.put(&ancestor_key, std.mem.asBytes(&cat));
     }
 }

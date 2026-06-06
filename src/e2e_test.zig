@@ -4,7 +4,8 @@ const testing = std.testing;
 const Database = @import("database.zig").Database;
 const Config = @import("main.zig").Config;
 const ops = @import("operations/operations.zig");
-const types = @import("types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("schema.zig");
 const wal_mod = @import("wal/wal.zig");
 const wal_replay = @import("wal/wal_replay.zig");
 const snapshot = @import("snapshot.zig");
@@ -114,38 +115,38 @@ test "E2E: B+Tree insert, search, delete, range scan with 500 keys" {
 }
 
 test "E2E: FixedString roundtrip and truncation" {
-    const fs = types.FixedString(10).fromSlice("hello");
+    const fs = codec.FixedString(10).fromSlice("hello");
     try testing.expectEqualSlices(u8, "hello", fs.slice());
     try testing.expect(fs.eql("hello"));
     try testing.expect(!fs.eql("world"));
 
-    const long = types.FixedString(6).fromSlice("this is too long");
+    const long = codec.FixedString(6).fromSlice("this is too long");
     try testing.expectEqual(@as(u16, 6), long.len);
     try testing.expectEqualSlices(u8, "this i", long.slice());
 }
 
 test "E2E: u64 encoding preserves sort order" {
-    const a = types.encodeU64(100);
-    const b = types.encodeU64(200);
-    const c = types.encodeU64(50);
+    const a = codec.encodeU64(100);
+    const b = codec.encodeU64(200);
+    const c = codec.encodeU64(50);
 
     try testing.expect(std.mem.order(u8, &a, &b) == .lt);
     try testing.expect(std.mem.order(u8, &c, &a) == .lt);
     try testing.expect(std.mem.order(u8, &b, &c) == .gt);
 
-    try testing.expectEqual(@as(u64, 100), types.decodeU64(&a));
-    try testing.expectEqual(@as(u64, 200), types.decodeU64(&b));
+    try testing.expectEqual(@as(u64, 100), codec.decodeU64(&a));
+    try testing.expectEqual(@as(u64, 200), codec.decodeU64(&b));
 }
 
 test "E2E: composite key encoding" {
-    const k1 = types.ParentChildKey.encode(1, 100);
-    const k2 = types.ParentChildKey.encode(1, 200);
-    const k3 = types.ParentChildKey.encode(2, 50);
+    const k1 = schema.ParentChildKey.encode(1, 100);
+    const k2 = schema.ParentChildKey.encode(1, 200);
+    const k3 = schema.ParentChildKey.encode(2, 50);
 
     try testing.expect(std.mem.order(u8, &k1, &k2) == .lt);
     try testing.expect(std.mem.order(u8, &k2, &k3) == .lt);
 
-    const decoded = types.ParentChildKey.decode(&k1);
+    const decoded = schema.ParentChildKey.decode(&k1);
     try testing.expectEqual(@as(u64, 1), decoded.parent_id);
     try testing.expectEqual(@as(u64, 100), decoded.child_id);
 }
@@ -344,7 +345,7 @@ test "E2E: listChildren with pagination" {
         _ = try ops.createCategory(db, parent, name, name, "");
     }
 
-    var buf: [64]types.Category = undefined;
+    var buf: [64]schema.Category = undefined;
     const page1 = try ops.listChildren(db, parent, 0, 5, &buf);
     try testing.expectEqual(@as(usize, 5), page1.len);
 
@@ -372,7 +373,7 @@ test "E2E: listLinks with pagination" {
         _ = try ops.createLink(db, cat, url, title, "");
     }
 
-    var lbuf: [64]types.Link = undefined;
+    var lbuf: [64]schema.Link = undefined;
     const all = (try ops.listLinks(db, cat, 0, 64, &lbuf, null, 0)).items;
     try testing.expectEqual(@as(usize, 8), all.len);
 
@@ -417,11 +418,11 @@ test "E2E: search categories and links" {
     _ = try ops.createLink(db, zig_cat, "https://ziglang.org", "Zig Official", "Main Zig site");
     _ = try ops.createLink(db, zig_cat, "https://example.com", "Example Site", "Not about Zig");
 
-    var cat_buf: [64]types.Category = undefined;
+    var cat_buf: [64]schema.Category = undefined;
     const cat_results = try ops.searchCategories(db, "Zig", 64, &cat_buf);
     try testing.expect(cat_results.len >= 2);
 
-    var link_buf: [64]types.Link = undefined;
+    var link_buf: [64]schema.Link = undefined;
     const link_results = try ops.searchLinks(db, "Zig", 64, &link_buf);
     try testing.expect(link_results.len >= 1);
 
@@ -609,11 +610,11 @@ test "E2E: full DMOZ workflow - create hierarchy, browse, search" {
     try testing.expectEqual(computers, zig_path[0]);
     try testing.expectEqual(zig_cat, zig_path[3]);
 
-    var cat_buf: [64]types.Category = undefined;
+    var cat_buf: [64]schema.Category = undefined;
     const roots = try ops.listChildren(db, 0, 0, 64, &cat_buf);
     try testing.expect(roots.len >= 2);
 
-    var link_buf: [64]types.Link = undefined;
+    var link_buf: [64]schema.Link = undefined;
     const zig_links = (try ops.listLinks(db, zig_cat, 0, 64, &link_buf, null, 0)).items;
     try testing.expectEqual(@as(usize, 2), zig_links.len);
 

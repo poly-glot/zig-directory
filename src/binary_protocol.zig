@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types.zig");
+const schema = @import("schema.zig");
 const Database = @import("database.zig").Database;
 const Stats = @import("database.zig").Stats;
 const operations = @import("operations/operations.zig");
@@ -309,7 +309,7 @@ const category_fields = &[_]struct { []const u8, type }{
 const CreateLinks = BatchCreateHandler(link_fields, @intFromEnum(Op.create_link), operations.createLink);
 const CreateCategories = BatchCreateHandler(category_fields, @intFromEnum(Op.create_category), operations.createCategory);
 
-const RESPONSE_RESERVE = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(types.Category);
+const RESPONSE_RESERVE = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(schema.Category);
 
 fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
     return resp_off == 0 or buf_len - resp_off >= RESPONSE_RESERVE;
@@ -377,8 +377,8 @@ fn dispatch(db: *Database, op: Op, op_byte: u8, payload: []const u8, count: u16,
         .ping => writeResp(resp, op_byte, .ok, 0, &.{}),
         .create_link => CreateLinks.handle(db, resp, payload, count),
         .create_category => CreateCategories.handle(db, resp, payload, count),
-        .get_link => handleGet(types.Link, db, resp, op_byte, payload, operations.getLink),
-        .get_category => handleGet(types.Category, db, resp, op_byte, payload, operations.getCategory),
+        .get_link => handleGet(schema.Link, db, resp, op_byte, payload, operations.getLink),
+        .get_category => handleGet(schema.Category, db, resp, op_byte, payload, operations.getCategory),
         .get_categories_by_ids => handleGetCategoriesByIds(db, resp, op_byte, payload),
         .delete_link => handleDelete(db, resp, op_byte, payload, operations.deleteLink),
         .delete_category => handleDelete(db, resp, op_byte, payload, operations.deleteCategory),
@@ -473,7 +473,7 @@ fn handleGetCategoriesByIds(
         return writeErrorResp(resp, op_byte, .invalid);
     }
 
-    const cat_size = @sizeOf(types.Category);
+    const cat_size = @sizeOf(schema.Category);
     if (resp.len < RESPONSE_HEADER_SIZE + @as(usize, want) * cat_size) {
         return writeErrorResp(resp, op_byte, .err);
     }
@@ -561,13 +561,13 @@ fn handleListRootCategories(db: *Database, resp: []u8, op_byte: u8, payload: []c
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const offset = std.mem.readInt(u32, payload[0..4], .little);
     const limit = std.mem.readInt(u32, payload[4..8], .little);
-    const N = comptime defaultListBufLen(types.Category);
-    var buf: [N]types.Category = undefined;
+    const N = comptime defaultListBufLen(schema.Category);
+    var buf: [N]schema.Category = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const items = operations.listChildren(db, 0, offset, max, &buf) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
-    return writeRowList(types.Category, resp, op_byte, items);
+    return writeRowList(schema.Category, resp, op_byte, items);
 }
 
 fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -584,7 +584,7 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
     db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
 
-    const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(types.Category) + 2 + 2 + 8;
+    const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(schema.Category) + 2 + 2 + 8;
     if (resp.len < MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
 
     var off: usize = RESPONSE_HEADER_SIZE;
@@ -593,14 +593,14 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     @memcpy(resp[off..][0..cat_bytes.len], cat_bytes);
     off += cat_bytes.len;
 
-    var anc_buf: [64]types.Category = undefined;
+    var anc_buf: [64]schema.Category = undefined;
     const ancestors = operations.walkAncestors(db, cat_id, &anc_buf) catch
         return writeErrorResp(resp, op_byte, .err);
     const anc_count_off = off;
     off += 2;
     var anc_written: u16 = 0;
     for (ancestors) |a| {
-        if (off + @sizeOf(types.Category) + 2 + 8 > resp.len) break;
+        if (off + @sizeOf(schema.Category) + 2 + 8 > resp.len) break;
         const ab = std.mem.asBytes(&a);
         @memcpy(resp[off..][0..ab.len], ab);
         off += ab.len;
@@ -608,14 +608,14 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     }
     std.mem.writeInt(u16, resp[anc_count_off..][0..2], anc_written, .little);
 
-    var children_buf: [100]types.Category = undefined;
+    var children_buf: [100]schema.Category = undefined;
     const children = operations.listChildren(db, cat_id, 0, 100, &children_buf) catch
         return writeErrorResp(resp, op_byte, .err);
     const child_count_off = off;
     off += 2;
     var children_written: u16 = 0;
     for (children) |child| {
-        if (off + @sizeOf(types.Category) + 8 > resp.len) break;
+        if (off + @sizeOf(schema.Category) + 8 > resp.len) break;
         const cb = std.mem.asBytes(&child);
         @memcpy(resp[off..][0..cb.len], cb);
         off += cb.len;
@@ -650,13 +650,13 @@ fn handleListChildren(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     const parent_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
     const limit = std.mem.readInt(u32, payload[12..16], .little);
-    const N = comptime defaultListBufLen(types.Category);
-    var buf: [N]types.Category = undefined;
+    const N = comptime defaultListBufLen(schema.Category);
+    var buf: [N]schema.Category = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const items = operations.listChildren(db, parent_id, offset, max, &buf) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
-    return writeRowList(types.Category, resp, op_byte, items);
+    return writeRowList(schema.Category, resp, op_byte, items);
 }
 
 fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -667,8 +667,8 @@ fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) 
     const extras = readOptionalListExtras(payload, 16) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const N = comptime defaultListBufLen(types.Link);
-    var buf: [N]types.Link = undefined;
+    const N = comptime defaultListBufLen(schema.Link);
+    var buf: [N]schema.Link = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const page = operations.listLinks(db, cat_id, offset, max, &buf, extras.status, extras.after_id) catch |err| {
         return writeMappedError(resp, op_byte, err);
@@ -683,8 +683,8 @@ fn handleListAllLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     const extras = readOptionalListExtras(payload, 8) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const N = comptime defaultListBufLen(types.Link);
-    var buf: [N]types.Link = undefined;
+    const N = comptime defaultListBufLen(schema.Link);
+    var buf: [N]schema.Link = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const page = operations.listAllLinks(db, offset, max, &buf, extras.status, extras.after_id) catch |err| {
         return writeMappedError(resp, op_byte, err);
@@ -700,8 +700,8 @@ fn handleListLinksBySubmitter(db: *Database, resp: []u8, op_byte: u8, payload: [
     const extras = readOptionalListExtras(payload, 16) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const N = comptime defaultListBufLen(types.Link);
-    var buf: [N]types.Link = undefined;
+    const N = comptime defaultListBufLen(schema.Link);
+    var buf: [N]schema.Link = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const page = operations.listLinksBySubmitter(db, submitter_id, offset, max, &buf, extras.status, extras.after_id) catch |err| {
         return writeMappedError(resp, op_byte, err);
@@ -733,7 +733,7 @@ fn readOptionalListExtras(payload: []const u8, fixed_len: usize) ?OptionalListEx
 }
 
 fn writeLinkPage(resp: []u8, op_byte: u8, page: operations.LinkPage) usize {
-    var off = writeRowList(types.Link, resp, op_byte, page.items);
+    var off = writeRowList(schema.Link, resp, op_byte, page.items);
     const written = std.mem.readInt(u16, resp[8..10], .little);
     if (off + 8 > resp.len) return writeErrorResp(resp, op_byte, .err);
     std.mem.writeInt(u64, resp[off..][0..8], page.next_after_id, .little);
@@ -822,7 +822,7 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
             next_after_id = last_written_id;
             if (status_filter == null) break else continue;
         }
-        if (off + @sizeOf(types.Link) + 16 > resp.len) {
+        if (off + @sizeOf(schema.Link) + 16 > resp.len) {
             if (status_filter == null) break else continue;
         }
         const lb = std.mem.asBytes(&link);
@@ -847,7 +847,7 @@ const SearchScope = enum(u8) { both = 0, links_only = 1, categories_only = 2 };
 
 const inverted = @import("inverted_index.zig");
 
-fn linkMatchField(link: types.Link, query: []const u8) u8 {
+fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     var it = inverted.TokenIterator.init(query);
     while (it.next(&tok_buf)) |tok| {
@@ -882,16 +882,16 @@ fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usi
     const max = @min(limit, 50);
     var off: usize = RESPONSE_HEADER_SIZE;
 
-    var cat_buf: [50]types.Category = undefined;
+    var cat_buf: [50]schema.Category = undefined;
     const cats = if (scope == .links_only)
         cat_buf[0..0]
     else
-        operations.searchCategories(db, query, max, &cat_buf) catch &[0]types.Category{};
+        operations.searchCategories(db, query, max, &cat_buf) catch &[0]schema.Category{};
     const cat_count_off = off;
     off += 2;
     var cats_written: u16 = 0;
     for (cats) |cat| {
-        if (off + @sizeOf(types.Category) + 2 > resp.len) break;
+        if (off + @sizeOf(schema.Category) + 2 > resp.len) break;
         const cb = std.mem.asBytes(&cat);
         @memcpy(resp[off..][0..cb.len], cb);
         off += cb.len;
@@ -899,16 +899,16 @@ fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usi
     }
     std.mem.writeInt(u16, resp[cat_count_off..][0..2], cats_written, .little);
 
-    var link_buf: [50]types.Link = undefined;
+    var link_buf: [50]schema.Link = undefined;
     const links = if (scope == .categories_only)
         link_buf[0..0]
     else
-        operations.searchLinks(db, query, max, &link_buf) catch &[0]types.Link{};
+        operations.searchLinks(db, query, max, &link_buf) catch &[0]schema.Link{};
     const link_count_off = off;
     off += 2;
     var links_written: u16 = 0;
     for (links) |link| {
-        if (off + @sizeOf(types.Link) + 1 > resp.len) break;
+        if (off + @sizeOf(schema.Link) + 1 > resp.len) break;
         const lb = std.mem.asBytes(&link);
         @memcpy(resp[off..][0..lb.len], lb);
         off += lb.len;
@@ -1146,7 +1146,7 @@ fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []con
     var off: usize = RESPONSE_HEADER_SIZE;
     const r = parsed.result;
     const opts = operations.CreateLinkOpts{
-        .status = @intFromEnum(types.LinkStatus.pending),
+        .status = @intFromEnum(schema.LinkStatus.pending),
         .submitter_id = submitter_id,
     };
     const id = operations.createLinkWithOpts(
@@ -1426,7 +1426,7 @@ test "index_health response carries slug_path_repair_queue fields" {
     var db = try Database.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var task = types.RepairTask{ .cat_id = 1, .op = .renamed_slug };
+    var task = schema.RepairTask{ .cat_id = 1, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
     try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));
@@ -1960,7 +1960,7 @@ test "create_submission: writes a pending Link with the supplied submitter_id" {
     try std.testing.expect(id > 0);
 
     const link = (try operations.getLink(db, id)).?;
-    try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
     try std.testing.expectEqual(@as(u64, 7777), link.submitter_id);
 }
 
@@ -1978,12 +1978,12 @@ test "update_link_status: flips pending → approved" {
         "https://x.example",
         "X",
         "",
-        .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 1 },
+        .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 1 },
     );
 
     var payload: [9]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], id, .little);
-    payload[8] = @intFromEnum(types.LinkStatus.approved);
+    payload[8] = @intFromEnum(schema.LinkStatus.approved);
 
     var resp: [64]u8 = undefined;
     const reply_len = handleUpdateLinkStatus(db, &resp, @intFromEnum(Op.update_link_status), &payload);
@@ -1991,7 +1991,7 @@ test "update_link_status: flips pending → approved" {
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
 
     const link = (try operations.getLink(db, id)).?;
-    try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.approved)), link.status);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.approved)), link.status);
 }
 
 test "list_all_links (op=16) with trailing status byte filters by status" {
@@ -2003,17 +2003,17 @@ test "list_all_links (op=16) with trailing status byte filters by status" {
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
 
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 1 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://b.example", "b", "", .{ .status = @intFromEnum(types.LinkStatus.approved), .submitter_id = 2 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://c.example", "c", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 3 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://d.example", "d", "", .{ .status = @intFromEnum(types.LinkStatus.rejected), .submitter_id = 4 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://e.example", "e", "", .{ .status = @intFromEnum(types.LinkStatus.approved), .submitter_id = 5 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://f.example", "f", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 6 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 1 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://b.example", "b", "", .{ .status = @intFromEnum(schema.LinkStatus.approved), .submitter_id = 2 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://c.example", "c", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 3 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://d.example", "d", "", .{ .status = @intFromEnum(schema.LinkStatus.rejected), .submitter_id = 4 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://e.example", "e", "", .{ .status = @intFromEnum(schema.LinkStatus.approved), .submitter_id = 5 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://f.example", "f", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 6 });
 
     var payload: [9]u8 = undefined;
     std.mem.writeInt(u32, payload[0..4], 0, .little);
     std.mem.writeInt(u32, payload[4..8], 50, .little);
-    payload[8] = @intFromEnum(types.LinkStatus.pending);
+    payload[8] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
     const reply_len = handleListAllLinks(db, &resp, @intFromEnum(Op.list_all_links), &payload);
@@ -2024,9 +2024,9 @@ test "list_all_links (op=16) with trailing status byte filters by status" {
     try std.testing.expectEqual(@as(u16, 3), item_count);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(types.Link);
-        const link = std.mem.bytesToValue(types.Link, resp[start..][0..@sizeOf(types.Link)]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(schema.Link);
+        const link = std.mem.bytesToValue(schema.Link, resp[start..][0..@sizeOf(schema.Link)]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
     }
 
     var payload_all: [8]u8 = undefined;
@@ -2049,17 +2049,17 @@ test "list_links (op=13) with trailing status byte filters within a category" {
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
     const other_id = try operations.createCategory(db, 0, "Other", "other", "");
 
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(types.LinkStatus.approved) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, other_id, "https://o1.example", "o1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, other_id, "https://o2.example", "o2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(schema.LinkStatus.approved) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, other_id, "https://o1.example", "o1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, other_id, "https://o2.example", "o2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], cat_id, .little);
     std.mem.writeInt(u32, payload[8..12], 0, .little);
     std.mem.writeInt(u32, payload[12..16], 50, .little);
-    payload[16] = @intFromEnum(types.LinkStatus.pending);
+    payload[16] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
     const reply_len = handleListLinks(db, &resp, @intFromEnum(Op.list_links), &payload);
@@ -2070,9 +2070,9 @@ test "list_links (op=13) with trailing status byte filters within a category" {
     try std.testing.expectEqual(@as(u16, 2), item_count);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(types.Link);
-        const link = std.mem.bytesToValue(types.Link, resp[start..][0..@sizeOf(types.Link)]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(schema.Link);
+        const link = std.mem.bytesToValue(schema.Link, resp[start..][0..@sizeOf(schema.Link)]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
         try std.testing.expectEqual(cat_id, link.category_id);
     }
 }
@@ -2085,16 +2085,16 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://x1.example", "x1", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 100 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://x2.example", "x2", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 100 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://x3.example", "x3", "", .{ .status = @intFromEnum(types.LinkStatus.approved), .submitter_id = 100 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://y1.example", "y1", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 200 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://x1.example", "x1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 100 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://x2.example", "x2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 100 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://x3.example", "x3", "", .{ .status = @intFromEnum(schema.LinkStatus.approved), .submitter_id = 100 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://y1.example", "y1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 200 });
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], 100, .little);
     std.mem.writeInt(u32, payload[8..12], 0, .little);
     std.mem.writeInt(u32, payload[12..16], 50, .little);
-    payload[16] = @intFromEnum(types.LinkStatus.pending);
+    payload[16] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
     const reply_len = handleListLinksBySubmitter(db, &resp, @intFromEnum(Op.list_links_by_submitter), &payload);
@@ -2105,9 +2105,9 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     try std.testing.expectEqual(@as(u16, 2), item_count);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(types.Link);
-        const link = std.mem.bytesToValue(types.Link, resp[start..][0..@sizeOf(types.Link)]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(schema.Link);
+        const link = std.mem.bytesToValue(schema.Link, resp[start..][0..@sizeOf(schema.Link)]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
         try std.testing.expectEqual(@as(u64, 100), link.submitter_id);
     }
 }
@@ -2123,17 +2123,17 @@ test "list_subtree_links (op=17) with trailing status byte filters whole subtree
     const a_id = try operations.createCategory(db, top_id, "A", "a", "");
     const b_id = try operations.createCategory(db, top_id, "B", "b", "");
 
-    _ = try operations.createLinkWithOpts(db, a_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, a_id, "https://a2.example", "a2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, a_id, "https://a3.example", "a3", "", .{ .status = @intFromEnum(types.LinkStatus.approved) });
-    _ = try operations.createLinkWithOpts(db, b_id, "https://b1.example", "b1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, a_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, a_id, "https://a2.example", "a2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, a_id, "https://a3.example", "a3", "", .{ .status = @intFromEnum(schema.LinkStatus.approved) });
+    _ = try operations.createLinkWithOpts(db, b_id, "https://b1.example", "b1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
 
     var payload: [18]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], top_id, .little);
     payload[8] = 0;
     std.mem.writeInt(u32, payload[9..13], 0, .little);
     std.mem.writeInt(u32, payload[13..17], 50, .little);
-    payload[17] = @intFromEnum(types.LinkStatus.pending);
+    payload[17] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [16384]u8 = undefined;
     const reply_len = handleListSubtreeLinks(db, &resp, @intFromEnum(Op.list_subtree_links), &payload);
@@ -2143,7 +2143,7 @@ test "list_subtree_links (op=17) with trailing status byte filters whole subtree
     const returned = std.mem.readInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 3), returned);
 
-    const link_bytes_end = RESPONSE_HEADER_SIZE + 4 + returned * @sizeOf(types.Link);
+    const link_bytes_end = RESPONSE_HEADER_SIZE + 4 + returned * @sizeOf(schema.Link);
     const total = std.mem.readInt(u64, resp[link_bytes_end..][0..8], .little);
     try std.testing.expectEqual(@as(u64, 3), total);
 }
@@ -2156,8 +2156,8 @@ test "bulk_update_link_status (op=34) reports per-id result codes" {
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
-    const approved = @intFromEnum(types.LinkStatus.approved);
-    const a = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
+    const approved = @intFromEnum(schema.LinkStatus.approved);
+    const a = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
     const b = try operations.createLinkWithOpts(db, cat_id, "https://b.example", "b", "", .{ .status = approved });
     const c: u64 = 999_999;
 
@@ -2247,10 +2247,10 @@ test "counts_by_status (op=36) returns per-status totals" {
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(types.LinkStatus.approved) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://r1.example", "r1", "", .{ .status = @intFromEnum(types.LinkStatus.rejected) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(schema.LinkStatus.approved) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://r1.example", "r1", "", .{ .status = @intFromEnum(schema.LinkStatus.rejected) });
 
     var resp: [128]u8 = undefined;
     const len = handleCountsByStatus(db, &resp, @intFromEnum(Op.counts_by_status));
@@ -2282,11 +2282,11 @@ test "search (op=14): scope byte filters sections and links carry match_field" {
         fn run(resp: []const u8) Parsed {
             var off: usize = RESPONSE_HEADER_SIZE;
             const cc = std.mem.readInt(u16, resp[off..][0..2], .little);
-            off += 2 + @as(usize, cc) * @sizeOf(types.Category);
+            off += 2 + @as(usize, cc) * @sizeOf(schema.Category);
             const lc = std.mem.readInt(u16, resp[off..][0..2], .little);
             off += 2;
             var mf: u8 = 255;
-            if (lc > 0) mf = resp[off + @sizeOf(types.Link)];
+            if (lc > 0) mf = resp[off + @sizeOf(schema.Link)];
             return .{ .cat_count = cc, .link_count = lc, .first_match_field = mf };
         }
     }.run;
@@ -2399,18 +2399,18 @@ test "get_categories_by_ids (29): mix of hits and misses returns only the hits" 
     const count = std.mem.readInt(u16, resp[8..10], .little);
     try std.testing.expectEqual(@as(u16, 2), count);
 
-    const cat_size = @sizeOf(types.Category);
+    const cat_size = @sizeOf(schema.Category);
     try std.testing.expectEqual(
         @as(usize, RESPONSE_HEADER_SIZE + 2 * cat_size),
         reply_len,
     );
 
     const cat0 = std.mem.bytesToValue(
-        types.Category,
+        schema.Category,
         resp[RESPONSE_HEADER_SIZE..][0..cat_size],
     );
     const cat1 = std.mem.bytesToValue(
-        types.Category,
+        schema.Category,
         resp[RESPONSE_HEADER_SIZE + cat_size ..][0..cat_size],
     );
     try std.testing.expectEqual(a_id, cat0.id);

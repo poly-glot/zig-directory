@@ -1,67 +1,8 @@
 const std = @import("std");
-
-pub fn Serializable(comptime T: type) type {
-    comptime {
-        const info = @typeInfo(T);
-        if (info != .@"struct" or info.@"struct".layout != .@"extern")
-            @compileError("Serializable requires an extern struct, got " ++ @typeName(T));
-    }
-
-    return struct {
-        pub fn asBytes(ptr: *const T) []const u8 {
-            return std.mem.asBytes(ptr);
-        }
-
-        pub fn asMutableBytes(ptr: *T) []u8 {
-            return std.mem.asBytes(ptr);
-        }
-
-        pub fn toBytes(ptr: *const T) [@sizeOf(T)]u8 {
-            return std.mem.toBytes(ptr.*);
-        }
-
-        pub fn fromBytes(bytes: []const u8) T {
-            return std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
-        }
-    };
-}
-
-pub fn FixedString(comptime N: usize) type {
-    comptime {
-        if (N % 2 != 0) @compileError("FixedString capacity N must be even for alignment");
-    }
-
-    return extern struct {
-        data: [N]u8 = [_]u8{0} ** N,
-        len: u16 = 0,
-
-        const Self = @This();
-
-        pub fn fromSlice(s: []const u8) Self {
-            var fs = Self{};
-            const copy_len = @min(s.len, N);
-            @memcpy(fs.data[0..copy_len], s[0..copy_len]);
-            fs.len = @intCast(copy_len);
-            return fs;
-        }
-
-        pub fn slice(self: *const Self) []const u8 {
-            return self.data[0..@min(self.len, N)];
-        }
-
-        pub fn eql(self: *const Self, other: []const u8) bool {
-            return std.mem.eql(u8, self.slice(), other);
-        }
-
-        pub fn format(self: *const Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.writeAll(self.slice());
-        }
-
-        comptime {
-            if (@sizeOf(Self) != N + 2) @compileError("FixedString size mismatch");
-        }
-    };
-}
+const codec = @import("zigstore").codec;
+const FixedString = codec.FixedString;
+const Serializable = codec.Serializable;
+const CompositeKey = codec.CompositeKey;
 
 pub const Category = extern struct {
     id: u64 = 0,
@@ -159,64 +100,6 @@ comptime {
         @compileError("RepairTask size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(RepairTask)}) ++ ", expected 2080");
 }
 
-pub fn CompositeKey(comptime fields: []const [:0]const u8) type {
-    comptime {
-        if (fields.len == 0) @compileError("CompositeKey requires at least one field");
-    }
-
-    const num_fields = fields.len;
-    const key_size = num_fields * 8;
-
-    const struct_fields = comptime blk: {
-        var sf: [num_fields]std.builtin.Type.StructField = undefined;
-        for (fields, 0..) |name, i| {
-            sf[i] = .{
-                .name = name,
-                .type = u64,
-                .default_value_ptr = null,
-                .is_comptime = false,
-                .alignment = @alignOf(u64),
-            };
-        }
-        break :blk sf;
-    };
-
-    const GeneratedStruct = @Type(.{ .@"struct" = .{
-        .layout = .@"extern",
-        .fields = &struct_fields,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
-
-    return struct {
-        pub const KeyStruct = GeneratedStruct;
-
-        pub const encoded_size = key_size;
-
-        pub fn encode(values: [num_fields]u64) [key_size]u8 {
-            var buf: [key_size]u8 = undefined;
-            inline for (0..num_fields) |i| {
-                buf[i * 8 ..][0..8].* = std.mem.toBytes(
-                    std.mem.nativeTo(u64, values[i], .big),
-                );
-            }
-            return buf;
-        }
-
-        pub fn decode(bytes: []const u8) GeneratedStruct {
-            var result: GeneratedStruct = undefined;
-            inline for (fields, 0..) |name, i| {
-                @field(result, name) = std.mem.toNative(
-                    u64,
-                    std.mem.bytesToValue(u64, bytes[i * 8 ..][0..8]),
-                    .big,
-                );
-            }
-            return result;
-        }
-    };
-}
-
 const ParentChildComposite = CompositeKey(&.{ "parent_id", "child_id" });
 const CategoryLinkComposite = CompositeKey(&.{ "category_id", "link_id" });
 const SubmitterLinkComposite = CompositeKey(&.{ "submitter_id", "link_id" });
@@ -263,57 +146,6 @@ pub const SubmitterLinkKey = extern struct {
     }
 };
 
-pub fn encodeU64(val: u64) [8]u8 {
-    return std.mem.toBytes(std.mem.nativeTo(u64, val, .big));
-}
-
-pub fn decodeU64(bytes: []const u8) u64 {
-    return std.mem.toNative(u64, std.mem.bytesToValue(u64, bytes[0..8]), .big);
-}
-
-pub fn hashUrl(url: []const u8) u64 {
-    return std.hash.Wyhash.hash(0, url);
-}
-
-test "FixedString fromSlice / slice roundtrip" {
-    const fs = FixedString(256).fromSlice("hello world");
-    try std.testing.expectEqualSlices(u8, "hello world", fs.slice());
-    try std.testing.expectEqual(@as(u16, 11), fs.len);
-}
-
-test "FixedString truncation" {
-    const fs = FixedString(4).fromSlice("abcdefgh");
-    try std.testing.expectEqualSlices(u8, "abcd", fs.slice());
-    try std.testing.expectEqual(@as(u16, 4), fs.len);
-}
-
-test "FixedString eql" {
-    const fs = FixedString(64).fromSlice("test");
-    try std.testing.expect(fs.eql("test"));
-    try std.testing.expect(!fs.eql("other"));
-}
-
-test "FixedString default is empty" {
-    const fs = FixedString(256){};
-    try std.testing.expectEqual(@as(u16, 0), fs.len);
-    try std.testing.expectEqualSlices(u8, "", fs.slice());
-}
-
-test "encodeU64 / decodeU64 roundtrip" {
-    const values = [_]u64{ 0, 1, 42, 0xDEADBEEF, std.math.maxInt(u64) };
-    for (values) |v| {
-        const encoded = encodeU64(v);
-        const decoded = decodeU64(&encoded);
-        try std.testing.expectEqual(v, decoded);
-    }
-}
-
-test "encodeU64 big-endian ordering" {
-    const a = encodeU64(100);
-    const b = encodeU64(200);
-    try std.testing.expect(std.mem.order(u8, &a, &b) == .lt);
-}
-
 test "ParentChildKey encode / decode" {
     const encoded = ParentChildKey.encode(10, 20);
     const decoded = ParentChildKey.decode(&encoded);
@@ -326,21 +158,6 @@ test "CategoryLinkKey encode / decode" {
     const decoded = CategoryLinkKey.decode(&encoded);
     try std.testing.expectEqual(@as(u64, 5), decoded.category_id);
     try std.testing.expectEqual(@as(u64, 99), decoded.link_id);
-}
-
-test "hashUrl deterministic" {
-    const h1 = hashUrl("https://example.com");
-    const h2 = hashUrl("https://example.com");
-    try std.testing.expectEqual(h1, h2);
-
-    const h3 = hashUrl("https://other.com");
-    try std.testing.expect(h1 != h3);
-}
-
-test "hashUrl different inputs produce different hashes" {
-    const h1 = hashUrl("https://a.com");
-    const h2 = hashUrl("https://b.com");
-    try std.testing.expect(h1 != h2);
 }
 
 test "Serializable Category asBytes roundtrip" {
@@ -438,30 +255,6 @@ test "Serializable asBytes matches std.mem.asBytes" {
     const via_mixin = cat.asBytes();
     const via_std = std.mem.asBytes(&cat);
     try std.testing.expectEqualSlices(u8, via_std, via_mixin);
-}
-
-test "CompositeKey generic encode/decode" {
-    const TripleKey = CompositeKey(&.{ "a", "b", "c" });
-
-    const encoded = TripleKey.encode(.{ 1, 2, 3 });
-    try std.testing.expectEqual(@as(usize, 24), encoded.len);
-
-    const decoded = TripleKey.decode(&encoded);
-    try std.testing.expectEqual(@as(u64, 1), decoded.a);
-    try std.testing.expectEqual(@as(u64, 2), decoded.b);
-    try std.testing.expectEqual(@as(u64, 3), decoded.c);
-}
-
-test "CompositeKey preserves sort order" {
-    const Pair = CompositeKey(&.{ "x", "y" });
-
-    const a = Pair.encode(.{ 1, 999 });
-    const b = Pair.encode(.{ 2, 0 });
-    try std.testing.expect(std.mem.order(u8, &a, &b) == .lt);
-
-    const c = Pair.encode(.{ 5, 10 });
-    const d = Pair.encode(.{ 5, 20 });
-    try std.testing.expect(std.mem.order(u8, &c, &d) == .lt);
 }
 
 test "CompositeKey produces identical bytes to ParentChildKey" {

@@ -1,5 +1,6 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("../schema.zig");
 const Database = @import("../database.zig").Database;
 const changeset = @import("../changeset.zig");
 const inverted = @import("../inverted_index.zig");
@@ -8,7 +9,7 @@ const slug_mod = @import("operations_slug.zig");
 
 pub fn computeCategoryInsertChangeSet(
     db: *Database,
-    cat: types.Category,
+    cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
@@ -65,7 +66,7 @@ pub fn computeCategoryInsertChangeSet(
             break :blk true;
         };
         if (existing.len != 8) break :blk true;
-        const existing_id = types.decodeU64(existing);
+        const existing_id = codec.decodeU64(existing);
         var existing_path_buf: [2048]u8 = undefined;
         const existing_path = (try slug_mod.buildSlugPath(db, existing_id, &existing_path_buf)) orelse {
             break :blk true;
@@ -84,8 +85,8 @@ pub fn computeCategoryInsertChangeSet(
 }
 
 pub fn computeCategoryTextUpdateChangeSet(
-    old_cat: types.Category,
-    new_cat: types.Category,
+    old_cat: schema.Category,
+    new_cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
@@ -167,8 +168,8 @@ fn composeOldDescendantPath(
 
 pub fn computeCategoryRenameChangeSet(
     db: *Database,
-    old_cat: types.Category,
-    new_cat: types.Category,
+    old_cat: schema.Category,
+    new_cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var old_buf: [2048]u8 = undefined;
@@ -198,7 +199,7 @@ pub fn computeCategoryRenameChangeSet(
     try stack.append(allocator, new_cat.id);
 
     walk: while (stack.pop()) |cur_id| {
-        var children_buf: [256]types.Category = undefined;
+        var children_buf: [256]schema.Category = undefined;
         var offset: u32 = 0;
         while (true) {
             const children = try category.listChildren(db, cur_id, offset, 256, &children_buf);
@@ -249,7 +250,7 @@ pub fn computeCategoryRenameChangeSet(
 
 pub fn computeCategoryDeleteChangeSet(
     db: *Database,
-    cat: types.Category,
+    cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
@@ -296,7 +297,7 @@ pub fn computeCategoryDeleteChangeSet(
 
 pub fn computeCategoryMoveChangeSet(
     db: *Database,
-    cat: types.Category,
+    cat: schema.Category,
     new_parent_id: u64,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
@@ -370,7 +371,7 @@ pub fn computeCategoryMoveChangeSet(
     try stack.append(allocator, cat.id);
 
     walk: while (stack.pop()) |cur_id| {
-        var children_buf: [256]types.Category = undefined;
+        var children_buf: [256]schema.Category = undefined;
         var offset: u32 = 0;
         while (true) {
             const children = try category.listChildren(db, cur_id, offset, 256, &children_buf);
@@ -426,7 +427,7 @@ pub fn computeCategoryMoveChangeSet(
 
 pub fn computeLinkInsertChangeSet(
     db: *Database,
-    link: types.Link,
+    link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
@@ -467,8 +468,8 @@ pub fn computeLinkInsertChangeSet(
 }
 
 pub fn computeLinkTextUpdateChangeSet(
-    old_link: types.Link,
-    new_link: types.Link,
+    old_link: schema.Link,
+    new_link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
@@ -515,7 +516,7 @@ pub fn computeLinkTextUpdateChangeSet(
 
 pub fn computeLinkDeleteChangeSet(
     db: *Database,
-    link: types.Link,
+    link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
     var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
@@ -571,7 +572,7 @@ test "computeCategoryRenameChangeSet: <= threshold populates descendant_swaps" {
 
     const old_cat = (try category.getCategory(db, parent_id)).?;
     var new_cat = old_cat;
-    new_cat.slug = types.FixedString(128).fromSlice("new");
+    new_cat.slug = codec.FixedString(128).fromSlice("new");
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -603,7 +604,7 @@ test "computeCategoryRenameChangeSet: > threshold sets above_threshold + populat
 
     const old_cat = (try category.getCategory(db, parent_id)).?;
     var new_cat = old_cat;
-    new_cat.slug = types.FixedString(128).fromSlice("new");
+    new_cat.slug = codec.FixedString(128).fromSlice("new");
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -641,7 +642,7 @@ test "computeCategoryRenameChangeSet: descendant walk silently caps at depth 64"
 
     const old_top = (try category.getCategory(db, top_id)).?;
     var new_top = old_top;
-    new_top.slug = types.FixedString(128).fromSlice("topnew");
+    new_top.slug = codec.FixedString(128).fromSlice("topnew");
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -717,12 +718,12 @@ test "computeCategoryMoveChangeSet: > threshold sets above_threshold + populates
     try std.testing.expectEqual(@as(usize, 0), e.descendant_swaps.len);
     try std.testing.expect(e.enqueue.seq != 0);
     try std.testing.expectEqualStrings("top/a", e.enqueue.old_slug_prefix);
-    try std.testing.expectEqual(types.RepairOp.moved_parent, e.enqueue.op);
+    try std.testing.expectEqual(schema.RepairOp.moved_parent, e.enqueue.op);
 }
 
 pub fn computeLinkRecatChangeSet(
     db: *Database,
-    link: types.Link,
+    link: schema.Link,
     new_category_id: u64,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
