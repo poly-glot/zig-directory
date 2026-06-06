@@ -1,0 +1,44 @@
+# NOTE: the cluster's CNI is flannel, which does NOT enforce NetworkPolicy —
+# these are declarative intent that only takes effect if Calico (or another
+# policy-enforcing CNI) is added. Today the real in-cluster boundary is the
+# ClusterIP services (not externally exposed) plus the backend's CIDR trust.
+# The node-subnet ipBlock keeps kubelet tcpSocket probes working once enforced.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dmozdb-allow-web
+spec:
+  podSelector:
+    matchLabels:
+      app: dmozdb
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web
+        - ipBlock:
+            cidr: 10.0.1.0/24
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: denokv-allow-web
+spec:
+  podSelector:
+    matchLabels:
+      app: denokv
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web
+        - ipBlock:
+            cidr: 10.0.1.0/24
+      ports:
+        - protocol: TCP
+          port: 4512

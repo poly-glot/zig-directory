@@ -5,13 +5,15 @@ metadata:
   labels:
     app: dmozdb
 spec:
+  # Backend protocol endpoint. Reachable only in-cluster (ClusterIP); the web
+  # frontend connects here, and the Zig backend's CIDR trust + this service's
+  # non-exposure are the access boundary. The web frontend's own Service lives
+  # in web.yaml; denokv's in denokv.yaml.
   type: ClusterIP
   selector:
     app: dmozdb
   ports:
-    # Only the web frontend is exposed; the backend stays on pod-local
-    # loopback and has no Service.
-    - port: 8000
-      targetPort: 8000
+    - port: 8080
+      targetPort: 8080
       protocol: TCP
-      name: http
+      name: dmozdb
