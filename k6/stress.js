@@ -114,7 +114,7 @@ export const options = STAGED
 
 export default function () {
   group("homepage", function () {
-    const res = http.get(`${BASE}/`, { tags: { area: "home" } });
+    const res = http.get(`${BASE}/`, { tags: { area: "home", name: "home" } });
     homeTrend.add(res.timings.duration);
     check(res, {
       "home 200": (r) => r.status === 200,
@@ -140,7 +140,7 @@ export default function () {
       ]);
     }
     const res = http.get(`${BASE}/category/${path}${query}`, {
-      tags: { area: "category" },
+      tags: { area: "category", name: "category" },
     });
     categoryTrend.add(res.timings.duration);
     check(res, { "category 200": (r) => r.status === 200 });
@@ -154,7 +154,7 @@ export default function () {
       ["sort", sort === "relevance" ? "" : sort],
     ]);
     const res = http.get(`${BASE}/search${query}`, {
-      tags: { area: "search" },
+      tags: { area: "search", name: "search" },
     });
     searchTrend.add(res.timings.duration);
     check(res, { "search 200": (r) => r.status === 200 });
