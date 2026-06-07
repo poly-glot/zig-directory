@@ -9,7 +9,7 @@ pub const WalApplier = struct {
 
     pub fn apply(self: *WalApplier, entry: zigstore.ReplayEntry) !void {
         switch (entry.op_code) {
-            .changeset => {
+            changeset.CHANGESET_OP => {
                 var arena = std.heap.ArenaAllocator.init(self.db.allocator);
                 defer arena.deinit();
                 const cs = changeset.decode(arena.allocator(), entry.data) catch |err| {
@@ -21,6 +21,7 @@ pub const WalApplier = struct {
                 };
                 try apply_mod.apply(self.db, cs);
             },
+            else => return error.UnknownWalOpCode,
         }
     }
 };

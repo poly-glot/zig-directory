@@ -4,6 +4,7 @@ const bloom = @import("bloom.zig");
 const subtree_mod = @import("subtree.zig");
 const verifier = @import("verifier.zig");
 const changeset = @import("changeset.zig");
+const apply_mod = @import("apply/apply.zig");
 const wal_apply = @import("wal/wal_apply.zig");
 const repair_worker = @import("repair/repair_worker.zig");
 const histogram = @import("histogram.zig");
@@ -73,12 +74,6 @@ pub const Directory = struct {
     links_pending_count: std.atomic.Value(u64),
     links_approved_count: std.atomic.Value(u64),
     links_rejected_count: std.atomic.Value(u64),
-
-    apply_mutex: std.Thread.Mutex,
-    apply_cond: std.Thread.Condition,
-    last_applied_seq: u64,
-
-    snapshot_in_progress: std.atomic.Value(bool),
 
     op_latency: *[256]histogram.AtomicHistogram,
 
@@ -205,10 +200,6 @@ pub const Directory = struct {
             .links_pending_count = std.atomic.Value(u64).init(0),
             .links_approved_count = std.atomic.Value(u64).init(0),
             .links_rejected_count = std.atomic.Value(u64).init(0),
-            .apply_mutex = .{},
-            .apply_cond = .{},
-            .last_applied_seq = if (store.wal_writer) |w| w.sequence else 0,
-            .snapshot_in_progress = std.atomic.Value(bool).init(false),
             .op_latency = op_latency,
         };
 
@@ -257,7 +248,16 @@ pub const Directory = struct {
     }
 
     pub fn commit(self: *Self, cs: changeset.ChangeSet) !void {
-        return @import("commit.zig").commit(self, cs);
+        try zigstore.commit(changeset.ChangeSet, self.store, changeset.CHANGESET_OP, cs, self, &serializeChangeSet, &applyChangeSet);
+    }
+
+    fn serializeChangeSet(allocator: std.mem.Allocator, cs: changeset.ChangeSet) anyerror![]u8 {
+        return changeset.encode(allocator, cs);
+    }
+
+    fn applyChangeSet(ctx: *anyopaque, cs: changeset.ChangeSet) anyerror!void {
+        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        return apply_mod.apply(dir, cs);
     }
 
     pub fn signalMemtableFlusher(self: *Self) void {

@@ -24,8 +24,8 @@ pub fn rebuildAllIndices(db: *Directory) !RebuildStats {
     };
 
     {
-        db.apply_mutex.lock();
-        defer db.apply_mutex.unlock();
+        db.store.apply_mutex.lock();
+        defer db.store.apply_mutex.unlock();
 
         db.drainAllMemtables();
 

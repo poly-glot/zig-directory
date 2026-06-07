@@ -17,7 +17,6 @@ pub const connection = @import("connection.zig");
 pub const signal = @import("signal.zig");
 pub const wal = @import("wal/wal.zig");
 pub const wal_replay = @import("wal/wal_replay.zig");
-pub const snapshot = @import("snapshot.zig");
 pub const binary_protocol = @import("binary_protocol.zig");
 pub const subtree = @import("subtree.zig");
 pub const verifier = @import("verifier.zig");
@@ -264,7 +263,6 @@ test {
     _ = signal;
     _ = wal;
     _ = wal_replay;
-    _ = snapshot;
     _ = binary_protocol;
     _ = subtree;
     _ = verifier;
@@ -275,7 +273,6 @@ test {
     _ = @import("apply/apply_link.zig");
     _ = @import("apply/apply_category.zig");
     _ = @import("apply/apply_repair.zig");
-    _ = @import("commit.zig");
     _ = @import("repair/repair_worker.zig");
     _ = @import("operations/operations_shared.zig");
     _ = @import("operations/operations_changeset_compute.zig");

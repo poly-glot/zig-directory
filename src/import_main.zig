@@ -1,8 +1,8 @@
 const std = @import("std");
+const zigstore = @import("zigstore");
 const Directory = @import("directory.zig").Directory;
 const operations = @import("operations/operations.zig");
 const Config = @import("main.zig").Config;
-const snapshot = @import("snapshot.zig");
 
 const log = std.log.scoped(.dmoz_import);
 
@@ -139,9 +139,9 @@ fn importLinks(
         n_created += 1;
         if (n_created % 5000 == 0) {
             db.drainAllMemtables();
-            const snap = snapshot.forceSnapshot(db) catch |e| blk: {
+            const snap = zigstore.snapshot.forceSnapshot(db.store.snapshotHost()) catch |e| blk: {
                 log.warn("forceSnapshot failed: {}", .{e});
-                break :blk snapshot.SnapshotResult{ .wal_sequence = 0, .duration_ms = 0 };
+                break :blk zigstore.SnapshotResult{ .wal_sequence = 0, .duration_ms = 0 };
             };
             if (db.store.wal_writer) |*w| {
                 w.truncateAfterCheckpoint() catch |e| log.warn("wal truncate failed: {}", .{e});

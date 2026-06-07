@@ -1,4 +1,5 @@
 const std = @import("std");
+const zigstore = @import("zigstore");
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
 const Stats = @import("directory.zig").Stats;
@@ -989,8 +990,7 @@ fn handleRebuildIndex(db: *Directory, resp: []u8, op_byte: u8) usize {
 }
 
 fn handleSnapshot(db: *Directory, resp: []u8, op_byte: u8) usize {
-    const snapshot = @import("snapshot.zig");
-    const result = snapshot.forceSnapshot(db) catch |err| {
+    const result = zigstore.snapshot.forceSnapshot(db.store.snapshotHost()) catch |err| {
         if (err != error.SnapshotInProgress) {
             log.err("snapshot op failed: {}", .{err});
         }
@@ -1714,9 +1714,8 @@ test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
     try std.testing.expectEqual(@intFromEnum(SubStatus.none), resp[6]);
 
-    const snapshot_mod = @import("snapshot.zig");
-    const snap = (try snapshot_mod.SnapshotManager.loadSnapshotMeta(db.config.data_dir)).?;
-    try std.testing.expectEqual(snapshot_mod.SNAP_MAGIC, snap.magic);
+    const snap = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(db.config.data_dir)).?;
+    try std.testing.expectEqual(zigstore.snapshot.SNAP_MAGIC, snap.magic);
 
     const reported_seq = std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE..][0..8], .little);
     try std.testing.expectEqual(snap.wal_sequence, reported_seq);
@@ -1729,8 +1728,8 @@ test "snapshot op (22): concurrent invocation returns already_in_progress" {
     var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    db.snapshot_in_progress.store(true, .release);
-    defer db.snapshot_in_progress.store(false, .release);
+    db.store.snapshot_in_progress.store(true, .release);
+    defer db.store.snapshot_in_progress.store(false, .release);
 
     var resp: [128]u8 = undefined;
     const off = handleSnapshot(db, &resp, @intFromEnum(Op.snapshot));

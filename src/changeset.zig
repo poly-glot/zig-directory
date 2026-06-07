@@ -140,6 +140,8 @@ pub const ChangeSet = union(Op) {
 
 pub const SCHEMA_VERSION: u8 = 1;
 
+pub const CHANGESET_OP: u8 = 100;
+
 pub const DecodeError = error{
     BufferTooShort,
     UnknownOpTag,

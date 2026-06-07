@@ -4,11 +4,11 @@ const testing = std.testing;
 const Directory = @import("directory.zig").Directory;
 const Config = @import("main.zig").Config;
 const ops = @import("operations/operations.zig");
-const codec = @import("zigstore").codec;
+const zigstore = @import("zigstore");
+const codec = zigstore.codec;
 const schema = @import("schema.zig");
 const wal_mod = @import("wal/wal.zig");
 const wal_replay = @import("wal/wal_replay.zig");
-const snapshot = @import("snapshot.zig");
 const page = @import("page.zig");
 const page_cache = @import("page_cache.zig");
 const freelist = @import("freelist.zig");
@@ -511,14 +511,14 @@ test "E2E: snapshot create and load meta" {
     var db = try initTestDb(dir);
     defer db.deinit();
 
-    var snap_mgr = snapshot.SnapshotManager.init(dir, 3600);
-    try snap_mgr.createSnapshot(db, 42);
+    var snap_mgr = zigstore.snapshot.SnapshotManager.init(dir, 3600);
+    try snap_mgr.createSnapshot(db.store.snapshotHost(), 42);
 
-    const meta = (try snapshot.SnapshotManager.loadSnapshotMeta(dir)).?;
+    const meta = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(dir)).?;
     try testing.expectEqual(@as(u32, 0x534E4150), meta.magic);
     try testing.expectEqual(@as(u64, 42), meta.wal_sequence);
 
-    const seq = try snapshot.SnapshotManager.getWalSequence(dir);
+    const seq = try zigstore.snapshot.SnapshotManager.getWalSequence(dir);
     try testing.expectEqual(@as(u64, 42), seq);
 }
 
@@ -719,7 +719,7 @@ test "H1: a snapshot persists the page-0 header so data survives a later crash" 
         const child = try ops.createCategory(a, top, "Child", "child", "");
         const link = try ops.createLink(a, child, "https://snap.example", "Snap", "");
         a.drainAllMemtables();
-        _ = try snapshot.forceSnapshot(a);
+        _ = try zigstore.snapshot.forceSnapshot(a.store.snapshotHost());
         a.deinitCrashTestInstance();
         break :blk .{ child, link };
     };
