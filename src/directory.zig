@@ -7,8 +7,9 @@ const changeset = @import("changeset.zig");
 const apply_mod = @import("apply/apply.zig");
 const wal_apply = @import("wal/wal_apply.zig");
 const repair_worker = @import("repair/repair_worker.zig");
-const histogram = @import("histogram.zig");
+const histogram = zigstore.histogram;
 const memtable = @import("memtable.zig");
+const binary_protocol = @import("binary_protocol.zig");
 const Config = @import("main.zig").Config;
 
 const log = std.log.scoped(.directory);
@@ -78,6 +79,31 @@ pub const Directory = struct {
     op_latency: *[256]histogram.AtomicHistogram,
 
     const Self = @This();
+
+    pub fn dispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        return binary_protocol.dispatch(dir, op_byte, payload, count, resp);
+    }
+
+    pub fn processFrames(ctx: *anyopaque, conn: *zigstore.connection.Connection) void {
+        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        zigstore.protocol.processFrames(ctx, conn, &Directory.dispatch, dir.op_latency);
+    }
+
+    pub fn handler() zigstore.Handler {
+        return .{
+            .process_frames = &Directory.processFrames,
+            .header_size = zigstore.protocol.HEADER_SIZE,
+            .on_shutdown = &Directory.flushHeaderOnShutdown,
+        };
+    }
+
+    fn flushHeaderOnShutdown(ctx: *anyopaque) void {
+        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        dir.flushHeader() catch |err| {
+            log.err("Failed to flush database header on shutdown: {}", .{err});
+        };
+    }
 
     pub fn categories_by_id(self: *Self) *zigstore.BPlusTree {
         return self.store.tree("categories_by_id");
