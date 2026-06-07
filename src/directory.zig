@@ -85,7 +85,7 @@ pub const Directory = struct {
 
     pub fn processFrames(ctx: *anyopaque, conn: *zigstore.connection.Connection) void {
         const dir: *Directory = @ptrCast(@alignCast(ctx));
-        zigstore.protocol.processFrames(ctx, conn, &Directory.dispatch, dir.op_latency);
+        zigstore.protocol.processFrames(ctx, conn, &Directory.dispatch, dir.op_latency, binary_protocol.RESPONSE_RESERVE);
     }
 
     pub fn handler() zigstore.Handler {

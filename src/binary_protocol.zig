@@ -96,6 +96,12 @@ pub const Op = enum(u8) {
 
 pub const GET_CATEGORIES_BY_IDS_MAX: u16 = 200;
 
+pub const RESPONSE_RESERVE: usize = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(schema.Category);
+
+comptime {
+    if (RESPONSE_RESERVE > zigstore.connection.RESPONSE_BUF_SIZE) @compileError("RESPONSE_RESERVE exceeds the connection response buffer");
+}
+
 pub const BULK_IMPORT_MAX_BYTES: usize = 60 * 1024;
 pub const BULK_IMPORT_MAX_ITEMS: u32 = 50_000;
 pub const BULK_IMPORT_CHUNK: u32 = 500;
@@ -1468,7 +1474,7 @@ test "op_latency_stats (23): records latency through processFrames + reports per
     }
     conn.bytes_read = off;
 
-    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency);
+    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency, RESPONSE_RESERVE);
 
     var resp: [4096]u8 = undefined;
     const reply_len = handleOpLatencyStats(db, &resp, @intFromEnum(Op.op_latency_stats));
@@ -2283,7 +2289,7 @@ fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {
     const n = @min(input.len, bp.request_buf.len);
     @memcpy(bp.request_buf[0..n], input[0..n]);
     conn.bytes_read = n;
-    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency);
+    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency, RESPONSE_RESERVE);
 }
 
 test "fuzz: processFrames tolerates arbitrary request frames" {
