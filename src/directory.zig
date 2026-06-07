@@ -160,10 +160,12 @@ pub const Directory = struct {
         errdefer allocator.free(path);
         const dir = try Self.init(allocator, .{
             .data_dir = path,
-            .cache_size_mb = 16,
-            .thread_count = 1,
-            .wal_batch_size = 32,
-            .snapshot_interval_s = 3600,
+            .server = .{
+                .cache_size_mb = 16,
+                .thread_count = 1,
+                .wal_batch_size = 32,
+                .snapshot_interval_s = 3600,
+            },
         });
         return dir;
     }
@@ -178,8 +180,8 @@ pub const Directory = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !*Self {
         const store = try Store.init(allocator, .{
             .data_dir = config.data_dir,
-            .cache_size_mb = config.cache_size_mb,
-            .wal_batch_size = config.wal_batch_size,
+            .cache_size_mb = config.server.cache_size_mb,
+            .wal_batch_size = config.server.wal_batch_size,
         });
         errdefer store.deinit();
 

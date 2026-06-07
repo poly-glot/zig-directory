@@ -9,13 +9,15 @@ const schema = @import("schema.zig");
 
 fn testConfig(dir: []const u8) Config {
     return Config{
-        .port = 0,
         .data_dir = dir,
-        .cache_size_mb = 1,
-        .thread_count = 1,
-        .snapshot_interval_s = 3600,
-        .wal_sync_interval_ms = 50,
-        .wal_batch_size = 32,
+        .server = .{
+            .port = 0,
+            .cache_size_mb = 1,
+            .thread_count = 1,
+            .snapshot_interval_s = 3600,
+            .wal_sync_interval_ms = 50,
+            .wal_batch_size = 32,
+        },
     };
 }
 

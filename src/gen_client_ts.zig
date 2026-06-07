@@ -36,17 +36,9 @@ const FieldTable = struct {
 };
 
 fn isFixedString(comptime T: type) ?FixedStringMeta {
-    const info = @typeInfo(T);
-    if (info != .@"struct" or info.@"struct".layout != .@"extern") return null;
-    const fields = info.@"struct".fields;
-    if (fields.len != 2) return null;
-    if (!std.mem.eql(u8, fields[0].name, "data")) return null;
-    if (!std.mem.eql(u8, fields[1].name, "len")) return null;
-    if (fields[1].type != u16) return null;
-    const data_info = @typeInfo(fields[0].type);
-    if (data_info != .array) return null;
-    if (data_info.array.child != u8) return null;
-    return .{ .capacity = data_info.array.len };
+    if (@typeInfo(T) != .@"struct") return null;
+    if (!@hasDecl(T, "is_fixed_string")) return null;
+    return .{ .capacity = T.capacity };
 }
 
 pub fn main() !void {
