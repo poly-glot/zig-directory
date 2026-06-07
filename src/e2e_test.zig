@@ -5,16 +5,7 @@ const Directory = @import("directory.zig").Directory;
 const Config = @import("main.zig").Config;
 const ops = @import("operations/operations.zig");
 const zigstore = @import("zigstore");
-const codec = zigstore.codec;
 const schema = @import("schema.zig");
-const wal_mod = @import("wal/wal.zig");
-const wal_replay = @import("wal/wal_replay.zig");
-const page = @import("page.zig");
-const page_cache = @import("page_cache.zig");
-const freelist = @import("freelist.zig");
-const btree = @import("btree/btree.zig");
-const file_header = @import("file_header.zig");
-const connection = @import("connection.zig");
 
 fn testConfig(dir: []const u8) Config {
     return Config{
@@ -36,121 +27,6 @@ fn cleanupTestDir(dir: []const u8) void {
     std.fs.deleteTreeAbsolute(dir) catch {};
 }
 
-test "E2E: page format comptime assertions" {
-    try testing.expectEqual(@as(usize, page.PAGE_SIZE), @sizeOf(page.Page));
-    try testing.expectEqual(@as(usize, 24), @sizeOf(page.PageHeader));
-    try testing.expectEqual(@as(usize, 16), @sizeOf(page.SlotEntry));
-    try testing.expectEqual(@as(usize, page.PAGE_SIZE), @sizeOf(file_header.FileHeader));
-}
-
-test "E2E: file header serialize/deserialize roundtrip" {
-    var hdr = file_header.FileHeader.init();
-    hdr.category_root = 1;
-    hdr.link_root = 3;
-    hdr.next_category_id = 42;
-
-    const bytes = hdr.serialize();
-    const restored = file_header.FileHeader.deserialize(&bytes);
-
-    try testing.expectEqual(@as(u32, 0x444D4F5A), restored.magic);
-    try testing.expectEqual(@as(u32, 1), restored.category_root);
-    try testing.expectEqual(@as(u32, 3), restored.link_root);
-    try testing.expectEqual(@as(u64, 42), restored.next_category_id);
-    try restored.validate();
-}
-
-test "E2E: B+Tree insert, search, delete, range scan with 500 keys" {
-    const path = "/tmp/e2e_btree_500.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
-
-    var cache = try page_cache.PageCache.init(testing.allocator, file, 128);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-    var tree = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
-
-    const count: usize = 500;
-    var key_buf: [32]u8 = undefined;
-    var val_buf: [64]u8 = undefined;
-    for (0..count) |i| {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>8}", .{i}) catch unreachable;
-        const val = std.fmt.bufPrint(&val_buf, "value_for_key_{d}", .{i}) catch unreachable;
-        try tree.insert(key, val);
-    }
-
-    var sb: [page.PAGE_SIZE]u8 = undefined;
-    for (0..count) |i| {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>8}", .{i}) catch unreachable;
-        const val = try tree.search(key, &sb);
-        try testing.expect(val != null);
-        const expected = std.fmt.bufPrint(&val_buf, "value_for_key_{d}", .{i}) catch unreachable;
-        try testing.expectEqualSlices(u8, expected, val.?);
-    }
-
-    var range_count: usize = 0;
-    var iter = try tree.rangeScan("key_00000100", "key_00000200");
-    while (try iter.next()) |_| {
-        range_count += 1;
-    }
-    try testing.expectEqual(@as(usize, 100), range_count);
-
-    for (0..count) |i| {
-        if (i % 2 == 0) {
-            const key = std.fmt.bufPrint(&key_buf, "key_{d:0>8}", .{i}) catch unreachable;
-            const deleted = try tree.delete(key);
-            try testing.expect(deleted);
-        }
-    }
-
-    for (0..count) |i| {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>8}", .{i}) catch unreachable;
-        const val = try tree.search(key, &sb);
-        if (i % 2 == 0) {
-            try testing.expect(val == null);
-        } else {
-            try testing.expect(val != null);
-        }
-    }
-}
-
-test "E2E: FixedString roundtrip and truncation" {
-    const fs = codec.FixedString(10).fromSlice("hello");
-    try testing.expectEqualSlices(u8, "hello", fs.slice());
-    try testing.expect(fs.eql("hello"));
-    try testing.expect(!fs.eql("world"));
-
-    const long = codec.FixedString(6).fromSlice("this is too long");
-    try testing.expectEqual(@as(u16, 6), long.len);
-    try testing.expectEqualSlices(u8, "this i", long.slice());
-}
-
-test "E2E: u64 encoding preserves sort order" {
-    const a = codec.encodeU64(100);
-    const b = codec.encodeU64(200);
-    const c = codec.encodeU64(50);
-
-    try testing.expect(std.mem.order(u8, &a, &b) == .lt);
-    try testing.expect(std.mem.order(u8, &c, &a) == .lt);
-    try testing.expect(std.mem.order(u8, &b, &c) == .gt);
-
-    try testing.expectEqual(@as(u64, 100), codec.decodeU64(&a));
-    try testing.expectEqual(@as(u64, 200), codec.decodeU64(&b));
-}
-
-test "E2E: composite key encoding" {
-    const k1 = schema.ParentChildKey.encode(1, 100);
-    const k2 = schema.ParentChildKey.encode(1, 200);
-    const k3 = schema.ParentChildKey.encode(2, 50);
-
-    try testing.expect(std.mem.order(u8, &k1, &k2) == .lt);
-    try testing.expect(std.mem.order(u8, &k2, &k3) == .lt);
-
-    const decoded = schema.ParentChildKey.decode(&k1);
-    try testing.expectEqual(@as(u64, 1), decoded.parent_id);
-    try testing.expectEqual(@as(u64, 100), decoded.child_id);
-}
-
 test "E2E: database init creates valid file" {
     const dir = "/tmp/e2e_db_init";
     cleanupTestDir(dir);
@@ -160,7 +36,7 @@ test "E2E: database init creates valid file" {
     defer db.deinit();
 
     try testing.expectEqual(@as(u32, 0x444D4F5A), db.store.header.magic);
-    try testing.expectEqual(file_header.VERSION, db.store.header.format_version);
+    try testing.expectEqual(@import("directory.zig").schema.format_version, db.store.header.format_version);
     try testing.expectEqual(@as(u64, 0), db.store.header.page_count);
 
     const stats = db.getStats();
@@ -430,77 +306,6 @@ test "E2E: search categories and links" {
     try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-test "E2E: WAL write and replay" {
-    const dir = "/tmp/e2e_wal";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
-
-    std.fs.makeDirAbsolute(dir) catch {};
-
-    {
-        var writer = try wal_mod.WalWriter.init(testing.allocator, dir, 32);
-        defer writer.deinit();
-
-        const seq1 = try writer.append(.changeset, "category_1_data");
-        try testing.expectEqual(@as(u64, 1), seq1);
-        const seq2 = try writer.append(.changeset, "link_1_data");
-        try testing.expectEqual(@as(u64, 2), seq2);
-        const seq3 = try writer.append(.changeset, "updated_data");
-        try testing.expectEqual(@as(u64, 3), seq3);
-        try writer.sync();
-    }
-
-    {
-        var reader = (try wal_replay.WalReader.init(dir)).?;
-        defer reader.close();
-
-        const e1 = (try reader.next()).?;
-        try testing.expectEqual(@as(u64, 1), e1.sequence);
-        try testing.expectEqual(wal_mod.OpCode.changeset, e1.op_code);
-        try testing.expectEqualSlices(u8, "category_1_data", e1.data);
-
-        const e2 = (try reader.next()).?;
-        try testing.expectEqual(@as(u64, 2), e2.sequence);
-        try testing.expectEqual(wal_mod.OpCode.changeset, e2.op_code);
-
-        const e3 = (try reader.next()).?;
-        try testing.expectEqual(@as(u64, 3), e3.sequence);
-
-        const e4 = try reader.next();
-        try testing.expect(e4 == null);
-    }
-}
-
-test "E2E: WAL replay with min_sequence filter" {
-    const dir = "/tmp/e2e_wal_filter";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
-
-    std.fs.makeDirAbsolute(dir) catch {};
-
-    {
-        var writer = try wal_mod.WalWriter.init(testing.allocator, dir, 32);
-        defer writer.deinit();
-
-        _ = try writer.append(.changeset, "data1");
-        _ = try writer.append(.changeset, "data2");
-        _ = try writer.append(.changeset, "data3");
-        _ = try writer.append(.changeset, "data4");
-        try writer.sync();
-    }
-
-    const Collector = struct {
-        count: usize = 0,
-        pub fn apply(self: *@This(), _: wal_replay.ReplayEntry) !void {
-            self.count += 1;
-        }
-    };
-    var collector = Collector{};
-    const last_seq = try wal_replay.replayWal(dir, 2, &collector);
-    try testing.expect(last_seq >= 3);
-    try testing.expect(collector.count >= 2);
-}
-
 test "E2E: snapshot create and load meta" {
     const dir = "/tmp/e2e_snapshot";
     cleanupTestDir(dir);
@@ -520,22 +325,6 @@ test "E2E: snapshot create and load meta" {
 
     const seq = try zigstore.snapshot.SnapshotManager.getWalSequence(dir);
     try testing.expectEqual(@as(u64, 42), seq);
-}
-
-test "E2E: connection state machine" {
-    var conn = connection.Connection{};
-    try testing.expect(!conn.isActive());
-    try testing.expectEqual(connection.Phase.empty, conn.phase);
-
-    var bp = connection.BufferPair{};
-    conn.fd = 5;
-    conn.phase = .reading_request;
-    conn.buf = &bp;
-    try testing.expect(conn.isActive());
-
-    conn.reset();
-    try testing.expect(!conn.isActive());
-    try testing.expectEqual(@as(usize, 0), conn.bytes_read);
 }
 
 test "E2E: data persists across database close and reopen" {

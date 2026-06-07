@@ -1,10 +1,7 @@
 const std = @import("std");
 const codec = @import("zigstore").codec;
 const schema = @import("schema.zig");
-const btree = @import("btree/btree.zig");
-const page_cache = @import("page_cache.zig");
-const freelist = @import("freelist.zig");
-const page = @import("page.zig");
+const Directory = @import("directory.zig").Directory;
 
 pub const MAX_DESCENDANTS: u32 = 1_000_000;
 pub const SubtreeError = error{ SubtreeTooLarge, OutOfMemory };
@@ -222,16 +219,12 @@ pub fn countSubtreeLinks(
 }
 
 test "collectDescendants returns inclusive sorted set on a tiny synthetic tree" {
-    const path = "/tmp/test_subtree_basic.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-    var cat_by_parent = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
-
+    const cat_by_parent = db.cat_by_parent();
     const edges = [_][2]u64{ .{ 1, 2 }, .{ 1, 3 }, .{ 2, 4 }, .{ 2, 5 } };
     inline for (edges) |edge| {
         const k = schema.ParentChildKey.encode(edge[0], edge[1]);
@@ -239,23 +232,19 @@ test "collectDescendants returns inclusive sorted set on a tiny synthetic tree" 
         try cat_by_parent.insert(&k, &v);
     }
 
-    const result = try collectDescendants(&cat_by_parent, 1, std.testing.allocator);
+    const result = try collectDescendants(cat_by_parent, 1, std.testing.allocator);
     defer std.testing.allocator.free(result);
 
     try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 2, 3, 4, 5 }, result);
 }
 
 test "collectDescendants tolerates cycles via the visited set" {
-    const path = "/tmp/test_subtree_cycle.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-    var cat_by_parent = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
-
+    const cat_by_parent = db.cat_by_parent();
     const edges = [_][2]u64{ .{ 1, 1 }, .{ 1, 2 }, .{ 2, 1 }, .{ 2, 3 } };
     inline for (edges) |edge| {
         const k = schema.ParentChildKey.encode(edge[0], edge[1]);
@@ -263,23 +252,19 @@ test "collectDescendants tolerates cycles via the visited set" {
         try cat_by_parent.insert(&k, &v);
     }
 
-    const result = try collectDescendants(&cat_by_parent, 1, std.testing.allocator);
+    const result = try collectDescendants(cat_by_parent, 1, std.testing.allocator);
     defer std.testing.allocator.free(result);
 
     try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 2, 3 }, result);
 }
 
 test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
-    const path = "/tmp/test_subtree_links.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-
-    var link_by_category = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
+    const link_by_category = db.link_by_category();
     var cid: u64 = 1;
     while (cid <= 3) : (cid += 1) {
         var lid: u64 = 1;
@@ -293,7 +278,7 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
 
     var ids = [_]u64{ 1, 2, 3 };
     const r1 = try listSubtreeLinkIds(
-        &link_by_category,
+        link_by_category,
         ids[0..],
         0,
         15,
@@ -305,7 +290,7 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
     try std.testing.expectEqual(@as(u64, 101), r1.link_ids[0]);
 
     const r2 = try listSubtreeLinkIds(
-        &link_by_category,
+        link_by_category,
         ids[0..],
         15,
         15,

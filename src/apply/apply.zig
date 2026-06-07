@@ -10,7 +10,7 @@ const apply_repair = @import("apply_repair.zig");
 pub const ApplyError = error{
     OutOfMemory,
     NotImplemented,
-} || @import("../btree/btree.zig").BTreeError;
+} || @import("zigstore").BTreeError;
 
 pub fn apply(db: *Directory, cs: changeset.ChangeSet) !void {
     return switch (cs) {

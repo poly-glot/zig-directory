@@ -2,21 +2,9 @@ const std = @import("std");
 const posix = std.posix;
 const zigstore = @import("zigstore");
 
-pub const page = @import("page.zig");
-pub const file_header = @import("file_header.zig");
-pub const btree = @import("btree/btree.zig");
-pub const page_cache = @import("page_cache.zig");
-pub const freelist = @import("freelist.zig");
 pub const schema = @import("schema.zig");
-pub const inverted_index = @import("inverted_index.zig");
-pub const memtable = @import("memtable.zig");
-pub const bloom = @import("bloom.zig");
 pub const operations = @import("operations/operations.zig");
 pub const directory = @import("directory.zig");
-pub const connection = @import("connection.zig");
-pub const signal = @import("signal.zig");
-pub const wal = @import("wal/wal.zig");
-pub const wal_replay = @import("wal/wal_replay.zig");
 pub const binary_protocol = @import("binary_protocol.zig");
 pub const subtree = @import("subtree.zig");
 pub const verifier = @import("verifier.zig");
@@ -228,19 +216,9 @@ pub fn main() !void {
 }
 
 test {
-    _ = page;
-    _ = file_header;
-    _ = btree;
-    _ = page_cache;
-    _ = freelist;
     _ = schema;
-    _ = inverted_index;
     _ = operations;
     _ = directory;
-    _ = connection;
-    _ = signal;
-    _ = wal;
-    _ = wal_replay;
     _ = binary_protocol;
     _ = subtree;
     _ = verifier;
@@ -259,12 +237,6 @@ test {
     _ = @import("operations/operations_search.zig");
     _ = @import("operations/operations_slug.zig");
     _ = @import("repair/repair.zig");
-    _ = @import("histogram.zig");
-    _ = @import("btree/btree_search.zig");
-    _ = @import("btree/btree_insert.zig");
-    _ = @import("btree/btree_delete.zig");
-    _ = @import("btree/btree_repair.zig");
-    _ = @import("btree/btree_helpers.zig");
 }
 
 test "parseIpv4 valid" {
