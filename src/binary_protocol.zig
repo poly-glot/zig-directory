@@ -1,18 +1,15 @@
 const std = @import("std");
 const zigstore = @import("zigstore");
+const protocol = zigstore.protocol;
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
-const Stats = @import("directory.zig").Stats;
 const operations = @import("operations/operations.zig");
-const conn_mod = @import("connection.zig");
 
 const log = std.log.scoped(.binary);
 
-pub const REQUEST_HEADER_SIZE: usize = 8;
+pub const RESPONSE_HEADER_SIZE: usize = protocol.RESPONSE_HEADER_SIZE;
 
-pub const RESPONSE_HEADER_SIZE: usize = 10;
-
-pub const HEADER_SIZE: usize = REQUEST_HEADER_SIZE;
+pub const HEADER_SIZE: usize = protocol.HEADER_SIZE;
 
 pub const Status = enum(u8) {
     ok = 0,
@@ -103,114 +100,24 @@ pub const BULK_IMPORT_MAX_BYTES: usize = 60 * 1024;
 pub const BULK_IMPORT_MAX_ITEMS: u32 = 50_000;
 pub const BULK_IMPORT_CHUNK: u32 = 500;
 
-fn ReadResult(comptime fields: []const struct { []const u8, type }) type {
-    var sf: [fields.len]std.builtin.Type.StructField = undefined;
-    for (fields, 0..) |f, i| {
-        sf[i] = .{
-            .name = @ptrCast(f[0]),
-            .type = f[1],
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(f[1]),
-        };
-    }
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = &sf,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
-}
-
-fn ParsedPayload(comptime fields: []const struct { []const u8, type }) type {
-    return struct {
-        result: ReadResult(fields),
-        rest: []const u8,
-    };
-}
-
-fn parsePayload(
-    comptime fields: []const struct { []const u8, type },
-    data: []const u8,
-) ?ParsedPayload(fields) {
-    var off: usize = 0;
-    var result: ReadResult(fields) = undefined;
-
-    inline for (fields) |f| {
-        const name: [:0]const u8 = @ptrCast(f[0]);
-        const T = f[1];
-
-        if (T == u64) {
-            if (off + 8 > data.len) return null;
-            @field(result, name) = std.mem.readInt(u64, data[off..][0..8], .little);
-            off += 8;
-        } else if (T == u32) {
-            if (off + 4 > data.len) return null;
-            @field(result, name) = std.mem.readInt(u32, data[off..][0..4], .little);
-            off += 4;
-        } else if (T == []const u8) {
-            if (off + 2 > data.len) return null;
-            const len = std.mem.readInt(u16, data[off..][0..2], .little);
-            off += 2;
-            if (off + len > data.len) return null;
-            @field(result, name) = data[off..][0..len];
-            off += len;
-        } else {
-            @compileError("parsePayload: unsupported type for field '" ++ f[0] ++ "'");
-        }
-    }
-
-    return .{ .result = result, .rest = data[off..] };
-}
-
-fn advancePayload(
-    comptime fields: []const struct { []const u8, type },
-    data: []const u8,
-) ?[]const u8 {
-    var off: usize = 0;
-    inline for (fields) |f| {
-        const T = f[1];
-        if (T == u64) {
-            if (off + 8 > data.len) return null;
-            off += 8;
-        } else if (T == u32) {
-            if (off + 4 > data.len) return null;
-            off += 4;
-        } else if (T == []const u8) {
-            if (off + 2 > data.len) return null;
-            const len = std.mem.readInt(u16, data[off..][0..2], .little);
-            off += 2;
-            if (off + len > data.len) return null;
-            off += len;
-        }
-    }
-    return data[off..];
-}
-
-fn writeResponseHeader(
-    buf: []u8,
-    total_len: u32,
-    op: u8,
-    status: Status,
-    sub_status: SubStatus,
-    count: u16,
-) void {
-    std.mem.writeInt(u32, buf[0..4], total_len, .little);
-    buf[4] = op;
-    buf[5] = @intFromEnum(status);
-    buf[6] = @intFromEnum(sub_status);
-    buf[7] = 0;
-    std.mem.writeInt(u16, buf[8..10], count, .little);
-}
+const parsePayload = protocol.parsePayload;
+const advancePayload = protocol.advancePayload;
+const readOptionalString = protocol.readOptionalString;
 
 fn writeResp(buf: []u8, op: u8, status: Status, count: u16, payload: []const u8) usize {
-    const total: usize = RESPONSE_HEADER_SIZE + payload.len;
-    if (buf.len < total) {
-        return 0;
-    }
-    writeResponseHeader(buf, @intCast(total), op, status, .none, count);
-    if (payload.len > 0) @memcpy(buf[RESPONSE_HEADER_SIZE..][0..payload.len], payload);
-    return total;
+    return protocol.writeResp(buf, op, baseStatus(status), count, payload);
+}
+
+fn writeRowList(comptime T: type, resp: []u8, op_byte: u8, items: []const T) usize {
+    return protocol.writeRowList(T, resp, op_byte, items);
+}
+
+fn writeOkHeader(resp: []u8, op_byte: u8, total_len: usize, count: u16) void {
+    protocol.writeOkHeader(resp, op_byte, @intCast(total_len), count);
+}
+
+fn writeRawHeader(resp: []u8, op_byte: u8, total_len: usize, status: Status, sub: SubStatus, count: u16) void {
+    protocol.writeRawHeader(resp, op_byte, @intCast(total_len), @intFromEnum(status), @intFromEnum(sub), count);
 }
 
 fn writeErrorResp(buf: []u8, op: u8, status: Status) usize {
@@ -218,18 +125,16 @@ fn writeErrorResp(buf: []u8, op: u8, status: Status) usize {
 }
 
 fn writeErrorRespSub(buf: []u8, op: u8, status: Status, sub: SubStatus) usize {
-    const total: u32 = @intCast(RESPONSE_HEADER_SIZE);
-    writeResponseHeader(buf, total, op, status, sub, 0);
-    return total;
+    return protocol.writeRawErrorResp(buf, op, @intFromEnum(status), @intFromEnum(sub));
+}
+
+fn baseStatus(status: Status) protocol.Status {
+    return @enumFromInt(@intFromEnum(status));
 }
 
 fn writeMappedError(buf: []u8, op: u8, err: anyerror) usize {
     const pair = mapErrorWithSubStatus(err);
     return writeErrorRespSub(buf, op, pair.status, pair.sub_status);
-}
-
-fn mapError(err: anyerror) Status {
-    return mapErrorWithSubStatus(err).status;
 }
 
 fn BatchCreateHandler(
@@ -287,7 +192,7 @@ fn BatchCreateHandler(
                 }
             }
 
-            writeResponseHeader(resp, @intCast(off), op_code, .ok, .none, written);
+            writeOkHeader(resp, op_code, off, written);
             return off;
         }
     };
@@ -310,70 +215,10 @@ const category_fields = &[_]struct { []const u8, type }{
 const CreateLinks = BatchCreateHandler(link_fields, @intFromEnum(Op.create_link), operations.createLink);
 const CreateCategories = BatchCreateHandler(category_fields, @intFromEnum(Op.create_category), operations.createCategory);
 
-const RESPONSE_RESERVE = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(schema.Category);
-
-fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
-    return resp_off == 0 or buf_len - resp_off >= RESPONSE_RESERVE;
-}
-
-pub fn processFrames(
-    db: *Directory,
-    conn: *conn_mod.Connection,
-) void {
-    const bp = conn.buf orelse return;
-    const data = bp.request_buf[0..conn.bytes_read];
-    var consumed: usize = 0;
-    var resp_off: usize = 0;
-
-    while (consumed + REQUEST_HEADER_SIZE <= data.len) {
-        if (!pipelineHasRoom(resp_off, bp.response_buf.len)) break;
-        if (resp_off + RESPONSE_HEADER_SIZE > bp.response_buf.len) break;
-
-        const frame = data[consumed..];
-        const total_len = std.mem.readInt(u32, frame[0..4], .little);
-
-        if (total_len > data.len - consumed) break;
-
-        const op_byte = frame[4];
-
-        if (total_len < REQUEST_HEADER_SIZE) {
-            resp_off += writeErrorResp(bp.response_buf[resp_off..], op_byte, .invalid);
-            consumed += REQUEST_HEADER_SIZE;
-            continue;
-        }
-
-        const count = std.mem.readInt(u16, frame[6..8], .little);
-        const payload = frame[REQUEST_HEADER_SIZE..total_len];
-
-        const op: Op = std.meta.intToEnum(Op, op_byte) catch {
-            resp_off += writeErrorResp(bp.response_buf[resp_off..], op_byte, .invalid);
-            consumed += total_len;
-            continue;
-        };
-
-        const t0 = std.time.nanoTimestamp();
-        const written = dispatch(db, op, op_byte, payload, count, bp.response_buf[resp_off..]);
-        const t1 = std.time.nanoTimestamp();
-        const dt: u64 = if (t1 > t0) @intCast(t1 - t0) else 0;
-        db.op_latency[op_byte].recordValue(dt);
-
-        if (written == 0) break;
-        resp_off += written;
-        consumed += total_len;
-    }
-
-    if (consumed > 0) {
-        const remaining = conn.bytes_read - consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, bp.request_buf[0..remaining], bp.request_buf[consumed..conn.bytes_read]);
-        }
-        conn.bytes_read = remaining;
-    }
-
-    conn.response_len = resp_off;
-}
-
-fn dispatch(db: *Directory, op: Op, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+    const op: Op = std.meta.intToEnum(Op, op_byte) catch {
+        return writeErrorResp(resp, op_byte, .invalid);
+    };
     return switch (op) {
         .ping => writeResp(resp, op_byte, .ok, 0, &.{}),
         .create_link => CreateLinks.handle(db, resp, payload, count),
@@ -494,7 +339,7 @@ fn handleGetCategoriesByIds(
         }
     }
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, found);
+    writeOkHeader(resp, op_byte, off, found);
     return off;
 }
 
@@ -642,7 +487,7 @@ fn handleBrowsePath(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
     std.mem.writeInt(u64, resp[off..][0..8], total_links, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -739,7 +584,7 @@ fn writeLinkPage(resp: []u8, op_byte: u8, page: operations.LinkPage) usize {
     if (off + 8 > resp.len) return writeErrorResp(resp, op_byte, .err);
     std.mem.writeInt(u64, resp[off..][0..8], page.next_after_id, .little);
     off += 8;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, written);
+    writeOkHeader(resp, op_byte, off, written);
     return off;
 }
 
@@ -840,7 +685,7 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     std.mem.writeInt(u64, resp[off..][0..8], next_after_id, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -919,7 +764,7 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     }
     std.mem.writeInt(u16, resp[link_count_off..][0..2], links_written, .little);
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -956,7 +801,7 @@ fn writeIndexHealthFrame(state_snapshot: anytype, resp: []u8) usize {
 fn handleIndexHealth(db: *Directory, resp: []u8, op_byte: u8) usize {
     const snap = db.verifier_state.snapshot(db);
     const off = writeIndexHealthFrame(snap, resp);
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -985,7 +830,7 @@ fn handleRebuildIndex(db: *Directory, resp: []u8, op_byte: u8) usize {
     std.mem.writeInt(u64, resp[off..][0..8], stats.queue_entries_drained, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1006,7 +851,7 @@ fn handleSnapshot(db: *Directory, resp: []u8, op_byte: u8) usize {
     std.mem.writeInt(u64, resp[off..][0..8], result.duration_ms, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1047,7 +892,7 @@ fn handleOpLatencyStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     }
 
     resp[count_off] = emitted;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1129,7 +974,7 @@ fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
     std.mem.writeInt(u64, resp[off..][0..8], elapsed_ms, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1163,7 +1008,7 @@ fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []co
         off += 2;
         @memset(resp[off..][0..8], 0);
         off += 8;
-        writeResponseHeader(resp, @intCast(off), op_byte, pair.status, pair.sub_status, 1);
+        writeRawHeader(resp, op_byte, off, pair.status, pair.sub_status, 1);
         return off;
     };
     resp[off] = @intFromEnum(Status.ok);
@@ -1171,7 +1016,7 @@ fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     off += 2;
     std.mem.writeInt(u64, resp[off..][0..8], id, .little);
     off += 8;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 1);
+    writeOkHeader(resp, op_byte, off, 1);
     return off;
 }
 
@@ -1234,7 +1079,7 @@ fn handleBulkLinkOp(
 
     std.mem.writeInt(u16, resp[ok_off..][0..2], ok_count, .little);
     std.mem.writeInt(u16, resp[err_off..][0..2], err_count, .little);
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1277,7 +1122,7 @@ fn handleCountsByStatus(db: *Directory, resp: []u8, op_byte: u8) usize {
     off += 8;
     std.mem.writeInt(u64, resp[off..][0..8], counts.rejected, .little);
     off += 8;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1299,32 +1144,7 @@ fn handleStats(db: *Directory, resp: []u8, op_byte: u8) usize {
         std.mem.writeInt(u64, resp[off..][0..8], val, .little);
         off += 8;
     }
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
-    return off;
-}
-
-fn readOptionalString(payload: []const u8, off: *usize, mask: u8, bit: u8) ?(?[]const u8) {
-    if (mask & bit == 0) return @as(?[]const u8, null);
-    if (off.* + 2 > payload.len) return null;
-    const len = std.mem.readInt(u16, payload[off.*..][0..2], .little);
-    off.* += 2;
-    if (off.* + len > payload.len) return null;
-    const s = payload[off.*..][0..len];
-    off.* += len;
-    return s;
-}
-
-fn writeRowList(comptime T: type, resp: []u8, op_byte: u8, items: []const T) usize {
-    var off: usize = RESPONSE_HEADER_SIZE;
-    var written_count: u16 = 0;
-    for (items) |item| {
-        const bytes = std.mem.asBytes(&item);
-        if (off + bytes.len > resp.len) break;
-        @memcpy(resp[off..][0..bytes.len], bytes);
-        off += bytes.len;
-        written_count += 1;
-    }
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, written_count);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1633,8 +1453,8 @@ test "op_latency_stats (23): records latency through processFrames + reports per
     var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var bp: conn_mod.BufferPair = .{};
-    var conn: conn_mod.Connection = .{};
+    var bp: zigstore.connection.BufferPair = .{};
+    var conn: zigstore.connection.Connection = .{};
     conn.buf = &bp;
 
     var off: usize = 0;
@@ -1648,7 +1468,7 @@ test "op_latency_stats (23): records latency through processFrames + reports per
     }
     conn.bytes_read = off;
 
-    processFrames(db, &conn);
+    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency);
 
     var resp: [4096]u8 = undefined;
     const reply_len = handleOpLatencyStats(db, &resp, @intFromEnum(Op.op_latency_stats));
@@ -1690,13 +1510,6 @@ test "handleStats refuses an undersized response buffer instead of overflowing i
     const written = handleStats(db, &exact, @intFromEnum(Op.stats));
     try std.testing.expectEqual(@as(usize, RESPONSE_HEADER_SIZE + 6 * 8), written);
     try std.testing.expectEqual(@intFromEnum(Status.ok), exact[5]);
-}
-
-test "pipelineHasRoom defers a frame once the buffer can't hold a worst-case response" {
-    const buf = conn_mod.RESPONSE_BUF_SIZE;
-    try std.testing.expect(pipelineHasRoom(0, buf));
-    try std.testing.expect(pipelineHasRoom(buf - RESPONSE_RESERVE, buf));
-    try std.testing.expect(!pipelineHasRoom(buf - RESPONSE_RESERVE + 1, buf));
 }
 
 test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration_ms" {
@@ -2465,12 +2278,12 @@ fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {
     const db = Directory.openTestInstance(gpa.allocator(), &tmp) catch return;
     defer db.deinitTestInstance();
 
-    var bp: conn_mod.BufferPair = .{};
-    var conn = conn_mod.Connection{ .phase = .reading_request, .buf = &bp };
+    var bp: zigstore.connection.BufferPair = .{};
+    var conn = zigstore.connection.Connection{ .phase = .reading_request, .buf = &bp };
     const n = @min(input.len, bp.request_buf.len);
     @memcpy(bp.request_buf[0..n], input[0..n]);
     conn.bytes_read = n;
-    processFrames(db, &conn);
+    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency);
 }
 
 test "fuzz: processFrames tolerates arbitrary request frames" {
