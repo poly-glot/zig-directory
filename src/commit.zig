@@ -1,19 +1,19 @@
 const std = @import("std");
 const changeset = @import("changeset.zig");
 const apply_mod = @import("apply/apply.zig");
-const Database = @import("database.zig").Database;
+const Directory = @import("directory.zig").Directory;
 
 pub const CommitError = error{
     WalDisabled,
     OutOfMemory,
 } || apply_mod.ApplyError;
 
-pub fn commit(db: *Database, cs: changeset.ChangeSet) !void {
+pub fn commit(db: *Directory, cs: changeset.ChangeSet) !void {
     const encoded = try changeset.encode(db.allocator, cs);
     defer db.allocator.free(encoded);
 
     var seq: u64 = 0;
-    if (db.wal_writer) |*w| {
+    if (db.store.wal_writer) |*w| {
         seq = try w.append(.changeset, encoded);
     } else {
         return CommitError.WalDisabled;
@@ -31,7 +31,7 @@ pub fn commit(db: *Database, cs: changeset.ChangeSet) !void {
         try apply_result;
     }
 
-    if (db.wal_writer) |*w| {
+    if (db.store.wal_writer) |*w| {
         try w.awaitDurable(seq);
     }
 }

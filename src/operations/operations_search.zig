@@ -1,6 +1,6 @@
 const std = @import("std");
 const schema = @import("../schema.zig");
-const Database = @import("../database.zig").Database;
+const Directory = @import("../directory.zig").Directory;
 const inverted = @import("../inverted_index.zig");
 const category = @import("operations_category.zig");
 const link_mod = @import("operations_link.zig");
@@ -9,7 +9,7 @@ const shared = @import("operations_shared.zig");
 const log = shared.log;
 
 pub fn searchCategories(
-    db: *Database,
+    db: *Directory,
     query: []const u8,
     limit: u32,
     buf: []schema.Category,
@@ -17,7 +17,7 @@ pub fn searchCategories(
     return searchViaIndexTree(
         schema.Category,
         db,
-        &db.categories_index_tree,
+        db.categories_index_tree(),
         query,
         limit,
         buf,
@@ -26,7 +26,7 @@ pub fn searchCategories(
 }
 
 pub fn searchLinks(
-    db: *Database,
+    db: *Directory,
     query: []const u8,
     limit: u32,
     buf: []schema.Link,
@@ -34,7 +34,7 @@ pub fn searchLinks(
     return searchViaIndexTree(
         schema.Link,
         db,
-        &db.links_index_tree,
+        db.links_index_tree(),
         query,
         limit,
         buf,
@@ -43,7 +43,7 @@ pub fn searchLinks(
 }
 
 fn searchTreeByToken(
-    tree: *@import("../btree/btree.zig").BPlusTree,
+    tree: *@import("zigstore").BPlusTree,
     token: []const u8,
     allocator: std.mem.Allocator,
 ) ![]u64 {
@@ -77,12 +77,12 @@ fn searchTreeByToken(
 
 fn searchViaIndexTree(
     comptime T: type,
-    db: *Database,
-    tree: *@import("../btree/btree.zig").BPlusTree,
+    db: *Directory,
+    tree: *@import("zigstore").BPlusTree,
     query: []const u8,
     limit: u32,
     buf: []T,
-    comptime getter: fn (*Database, u64) anyerror!?T,
+    comptime getter: fn (*Directory, u64) anyerror!?T,
 ) ![]T {
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     if (max == 0) return buf[0..0];
@@ -148,7 +148,7 @@ test "search: B+Tree-backed link search finds tokenised title" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -164,7 +164,7 @@ test "search: B+Tree-backed category search finds tokenised name" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -184,7 +184,7 @@ test "search: multi-token query AND-intersects per-token posting lists" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -202,7 +202,7 @@ test "search: AND-of-tokens — \"foo bar\" excludes the foo-only doc" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -219,7 +219,7 @@ test "search: shared token \"test\" returns both docs in ascending id order" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -238,7 +238,7 @@ test "search: token absent from corpus returns empty result set" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");

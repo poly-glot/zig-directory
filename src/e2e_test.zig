@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const Database = @import("database.zig").Database;
+const Directory = @import("directory.zig").Directory;
 const Config = @import("main.zig").Config;
 const ops = @import("operations/operations.zig");
 const codec = @import("zigstore").codec;
@@ -28,8 +28,8 @@ fn testConfig(dir: []const u8) Config {
     };
 }
 
-fn initTestDb(dir: []const u8) !*Database {
-    return Database.init(testing.allocator, testConfig(dir));
+fn initTestDb(dir: []const u8) !*Directory {
+    return Directory.init(testing.allocator, testConfig(dir));
 }
 
 fn cleanupTestDir(dir: []const u8) void {
@@ -159,9 +159,9 @@ test "E2E: database init creates valid file" {
     var db = try initTestDb(dir);
     defer db.deinit();
 
-    try testing.expectEqual(@as(u32, 0x444D4F5A), db.header.magic);
-    try testing.expectEqual(file_header.VERSION, db.header.version);
-    try testing.expectEqual(@as(u32, 8), db.header.page_count);
+    try testing.expectEqual(@as(u32, 0x444D4F5A), db.store.header.magic);
+    try testing.expectEqual(file_header.VERSION, db.store.header.format_version);
+    try testing.expectEqual(@as(u64, 0), db.store.header.page_count);
 
     const stats = db.getStats();
     try testing.expectEqual(@as(u64, 0), stats.category_count);
@@ -551,7 +551,7 @@ test "E2E: data persists across database close and reopen" {
         cat_id = try ops.createCategory(db, 0, "Persistent", "persistent", "This should survive restart");
         link_id = try ops.createLink(db, cat_id, "https://persist.com", "Persist Link", "Persistent link");
         try db.flushHeader();
-        try db.cache.flushAll();
+        try db.store.cache.flushAll();
         db.deinit();
     }
 
@@ -630,7 +630,7 @@ test "e2e: > threshold rename enqueues task, worker drains, queue empties" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
     db.config.rename_inline_threshold = 100;
 
@@ -642,17 +642,17 @@ test "e2e: > threshold rename enqueues task, worker drains, queue empties" {
         const slug = std.fmt.bufPrint(&slug_buf, "c{d}", .{i}) catch unreachable;
         _ = try ops.createCategory(db, parent_id, "x", slug, "");
     }
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try ops.updateCategory(db, parent_id, null, "new", null);
-    try std.testing.expect(db.slug_path_repair_queue.entry_count > 0);
+    try std.testing.expect(db.slug_path_repair_queue().entry_count > 0);
 
     try std.testing.expect((try ops.resolveSlugPath(db, "top/old/c1")) == null);
 
     const repair_worker = @import("repair/repair_worker.zig");
     try repair_worker.tickOnce(db);
-    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entry_count);
+    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entry_count);
 
     var j: u32 = 0;
     while (j < 250) : (j += 1) {
@@ -671,14 +671,14 @@ test "C1: an acked commit survives an unclean crash via WAL replay" {
     defer tmp.cleanup();
 
     const link_id = blk: {
-        const a = try Database.openTestInstance(allocator, &tmp);
+        const a = try Directory.openTestInstance(allocator, &tmp);
         const top = try ops.createCategory(a, 0, "Top", "top", "");
         const id = try ops.createLink(a, top, "https://crash.example", "Survivor", "");
         a.deinitCrashTestInstance();
         break :blk id;
     };
 
-    const b = try Database.openTestInstance(allocator, &tmp);
+    const b = try Directory.openTestInstance(allocator, &tmp);
     defer b.deinitTestInstance();
     try b.recover();
 
@@ -693,13 +693,13 @@ test "C4: a duplicate URL is rejected after a restart (bloom reseeded from disk)
     defer tmp.cleanup();
 
     {
-        const a = try Database.openTestInstance(allocator, &tmp);
+        const a = try Directory.openTestInstance(allocator, &tmp);
         defer a.deinitTestInstance();
         const top = try ops.createCategory(a, 0, "Top", "top", "");
         _ = try ops.createLink(a, top, "https://dup.example", "First", "");
     }
 
-    const b = try Database.openTestInstance(allocator, &tmp);
+    const b = try Directory.openTestInstance(allocator, &tmp);
     defer b.deinitTestInstance();
     try b.recover();
 
@@ -714,7 +714,7 @@ test "H1: a snapshot persists the page-0 header so data survives a later crash" 
     defer tmp.cleanup();
 
     const child_id, const link_id = blk: {
-        const a = try Database.openTestInstance(allocator, &tmp);
+        const a = try Directory.openTestInstance(allocator, &tmp);
         const top = try ops.createCategory(a, 0, "Top", "top", "");
         const child = try ops.createCategory(a, top, "Child", "child", "");
         const link = try ops.createLink(a, child, "https://snap.example", "Snap", "");
@@ -724,7 +724,7 @@ test "H1: a snapshot persists the page-0 header so data survives a later crash" 
         break :blk .{ child, link };
     };
 
-    const b = try Database.openTestInstance(allocator, &tmp);
+    const b = try Directory.openTestInstance(allocator, &tmp);
     defer b.deinitTestInstance();
     try b.recover();
 

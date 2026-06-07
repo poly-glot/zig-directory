@@ -1,7 +1,7 @@
 const std = @import("std");
 const schema = @import("schema.zig");
-const Database = @import("database.zig").Database;
-const Stats = @import("database.zig").Stats;
+const Directory = @import("directory.zig").Directory;
+const Stats = @import("directory.zig").Stats;
 const operations = @import("operations/operations.zig");
 const conn_mod = @import("connection.zig");
 
@@ -237,7 +237,7 @@ fn BatchCreateHandler(
     comptime createFn: anytype,
 ) type {
     return struct {
-        fn handle(db: *Database, resp: []u8, payload: []const u8, count: u16) usize {
+        fn handle(db: *Directory, resp: []u8, payload: []const u8, count: u16) usize {
             const ITEM_BYTES: usize = 10;
             if (resp.len < RESPONSE_HEADER_SIZE) return 0;
 
@@ -316,7 +316,7 @@ fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
 }
 
 pub fn processFrames(
-    db: *Database,
+    db: *Directory,
     conn: *conn_mod.Connection,
 ) void {
     const bp = conn.buf orelse return;
@@ -372,7 +372,7 @@ pub fn processFrames(
     conn.response_len = resp_off;
 }
 
-fn dispatch(db: *Database, op: Op, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+fn dispatch(db: *Directory, op: Op, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
     return switch (op) {
         .ping => writeResp(resp, op_byte, .ok, 0, &.{}),
         .create_link => CreateLinks.handle(db, resp, payload, count),
@@ -441,11 +441,11 @@ pub const ListSubtreeLinksRequest = struct {
 
 fn handleGet(
     comptime T: type,
-    db: *Database,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
-    comptime getter: fn (*Database, u64) anyerror!?T,
+    comptime getter: fn (*Directory, u64) anyerror!?T,
 ) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
@@ -458,7 +458,7 @@ fn handleGet(
 }
 
 fn handleGetCategoriesByIds(
-    db: *Database,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
@@ -498,11 +498,11 @@ fn handleGetCategoriesByIds(
 }
 
 fn handleDelete(
-    db: *Database,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
-    comptime deleteFn: fn (*Database, u64) anyerror!void,
+    comptime deleteFn: fn (*Directory, u64) anyerror!void,
 ) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
@@ -513,8 +513,8 @@ fn handleDelete(
 }
 
 fn handleBitmaskUpdate(
-    comptime updateFn: fn (*Database, u64, ?[]const u8, ?[]const u8, ?[]const u8) anyerror!void,
-    db: *Database,
+    comptime updateFn: fn (*Directory, u64, ?[]const u8, ?[]const u8, ?[]const u8) anyerror!void,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
@@ -537,7 +537,7 @@ fn handleBitmaskUpdate(
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleMoveCategory(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleMoveCategory(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const new_parent = std.mem.readInt(u64, payload[8..16], .little);
@@ -547,7 +547,7 @@ fn handleMoveCategory(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleMoveLink(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleMoveLink(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const new_cat = std.mem.readInt(u64, payload[8..16], .little);
@@ -557,7 +557,7 @@ fn handleMoveLink(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) u
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleListRootCategories(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListRootCategories(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const offset = std.mem.readInt(u32, payload[0..4], .little);
     const limit = std.mem.readInt(u32, payload[4..8], .little);
@@ -570,7 +570,7 @@ fn handleListRootCategories(db: *Database, resp: []u8, op_byte: u8, payload: []c
     return writeRowList(schema.Category, resp, op_byte, items);
 }
 
-fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleBrowsePath(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 2) return writeErrorResp(resp, op_byte, .invalid);
     const path_len: usize = std.mem.readInt(u16, payload[0..2], .little);
     if (2 + path_len > payload.len) return writeErrorResp(resp, op_byte, .invalid);
@@ -581,8 +581,8 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     const cat = (operations.getCategory(db, cat_id) catch null) orelse
         return writeErrorResp(resp, op_byte, .not_found);
 
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(schema.Category) + 2 + 2 + 8;
     if (resp.len < MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
@@ -628,13 +628,13 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
         hit
     else blk: {
         const desc = subtree.collectDescendantsCached(
-            &db.cat_by_parent,
+            db.cat_by_parent(),
             cat_id,
             &db.subtree_cache,
             db.allocator,
         ) catch break :blk 0;
         defer db.allocator.free(desc);
-        const t = subtree.countSubtreeLinks(&db.link_by_category, desc, db.allocator) catch break :blk 0;
+        const t = subtree.countSubtreeLinks(db.link_by_category(), desc, db.allocator) catch break :blk 0;
         db.subtree_cache.putLinkCount(cat_id, t) catch {};
         break :blk t;
     };
@@ -645,7 +645,7 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     return off;
 }
 
-fn handleListChildren(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListChildren(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const parent_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
@@ -659,7 +659,7 @@ fn handleListChildren(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     return writeRowList(schema.Category, resp, op_byte, items);
 }
 
-fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const cat_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
@@ -676,7 +676,7 @@ fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) 
     return writeLinkPage(resp, op_byte, page);
 }
 
-fn handleListAllLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListAllLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const offset = std.mem.readInt(u32, payload[0..4], .little);
     const limit = std.mem.readInt(u32, payload[4..8], .little);
@@ -692,7 +692,7 @@ fn handleListAllLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     return writeLinkPage(resp, op_byte, page);
 }
 
-fn handleListLinksBySubmitter(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListLinksBySubmitter(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const submitter_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
@@ -742,7 +742,7 @@ fn writeLinkPage(resp: []u8, op_byte: u8, page: operations.LinkPage) usize {
     return off;
 }
 
-fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 17) return writeErrorResp(resp, op_byte, .invalid);
     const req = ListSubtreeLinksRequest.parse(payload);
     req.validate() catch |err| return writeMappedError(resp, op_byte, err);
@@ -752,14 +752,14 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
     const status_filter = extras.status;
     const cursor_mode = extras.after_id > 0;
 
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const subtree = @import("subtree.zig");
 
     const descendants = subtree.collectDescendantsCached(
-        &db.cat_by_parent,
+        db.cat_by_parent(),
         req.cat_id,
         &db.subtree_cache,
         db.allocator,
@@ -780,7 +780,7 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
     const scan_threshold: u32 = db.config.subtree_scan_threshold;
     const slice = if (descendants.len > scan_threshold)
         subtree.listSubtreeLinkIdsScan(
-            &db.link_by_category,
+            db.link_by_category(),
             descendants,
             fetch_offset,
             fetch_limit,
@@ -788,7 +788,7 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
         ) catch |err| return writeMappedError(resp, op_byte, err)
     else
         subtree.listSubtreeLinkIds(
-            &db.link_by_category,
+            db.link_by_category(),
             descendants,
             fetch_offset,
             fetch_limit,
@@ -858,7 +858,7 @@ fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     return 0;
 }
 
-fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 6) return writeErrorResp(resp, op_byte, .invalid);
     const query_len: usize = std.mem.readInt(u16, payload[0..2], .little);
     if (query_len < 2) return writeErrorResp(resp, op_byte, .invalid);
@@ -952,21 +952,21 @@ fn writeIndexHealthFrame(state_snapshot: anytype, resp: []u8) usize {
     return off;
 }
 
-fn handleIndexHealth(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleIndexHealth(db: *Directory, resp: []u8, op_byte: u8) usize {
     const snap = db.verifier_state.snapshot(db);
     const off = writeIndexHealthFrame(snap, resp);
     writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
     return off;
 }
 
-fn handleRunVerifier(db: *Database, resp: []u8, op_byte: u8) usize {
-    db.verifier_mutex.lock();
-    db.verifier_cond.signal();
-    db.verifier_mutex.unlock();
+fn handleRunVerifier(db: *Directory, resp: []u8, op_byte: u8) usize {
+    @import("verifier.zig").runOnce(db, &db.verifier_state) catch |err| {
+        log.warn("run_verifier failed: {}", .{err});
+    };
     return handleIndexHealth(db, resp, op_byte);
 }
 
-fn handleRebuildIndex(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleRebuildIndex(db: *Directory, resp: []u8, op_byte: u8) usize {
     const repair = @import("repair/repair.zig");
     const stats = repair.rebuildAllIndices(db) catch |err| {
         log.err("rebuild_index failed: {}", .{err});
@@ -988,7 +988,7 @@ fn handleRebuildIndex(db: *Database, resp: []u8, op_byte: u8) usize {
     return off;
 }
 
-fn handleSnapshot(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleSnapshot(db: *Directory, resp: []u8, op_byte: u8) usize {
     const snapshot = @import("snapshot.zig");
     const result = snapshot.forceSnapshot(db) catch |err| {
         if (err != error.SnapshotInProgress) {
@@ -1010,7 +1010,7 @@ fn handleSnapshot(db: *Database, resp: []u8, op_byte: u8) usize {
     return off;
 }
 
-fn handleOpLatencyStats(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleOpLatencyStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     const PER_OP_BYTES: usize = 1 + 7 * 8;
 
     var off: usize = RESPONSE_HEADER_SIZE;
@@ -1051,7 +1051,7 @@ fn handleOpLatencyStats(db: *Database, resp: []u8, op_byte: u8) usize {
     return off;
 }
 
-fn handleBulkImport(db: *Database, resp: []u8, op_byte: u8, payload: []const u8, count: u16) usize {
+fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8, count: u16) usize {
     const PAYLOAD_BYTES: usize = 48;
     if (resp.len < RESPONSE_HEADER_SIZE + PAYLOAD_BYTES) return writeErrorResp(resp, op_byte, .err);
 
@@ -1133,7 +1133,7 @@ fn handleBulkImport(db: *Database, resp: []u8, op_byte: u8, payload: []const u8,
     return off;
 }
 
-fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     const ITEM_BYTES: usize = 10;
     if (resp.len < RESPONSE_HEADER_SIZE + ITEM_BYTES) return 0;
 
@@ -1175,7 +1175,7 @@ fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []con
     return off;
 }
 
-fn handleUpdateLinkStatus(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleUpdateLinkStatus(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 9) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const status = payload[8];
@@ -1200,9 +1200,9 @@ fn handleBulkLinkOp(
     op_byte: u8,
     payload: []const u8,
     id_off: usize,
-    db: *Database,
+    db: *Directory,
     status: u8,
-    comptime applyOne: fn (*Database, u64, u8) BulkResultCode,
+    comptime applyOne: fn (*Directory, u64, u8) BulkResultCode,
 ) usize {
     if (payload.len < id_off + 2) return writeErrorResp(resp, op_byte, .invalid);
     const count = std.mem.readInt(u16, payload[id_off..][0..2], .little);
@@ -1238,7 +1238,7 @@ fn handleBulkLinkOp(
     return off;
 }
 
-fn applyBulkStatus(db: *Database, id: u64, status: u8) BulkResultCode {
+fn applyBulkStatus(db: *Directory, id: u64, status: u8) BulkResultCode {
     operations.updateLinkStatusBulkOne(db, id, status) catch |err| return switch (err) {
         error.LinkNotFound => .not_found,
         error.AlreadyInState => .already_in_state,
@@ -1247,7 +1247,7 @@ fn applyBulkStatus(db: *Database, id: u64, status: u8) BulkResultCode {
     return .ok;
 }
 
-fn applyBulkDelete(db: *Database, id: u64, status: u8) BulkResultCode {
+fn applyBulkDelete(db: *Directory, id: u64, status: u8) BulkResultCode {
     _ = status;
     operations.deleteLink(db, id) catch |err| return switch (err) {
         error.LinkNotFound => .not_found,
@@ -1256,18 +1256,18 @@ fn applyBulkDelete(db: *Database, id: u64, status: u8) BulkResultCode {
     return .ok;
 }
 
-fn handleBulkUpdateLinkStatus(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleBulkUpdateLinkStatus(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 3) return writeErrorResp(resp, op_byte, .invalid);
     const status = payload[0];
     if (status > 2) return writeErrorResp(resp, op_byte, .invalid);
     return handleBulkLinkOp(resp, op_byte, payload, 1, db, status, applyBulkStatus);
 }
 
-fn handleBulkDeleteLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleBulkDeleteLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     return handleBulkLinkOp(resp, op_byte, payload, 0, db, 0, applyBulkDelete);
 }
 
-fn handleCountsByStatus(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleCountsByStatus(db: *Directory, resp: []u8, op_byte: u8) usize {
     const counts = operations.countsByStatus(db) catch |err| return writeMappedError(resp, op_byte, err);
     if (resp.len < RESPONSE_HEADER_SIZE + 24) return writeErrorResp(resp, op_byte, .err);
     var off: usize = RESPONSE_HEADER_SIZE;
@@ -1281,7 +1281,7 @@ fn handleCountsByStatus(db: *Database, resp: []u8, op_byte: u8) usize {
     return off;
 }
 
-fn handleStats(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     const s = db.getStats();
     const values = [_]u64{
         s.category_count,
@@ -1423,13 +1423,13 @@ test "index_health response carries slug_path_repair_queue fields" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var task = schema.RepairTask{ .cat_id = 1, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
-    try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));
+    try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
 
     var resp: [4096]u8 = undefined;
     const off = handleIndexHealth(db, &resp, @intFromEnum(Op.index_health));
@@ -1489,7 +1489,7 @@ test "create_link: oversized URL produces status=invalid, sub_status=field_too_l
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1529,7 +1529,7 @@ test "list_subtree_links: unsupported order_code produces sub_status=unsupported
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [17]u8 = undefined;
@@ -1550,7 +1550,7 @@ test "list_subtree_links: small subtree (<= scan_threshold) and large subtree bo
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const ops = @import("operations/operations.zig");
@@ -1564,10 +1564,10 @@ test "list_subtree_links: small subtree (<= scan_threshold) and large subtree bo
         const url = std.fmt.bufPrint(&url_buf, "https://x{d}.t", .{i}) catch unreachable;
         _ = try ops.createLink(db, cat_ids[i], url, "L", "");
     }
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], top_id, .little);
@@ -1596,7 +1596,7 @@ test "list_subtree_links: oversize offset produces sub_status=offset_too_large" 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [17]u8 = undefined;
@@ -1616,7 +1616,7 @@ test "op_latency_stats (23): empty histograms produce count=0 response" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var resp: [4096]u8 = undefined;
@@ -1630,7 +1630,7 @@ test "op_latency_stats (23): records latency through processFrames + reports per
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var bp: conn_mod.BufferPair = .{};
@@ -1678,7 +1678,7 @@ test "handleStats refuses an undersized response buffer instead of overflowing i
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var tail: [RESPONSE_HEADER_SIZE + 8]u8 = undefined;
@@ -1703,7 +1703,7 @@ test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     _ = try operations.createCategory(db, 0, "Top", "top", "");
@@ -1726,7 +1726,7 @@ test "snapshot op (22): concurrent invocation returns already_in_progress" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     db.snapshot_in_progress.store(true, .release);
@@ -1743,7 +1743,7 @@ test "create_link: duplicate URL produces status=duplicate, sub_status=duplicate
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1804,7 +1804,7 @@ test "bulk_import (24): empty count returns all-zero stats" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var resp: [128]u8 = undefined;
@@ -1824,7 +1824,7 @@ test "bulk_import (24): inserts 1000 items in a single frame" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -1868,7 +1868,7 @@ test "bulk_import (24): mid-stream invalid item is counted, subsequent items go 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -1904,7 +1904,7 @@ test "bulk_import (24): payload exceeding byte cap is rejected" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const oversized = try allocator.alloc(u8, BULK_IMPORT_MAX_BYTES + 1);
@@ -1922,7 +1922,7 @@ test "create_submission: writes a pending Link with the supplied submitter_id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1968,7 +1968,7 @@ test "update_link_status: flips pending → approved" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1998,7 +1998,7 @@ test "list_all_links (op=16) with trailing status byte filters by status" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2043,7 +2043,7 @@ test "list_links (op=13) with trailing status byte filters within a category" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2081,7 +2081,7 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2116,7 +2116,7 @@ test "list_subtree_links (op=17) with trailing status byte filters whole subtree
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -2152,7 +2152,7 @@ test "bulk_update_link_status (op=34) reports per-id result codes" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2199,7 +2199,7 @@ test "bulk_update_link_status (op=34) caps at 200" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [3]u8 = undefined;
@@ -2215,7 +2215,7 @@ test "bulk_delete_links (op=35): mixed found / not-found" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2243,7 +2243,7 @@ test "counts_by_status (op=36) returns per-status totals" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2265,7 +2265,7 @@ test "search (op=14): scope byte filters sections and links carry match_field" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -2338,7 +2338,7 @@ test "list_all_links with out-of-range status returns invalid" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [9]u8 = undefined;
@@ -2356,7 +2356,7 @@ test "update_link_status: out-of-range status returns invalid + unsupported_orde
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [9]u8 = undefined;
@@ -2374,7 +2374,7 @@ test "get_categories_by_ids (29): mix of hits and misses returns only the hits" 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const a_id = try operations.createCategory(db, 0, "Alpha", "alpha", "");
@@ -2421,7 +2421,7 @@ test "get_categories_by_ids (29): count > GET_CATEGORIES_BY_IDS_MAX returns inva
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [2]u8 = undefined;
@@ -2441,7 +2441,7 @@ test "get_categories_by_ids (29): truncated payload returns invalid" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [2 + 8]u8 = undefined;
@@ -2463,7 +2463,7 @@ fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {
     defer std.debug.assert(gpa.deinit() == .ok);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db = Database.openTestInstance(gpa.allocator(), &tmp) catch return;
+    const db = Directory.openTestInstance(gpa.allocator(), &tmp) catch return;
     defer db.deinitTestInstance();
 
     var bp: conn_mod.BufferPair = .{};

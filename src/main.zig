@@ -11,7 +11,7 @@ pub const inverted_index = @import("inverted_index.zig");
 pub const memtable = @import("memtable.zig");
 pub const bloom = @import("bloom.zig");
 pub const operations = @import("operations/operations.zig");
-pub const database = @import("database.zig");
+pub const directory = @import("directory.zig");
 pub const epoll_server = @import("epoll.zig");
 pub const connection = @import("connection.zig");
 pub const signal = @import("signal.zig");
@@ -22,7 +22,7 @@ pub const binary_protocol = @import("binary_protocol.zig");
 pub const subtree = @import("subtree.zig");
 pub const verifier = @import("verifier.zig");
 
-const Database = database.Database;
+const Directory = directory.Directory;
 const EpollServer = epoll_server.EpollServer;
 
 const log = std.log.scoped(.dmozdb);
@@ -207,7 +207,7 @@ pub fn main() !void {
         config.trusted_count,
     });
 
-    const db = try Database.init(allocator, config);
+    const db = try Directory.init(allocator, config);
     defer db.deinit();
 
     try db.recover();
@@ -258,7 +258,7 @@ test {
     _ = schema;
     _ = inverted_index;
     _ = operations;
-    _ = database;
+    _ = directory;
     _ = epoll_server;
     _ = connection;
     _ = signal;

@@ -1,10 +1,10 @@
 const std = @import("std");
 const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
-const Database = @import("../database.zig").Database;
+const Directory = @import("../directory.zig").Directory;
 const category = @import("operations_category.zig");
 
-pub fn resolveSlugPath(db: *Database, path: []const u8) !?u64 {
+pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
     if (path.len == 0) return null;
 
     var v_buf: [8]u8 = undefined;
@@ -12,7 +12,7 @@ pub fn resolveSlugPath(db: *Database, path: []const u8) !?u64 {
     var resolved_path: []const u8 = path;
     var top_buf: [2048]u8 = undefined;
 
-    if (try db.categories_by_slug_path.search(path, &v_buf)) |val| {
+    if (try db.categories_by_slug_path().search(path, &v_buf)) |val| {
         if (val.len == 8) maybe_id = std.mem.readInt(u64, val[0..8], .big);
     }
     if (maybe_id == null and !std.mem.startsWith(u8, path, "top/")) {
@@ -21,7 +21,7 @@ pub fn resolveSlugPath(db: *Database, path: []const u8) !?u64 {
             @memcpy(top_buf[0.."top/".len], "top/");
             @memcpy(top_buf["top/".len..need], path);
             const with_top = top_buf[0..need];
-            if (try db.categories_by_slug_path.search(with_top, &v_buf)) |val| {
+            if (try db.categories_by_slug_path().search(with_top, &v_buf)) |val| {
                 if (val.len == 8) {
                     maybe_id = std.mem.readInt(u64, val[0..8], .big);
                     resolved_path = with_top;
@@ -30,13 +30,13 @@ pub fn resolveSlugPath(db: *Database, path: []const u8) !?u64 {
         }
     }
     if (maybe_id == null and std.mem.indexOfScalar(u8, path, '/') == null) {
-        if (try db.categories_by_slug_only.search(path, &v_buf)) |val| {
+        if (try db.categories_by_slug_only().search(path, &v_buf)) |val| {
             if (val.len == 8) maybe_id = std.mem.readInt(u64, val[0..8], .big);
         }
     }
     const cat_id = maybe_id orelse return null;
 
-    if (db.slug_path_repair_queue.entry_count == 0) return cat_id;
+    if (db.slug_path_repair_queue().entry_count == 0) return cat_id;
 
     const cat = (try category.getCategory(db, cat_id)) orelse return null;
     var path_buf: [2048]u8 = undefined;
@@ -45,7 +45,7 @@ pub fn resolveSlugPath(db: *Database, path: []const u8) !?u64 {
     return cat_id;
 }
 
-pub fn buildSlugPath(db: *Database, id: u64, buf: []u8) !?[]const u8 {
+pub fn buildSlugPath(db: *Directory, id: u64, buf: []u8) !?[]const u8 {
     var id_path: [64]u64 = undefined;
     const path_ids = try category.getCategoryPath(db, id, &id_path);
 
@@ -70,7 +70,7 @@ pub fn buildSlugPath(db: *Database, id: u64, buf: []u8) !?[]const u8 {
     return buf[0..pos];
 }
 
-pub fn buildCanonicalSlugPath(db: *Database, cat: *const schema.Category, buf: []u8) !?[]const u8 {
+pub fn buildCanonicalSlugPath(db: *Directory, cat: *const schema.Category, buf: []u8) !?[]const u8 {
     var id_path: [64]u64 = undefined;
     const path_ids = try category.getCategoryPath(db, cat.id, &id_path);
     var pos: usize = 0;
@@ -95,7 +95,7 @@ test "resolveSlugPath: full path, single-segment fallback, miss" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -124,7 +124,7 @@ test "buildCanonicalSlugPath: composes path from cat + parent chain" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const child_id = try category.createCategory(db, top_id, "Child", "child", "");
@@ -138,35 +138,35 @@ test "resolveSlugPath: returns id for queue-empty fast path (steady state)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
     try std.testing.expectEqual(top_id, (try resolveSlugPath(db, "top")).?);
-    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entry_count);
+    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entry_count);
 }
 
 test "resolveSlugPath: validation gate hides orphans during repair window" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const a_id = try category.createCategory(db, top_id, "A", "a", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var v: [8]u8 = codec.encodeU64(a_id);
-    try db.categories_by_slug_path.insert("top/old-a", &v);
+    try db.categories_by_slug_path().insert("top/old-a", &v);
 
     try std.testing.expectEqual(a_id, (try resolveSlugPath(db, "top/old-a")).?);
 
     var task = schema.RepairTask{ .cat_id = a_id, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
-    try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));
+    try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
 
     try std.testing.expect((try resolveSlugPath(db, "top/old-a")) == null);
     try std.testing.expectEqual(a_id, (try resolveSlugPath(db, "top/a")).?);

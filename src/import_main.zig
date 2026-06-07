@@ -1,5 +1,5 @@
 const std = @import("std");
-const Database = @import("database.zig").Database;
+const Directory = @import("directory.zig").Directory;
 const operations = @import("operations/operations.zig");
 const Config = @import("main.zig").Config;
 const snapshot = @import("snapshot.zig");
@@ -41,7 +41,7 @@ fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn importCategories(
-    db: *Database,
+    db: *Directory,
     allocator: std.mem.Allocator,
     path_to_id: *std.StringHashMap(u64),
     tsv_path: []const u8,
@@ -95,7 +95,7 @@ fn importCategories(
 }
 
 fn importLinks(
-    db: *Database,
+    db: *Directory,
     allocator: std.mem.Allocator,
     path_to_id: *std.StringHashMap(u64),
     tsv_path: []const u8,
@@ -143,7 +143,7 @@ fn importLinks(
                 log.warn("forceSnapshot failed: {}", .{e});
                 break :blk snapshot.SnapshotResult{ .wal_sequence = 0, .duration_ms = 0 };
             };
-            if (db.wal_writer) |*w| {
+            if (db.store.wal_writer) |*w| {
                 w.truncateAfterCheckpoint() catch |e| log.warn("wal truncate failed: {}", .{e});
             }
             log.info("  inserted {d} links (snapshot wal_seq={d} dur={d}ms)", .{ n_created, snap.wal_sequence, snap.duration_ms });
@@ -189,7 +189,7 @@ pub fn main() !void {
         .snapshot_interval_s = 3600,
     };
 
-    const db = try Database.init(allocator, config);
+    const db = try Directory.init(allocator, config);
     defer db.deinit();
     try db.recover();
 

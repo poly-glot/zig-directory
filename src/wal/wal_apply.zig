@@ -1,13 +1,13 @@
 const std = @import("std");
-const wal_replay = @import("wal_replay.zig");
+const zigstore = @import("zigstore");
 const changeset = @import("../changeset.zig");
 const apply_mod = @import("../apply/apply.zig");
-const Database = @import("../database.zig").Database;
+const Directory = @import("../directory.zig").Directory;
 
 pub const WalApplier = struct {
-    db: *Database,
+    db: *Directory,
 
-    pub fn apply(self: *WalApplier, entry: wal_replay.ReplayEntry) !void {
+    pub fn apply(self: *WalApplier, entry: zigstore.ReplayEntry) !void {
         switch (entry.op_code) {
             .changeset => {
                 var arena = std.heap.ArenaAllocator.init(self.db.allocator);
@@ -41,7 +41,7 @@ test "WAL replay re-derives subtree counts via cascade" {
     defer tmp.cleanup();
 
     const top_id_persisted: u64 = blk: {
-        var db = try Database.openTestInstance(allocator, &tmp);
+        var db = try Directory.openTestInstance(allocator, &tmp);
         defer db.deinitTestInstance();
 
         const top_id = try ops.createCategory(db, 0, "Top", "top", "");
@@ -54,13 +54,13 @@ test "WAL replay re-derives subtree counts via cascade" {
         var tampered = top;
         tampered.link_count_subtree = 0;
         const id_key = codec.encodeU64(top_id);
-        try db.categories_by_id.insert(&id_key, std.mem.asBytes(&tampered));
+        try db.categories_by_id().insert(&id_key, std.mem.asBytes(&tampered));
 
         break :blk top_id;
     };
 
     {
-        var db = try Database.openTestInstance(allocator, &tmp);
+        var db = try Directory.openTestInstance(allocator, &tmp);
         defer db.deinitTestInstance();
 
         const top = (try ops.getCategory(db, top_id_persisted)).?;
