@@ -7,6 +7,7 @@ import {
   type Link,
 } from "../../lib/dmoz-client.ts";
 import { formatLongDateOrDash, pad7, safeHostname } from "../../lib/format.ts";
+import { safeHref } from "../../lib/url.ts";
 import Eyebrow from "../../components/common/Eyebrow/Eyebrow.tsx";
 import Hostname from "../../components/common/Hostname/Hostname.tsx";
 import Crumbs, { type Crumb } from "../../components/common/Crumbs/Crumbs.tsx";
@@ -78,10 +79,20 @@ export const handler = define.handlers<Data>({
       throw e;
     }
 
-    const [{ crumbs, categoryPath }, adjacent] = await Promise.all([
-      buildCrumbs(client, link.categoryId),
-      loadAdjacent(client, link.categoryId, link.id),
-    ]);
+    let crumbs: Crumb[] = [];
+    let categoryPath = "";
+    let adjacent: Link[] = [];
+    try {
+      const [built, adj] = await Promise.all([
+        buildCrumbs(client, link.categoryId),
+        loadAdjacent(client, link.categoryId, link.id),
+      ]);
+      crumbs = built.crumbs;
+      categoryPath = built.categoryPath;
+      adjacent = adj;
+    } catch (e) {
+      console.error("link page: crumbs/adjacent load failed:", e);
+    }
 
     ctx.state.title = link.title;
     if (link.description) ctx.state.description = link.description;
@@ -132,7 +143,12 @@ export default define.page<typeof handler>(function LinkDetailPage(props) {
             />
             {link.description ? <p class="lede">{link.description}</p> : null}
             <div class="row gap-16 mt-32 flex-wrap">
-              <a class="btn" href={link.url} target="_blank" rel="noopener">
+              <a
+                class="btn"
+                href={safeHref(link.url)}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
                 Visit site →
               </a>
               <a class="btn ghost" href={backHref}>Back to listings</a>

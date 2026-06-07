@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
+import { isHttpUrl } from "../../../lib/url.ts";
 import { formField } from "../../../lib/utils.ts";
 import CreatePageShell from "../../../components/admin/CreatePageShell/CreatePageShell.tsx";
 import CategoryPicker from "../../../islands/CategoryPicker.tsx";
@@ -76,7 +77,11 @@ export const handler = define.handlers<Data>({
           "Links can't live in a root category — pick a subcategory.";
       }
     }
-    if (!values.url) errors.url = "URL is required.";
+    if (!values.url) {
+      errors.url = "URL is required.";
+    } else if (!isHttpUrl(values.url)) {
+      errors.url = "Enter a valid http:// or https:// URL.";
+    }
     if (!values.title) errors.title = "Title is required.";
 
     if (Object.keys(errors).length > 0) {

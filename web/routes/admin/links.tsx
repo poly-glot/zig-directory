@@ -13,6 +13,7 @@ import {
   loadAdminContext,
 } from "../../lib/admin-context.ts";
 import { formField } from "../../lib/utils.ts";
+import { isHttpUrl } from "../../lib/url.ts";
 import LinkRow from "../../components/admin/AdminLinkRow/AdminLinkRow.tsx";
 import AdminTable from "../../components/admin/AdminTable/AdminTable.tsx";
 import AdminFilterChips from "../../components/admin/AdminFilterChips/AdminFilterChips.tsx";
@@ -182,6 +183,9 @@ async function applyAction(
       const title = formField(form, "title");
       const urlVal = formField(form, "url");
       if (title) updates.title = title;
+      if (urlVal && !isHttpUrl(urlVal)) {
+        return "Error: URL must be http:// or https://";
+      }
       if (urlVal) updates.url = urlVal;
       updates.description = formField(form, "description");
       await client.updateLink(id, updates);

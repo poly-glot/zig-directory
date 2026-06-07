@@ -121,14 +121,16 @@ export default function SiteHeader({ user, activeNav, invert = false }: Props) {
                 admin users — no separate top-level entry to avoid two
                 "Admin" affordances side-by-side in the nav. */
             }
-            {user ? <UserMenu user={user} /> : (
-              <NavLink
-                href="/auth/login"
-                label="Sign in"
-                id="login"
-                active={activeNav}
-              />
-            )}
+            {user
+              ? <UserMenu user={{ username: user.username, role: user.role }} />
+              : (
+                <NavLink
+                  href="/auth/login"
+                  label="Sign in"
+                  id="login"
+                  active={activeNav}
+                />
+              )}
             <a class={styles.submitBtn} href="/submit">
               Submit a link {ARROW}
             </a>

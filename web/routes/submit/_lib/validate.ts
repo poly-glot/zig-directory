@@ -4,20 +4,12 @@ import {
   type FormState,
   TITLE_MAX,
 } from "./types.ts";
-
-function isValidUrl(v: string): boolean {
-  try {
-    const u = new URL(v);
-    return u.protocol === "http:" || u.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
+import { isHttpUrl } from "../../../lib/url.ts";
 
 export function validateStep1(state: FormState): Record<string, string> {
   const errors: Record<string, string> = {};
   if (!state.url) errors.url = "URL is required.";
-  else if (!isValidUrl(state.url)) {
+  else if (!isHttpUrl(state.url)) {
     errors.url = "Enter a valid http:// or https:// URL.";
   }
   if (!state.title) errors.title = "Title is required.";
