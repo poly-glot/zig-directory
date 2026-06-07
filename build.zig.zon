@@ -4,7 +4,10 @@
     .fingerprint = 0xdb0bfb17443efa77,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
-        .zigstore = .{ .path = "../zigstore" },
+        .zigstore = .{
+            .url = "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.0.0.tar.gz",
+            .hash = "zigstore-1.0.0-Lu5Gj364BABnQB3K6b-1-wb2lFbU7yeC-FhfA4ESXk2u",
+        },
     },
     .paths = .{
         "build.zig",
