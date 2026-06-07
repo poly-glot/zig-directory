@@ -172,6 +172,7 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
 
 fn countTree(tree: *btree.BPlusTree, min_key: []const u8) !u64 {
     var iter = try tree.rangeScan(min_key, null);
+    defer iter.deinit();
     var count: u64 = 0;
     while (try iter.next()) |_| count += 1;
     return count;
@@ -179,6 +180,7 @@ fn countTree(tree: *btree.BPlusTree, min_key: []const u8) !u64 {
 
 fn treeNonEmpty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
     var iter = try tree.rangeScan(min_key, null);
+    defer iter.deinit();
     return (try iter.next()) != null;
 }
 
@@ -200,6 +202,7 @@ fn collectAllChildIds(db: *Directory, parent_id: u64) ![]u64 {
 fn countTops(db: *Directory) !u64 {
     const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id().rangeScan(&min_key, null);
+    defer iter.deinit();
     var n: u64 = 0;
     while (try iter.next()) |entry| {
         if (entry.value.len < @sizeOf(schema.Category)) continue;
@@ -211,14 +214,23 @@ fn countTops(db: *Directory) !u64 {
 
 fn countOrphans(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
-    const min_key = codec.encodeU64(0);
-    var iter = try db.categories_by_id().rangeScan(&min_key, null);
+
+    var parents: std.ArrayListUnmanaged(u64) = .{};
+    defer parents.deinit(db.allocator);
+    {
+        const min_key = codec.encodeU64(0);
+        var iter = try db.categories_by_id().rangeScan(&min_key, null);
+        defer iter.deinit();
+        while (try iter.next()) |entry| {
+            if (entry.value.len < @sizeOf(schema.Category)) continue;
+            const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+            if (cat.parent_id != 0) try parents.append(db.allocator, cat.parent_id);
+        }
+    }
+
     var orphans: u64 = 0;
-    while (try iter.next()) |entry| {
-        if (entry.value.len < @sizeOf(schema.Category)) continue;
-        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
-        if (cat.parent_id == 0) continue;
-        const parent = ops.getCategory(db, cat.parent_id) catch null;
+    for (parents.items) |parent_id| {
+        const parent = ops.getCategory(db, parent_id) catch null;
         if (parent == null) orphans += 1;
     }
     return orphans;
@@ -229,6 +241,7 @@ const SubtreeComputed = struct { link_subtree: u64, child_subtree: u32 };
 fn findTopId(db: *Directory) !u64 {
     const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id().rangeScan(&min_key, null);
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         if (entry.value.len < @sizeOf(schema.Category)) continue;
         const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
@@ -242,6 +255,7 @@ fn tallyDirectLinks(db: *Directory) !std.AutoHashMap(u64, u32) {
     errdefer direct_links.deinit();
     const min_key: [16]u8 = .{0} ** 16;
     var iter = try db.link_by_category().rangeScan(&min_key, null);
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         if (entry.key.len < 8) continue;
         const cid = codec.decodeU64(entry.key[0..8]);
@@ -405,14 +419,18 @@ test "verifier: tampered link_count surfaces drift on link_by_category invariant
     db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     {
-        const min_key: [16]u8 = .{0} ** 16;
-        var iter = try db.link_by_category().rangeScan(&min_key, null);
-        if (try iter.next()) |entry| {
-            const key = entry.key;
-            var key_copy: [16]u8 = undefined;
-            @memcpy(&key_copy, key[0..16]);
-            _ = try db.link_by_category().delete(&key_copy);
+        var key_copy: [16]u8 = undefined;
+        var found = false;
+        {
+            const min_key: [16]u8 = .{0} ** 16;
+            var iter = try db.link_by_category().rangeScan(&min_key, null);
+            defer iter.deinit();
+            if (try iter.next()) |entry| {
+                @memcpy(&key_copy, entry.key[0..16]);
+                found = true;
+            }
         }
+        if (found) _ = try db.link_by_category().delete(&key_copy);
     }
 
     var state = VerifierState{};

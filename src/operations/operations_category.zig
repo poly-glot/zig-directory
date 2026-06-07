@@ -185,6 +185,7 @@ pub fn listChildren(
     const max = @min(limit, @as(u32, @intCast(buf.len)));
 
     var iter = try db.cat_by_parent().rangeScan(&start_key, &end_key);
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         if (skipped < offset) {
             skipped += 1;
@@ -262,6 +263,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
     {
         const min_key: [16]u8 = .{0} ** 16;
         var iter = try db.link_by_category().rangeScan(&min_key, null);
+        defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.key.len < 8) continue;
             const cid = codec.decodeU64(entry.key[0..8]);
@@ -280,6 +282,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
     {
         const min_key: [16]u8 = .{0} ** 16;
         var iter = try db.cat_by_parent().rangeScan(&min_key, null);
+        defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) continue;
             const parent = codec.decodeU64(entry.key[0..8]);
@@ -295,6 +298,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
     {
         const min_key = codec.encodeU64(0);
         var iter = try db.categories_by_id().rangeScan(&min_key, null);
+        defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.value.len < @sizeOf(schema.Category)) continue;
             const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
@@ -357,6 +361,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
     {
         const min_key = codec.encodeU64(0);
         var iter = try db.categories_by_id().rangeScan(&min_key, null);
+        defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.value.len < @sizeOf(schema.Category)) continue;
             var cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);

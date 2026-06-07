@@ -62,6 +62,7 @@ fn searchTreeByToken(
         key_lo_buf[0 .. token.len + 8],
         key_hi_buf[0 .. token.len + 8],
     );
+    defer iter.deinit();
 
     var ids: std.ArrayListUnmanaged(u64) = .{};
     errdefer ids.deinit(allocator);

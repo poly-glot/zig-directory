@@ -87,6 +87,7 @@ pub fn collectDescendants(
         const cur = queue.pop().?;
         const start_key = schema.ParentChildKey.encode(.{ cur, 0 });
         var iter = try cat_by_parent.rangeScan(&start_key, null);
+        defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
             if (codec.decodeU64(entry.key[0..8]) != cur) break;
@@ -125,6 +126,7 @@ pub fn listSubtreeLinkIds(
     for (descendants) |cat_id| {
         const start_key = schema.CategoryLinkKey.encode(.{ cat_id, 0 });
         var iter = try link_by_category.rangeScan(&start_key, null);
+        defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
             if (codec.decodeU64(entry.key[0..8]) != cat_id) break;
@@ -177,6 +179,7 @@ pub fn listSubtreeLinkIdsScan(
 
     const min_key: [16]u8 = .{0} ** 16;
     var iter = try link_by_category.rangeScan(&min_key, null);
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         if (entry.key.len < 16) return error.Corrupted;
         const cat_id = codec.decodeU64(entry.key[0..8]);
@@ -210,6 +213,7 @@ pub fn countSubtreeLinks(
     var total: u64 = 0;
     const min_key: [16]u8 = .{0} ** 16;
     var iter = try link_by_category.rangeScan(&min_key, null);
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         if (entry.key.len < 16) continue;
         const cat_id = codec.decodeU64(entry.key[0..8]);

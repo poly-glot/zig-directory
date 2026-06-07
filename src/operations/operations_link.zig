@@ -186,6 +186,7 @@ pub fn recountLinkStatuses(db: *Directory) !void {
     var rejected: u64 = 0;
     const start_key = codec.encodeU64(0);
     var iter = try db.links_by_id().rangeScan(&start_key, null);
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         if (entry.value.len != @sizeOf(schema.Link)) continue;
         const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
@@ -264,6 +265,7 @@ fn paginateLinks(
     var last_id: u64 = 0;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
 
+    defer iter.deinit();
     while (try iter.next()) |entry| {
         const link = (try resolve(db, entry.value)) orelse continue;
         if (status_filter) |s| if (link.status != s) continue;

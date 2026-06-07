@@ -39,6 +39,7 @@ const QueuedTask = struct {
 fn peekMin(db: *Directory) !?QueuedTask {
     const start_key = [_]u8{0} ** 8;
     var iter = try db.slug_path_repair_queue().rangeScan(&start_key, null);
+    defer iter.deinit();
     if (try iter.next()) |entry| {
         if (entry.value.len < @sizeOf(schema.RepairTask)) return null;
         if (entry.key.len < 8) return null;

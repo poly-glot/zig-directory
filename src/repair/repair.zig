@@ -2,6 +2,7 @@ const std = @import("std");
 const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
+const operations = @import("../operations/operations.zig");
 const operations_slug = @import("../operations/operations_slug.zig");
 const inverted = @import("zigstore").inverted_index;
 const repair_worker = @import("repair_worker.zig");
@@ -56,17 +57,26 @@ fn rebuildCategoryIndices(db: *Directory) !u64 {
         slug_best.deinit();
     }
 
-    var written: u64 = 0;
+    var cat_ids: std.ArrayListUnmanaged(u64) = .{};
+    defer cat_ids.deinit(db.allocator);
+    {
+        const min_key = codec.encodeU64(0);
+        var iter = try db.categories_by_id().rangeScan(&min_key, null);
+        defer iter.deinit();
+        while (try iter.next()) |entry| {
+            if (entry.value.len != @sizeOf(schema.Category)) continue;
+            const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+            try cat_ids.append(db.allocator, cat.id);
+        }
+    }
 
-    const min_key = codec.encodeU64(0);
-    var iter = try db.categories_by_id().rangeScan(&min_key, null);
+    var written: u64 = 0;
     var path_buf: [2048]u8 = undefined;
     var key_buf: [4096]u8 = undefined;
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
 
-    while (try iter.next()) |entry| {
-        if (entry.value.len != @sizeOf(schema.Category)) continue;
-        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+    for (cat_ids.items) |cat_id| {
+        const cat = (try operations.getCategory(db, cat_id)) orelse continue;
         const id_key = codec.encodeU64(cat.id);
 
         const slug = cat.slug.slice();
@@ -126,6 +136,7 @@ fn rebuildLinkIndex(db: *Directory) !u64 {
 
     const min_key = codec.encodeU64(0);
     var iter = try db.links_by_id().rangeScan(&min_key, null);
+    defer iter.deinit();
     var key_buf: [4096]u8 = undefined;
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
 
@@ -240,6 +251,7 @@ test "rebuildAllIndices: stale token entry removed and re-added" {
 
     try std.testing.expect((try db.categories_index_tree().search(&stale_key, &v_buf)) == null);
     var prefix_iter = try db.categories_index_tree().rangeScan(stale_tok, null);
+    defer prefix_iter.deinit();
     var found_legit = false;
     while (try prefix_iter.next()) |e| {
         if (e.key.len < stale_tok.len) break;
