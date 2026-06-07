@@ -1,36 +1,26 @@
 const std = @import("std");
-const Database = @import("../database.zig").Database;
+const Directory = @import("../directory.zig").Directory;
 const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
 const operations = @import("../operations/operations.zig");
 
 const log = std.log.scoped(.repair_worker);
 
-pub fn loop(db: *Database) void {
-    while (!db.repair_worker_shutdown.load(.acquire)) {
-        std.Thread.sleep(@as(u64, db.config.repair_worker_interval_ms) * std.time.ns_per_ms);
-        if (db.repair_worker_shutdown.load(.acquire)) break;
-        tickOnce(db) catch |err| {
-            log.warn("tick failed: {}", .{err});
-        };
-    }
-}
-
-pub fn tickOnce(db: *Database) !void {
+pub fn tickOnce(db: *Directory) !void {
     db.repair_worker_mutex.lock();
     defer db.repair_worker_mutex.unlock();
 
     const max_tasks = db.config.repair_worker_max_tasks_per_tick;
     var processed: u32 = 0;
     while (processed < max_tasks) : (processed += 1) {
-        if (db.slug_path_repair_queue.entryCount() == 0) break;
+        if (db.slug_path_repair_queue().entryCount() == 0) break;
         const task = (try peekMin(db)) orelse break;
         try processTask(db, task);
     }
 
     db.repair_worker_last_tick_ms.store(std.time.milliTimestamp(), .release);
 
-    const depth = db.slug_path_repair_queue.entryCount();
+    const depth = db.slug_path_repair_queue().entryCount();
     if (depth >= 10000) {
         log.warn("queue depth {d} >= 10000; drain may be falling behind", .{depth});
     } else if (depth >= 1000) {
@@ -45,9 +35,9 @@ const QueuedTask = struct {
     task: schema.RepairTask,
 };
 
-fn peekMin(db: *Database) !?QueuedTask {
+fn peekMin(db: *Directory) !?QueuedTask {
     const start_key = [_]u8{0} ** 8;
-    var iter = try db.slug_path_repair_queue.rangeScan(&start_key, null);
+    var iter = try db.slug_path_repair_queue().rangeScan(&start_key, null);
     if (try iter.next()) |entry| {
         if (entry.value.len < @sizeOf(schema.RepairTask)) return null;
         if (entry.key.len < 8) return null;
@@ -60,7 +50,7 @@ fn peekMin(db: *Database) !?QueuedTask {
 
 const WalkFrame = struct { id: u64, child_offset: u32 };
 
-fn processTask(db: *Database, qt: QueuedTask) !void {
+fn processTask(db: *Directory, qt: QueuedTask) !void {
     const t0 = std.time.milliTimestamp();
     var chunks: u32 = 0;
 
@@ -87,7 +77,7 @@ fn processTask(db: *Database, qt: QueuedTask) !void {
     });
 }
 
-pub fn processOneChunk(db: *Database) !void {
+pub fn processOneChunk(db: *Directory) !void {
     const qt = (try peekMin(db)) orelse return;
     if ((try operations.getCategory(db, qt.task.cat_id)) == null) {
         try db.commit(changeset.ChangeSet{ .slug_path_repair_complete = .{ .seq = qt.seq } });
@@ -101,7 +91,7 @@ pub fn processOneChunk(db: *Database) !void {
 }
 
 fn processChunk(
-    db: *Database,
+    db: *Directory,
     qt: QueuedTask,
     stack: *std.ArrayList(WalkFrame),
     stack_alloc: std.mem.Allocator,
@@ -138,7 +128,7 @@ fn processChunk(
                 if (d_new_opt) |d_new| {
                     if (!std.mem.eql(u8, d_old, d_new)) {
                         var v_buf: [16]u8 = undefined;
-                        const at_old = (try db.categories_by_slug_path.search(d_old, &v_buf)) != null;
+                        const at_old = (try db.categories_by_slug_path().search(d_old, &v_buf)) != null;
                         if (at_old) {
                             try swaps.append(sa, .{
                                 .old_path = try sa.dupe(u8, d_old),
@@ -165,7 +155,7 @@ fn processChunk(
     return true;
 }
 
-fn commitSwaps(db: *Database, seq: u64, swaps: []const changeset.SlugPathSwap) !void {
+fn commitSwaps(db: *Directory, seq: u64, swaps: []const changeset.SlugPathSwap) !void {
     try db.commit(changeset.ChangeSet{ .slug_path_repair_chunk = .{
         .task_seq = seq,
         .swaps = swaps,
@@ -174,7 +164,7 @@ fn commitSwaps(db: *Database, seq: u64, swaps: []const changeset.SlugPathSwap) !
 }
 
 fn composeOldPath(
-    db: *Database,
+    db: *Directory,
     old_root_path: []const u8,
     root_id: u64,
     descendant_id: u64,
@@ -214,7 +204,7 @@ test "repair_worker: drains a single queued task end-to-end" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
     db.config.rename_inline_threshold = 1;
 
@@ -223,36 +213,36 @@ test "repair_worker: drains a single queued task end-to-end" {
     const parent_id = try ops.createCategory(db, top_id, "P", "old", "");
     _ = try ops.createCategory(db, parent_id, "C1", "c1", "");
     _ = try ops.createCategory(db, parent_id, "C2", "c2", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try ops.updateCategory(db, parent_id, null, "new", null);
-    try std.testing.expect(db.slug_path_repair_queue.entry_count > 0);
+    try std.testing.expect(db.slug_path_repair_queue().entry_count > 0);
 
     try tickOnce(db);
 
-    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entry_count);
+    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entry_count);
 
     var v_buf: [16]u8 = undefined;
-    try std.testing.expect((try db.categories_by_slug_path.search("top/old/c1", &v_buf)) == null);
-    try std.testing.expect((try db.categories_by_slug_path.search("top/new/c1", &v_buf)) != null);
+    try std.testing.expect((try db.categories_by_slug_path().search("top/old/c1", &v_buf)) == null);
+    try std.testing.expect((try db.categories_by_slug_path().search("top/new/c1", &v_buf)) != null);
 }
 
 test "repair_worker: handles cat deleted before drain" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var task = schema.RepairTask{ .cat_id = 9999, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
-    try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));
+    try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
 
     try tickOnce(db);
 
-    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entry_count);
+    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entry_count);
 }
 
 test "repair_worker: idempotent across simulated mid-walk crash" {
@@ -261,7 +251,7 @@ test "repair_worker: idempotent across simulated mid-walk crash" {
     defer tmp.cleanup();
 
     {
-        var db = try Database.openTestInstance(allocator, &tmp);
+        var db = try Directory.openTestInstance(allocator, &tmp);
         defer db.deinitTestInstance();
         db.config.rename_inline_threshold = 1;
         db.config.repair_worker_chunk_size = 1;
@@ -271,18 +261,18 @@ test "repair_worker: idempotent across simulated mid-walk crash" {
         const parent_id = try ops.createCategory(db, top_id, "P", "old", "");
         _ = try ops.createCategory(db, parent_id, "C1", "c1", "");
         _ = try ops.createCategory(db, parent_id, "C2", "c2", "");
-        db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-        db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+        db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+        db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
         try ops.updateCategory(db, parent_id, null, "new", null);
         try processOneChunk(db);
     }
 
     {
-        var db = try Database.openTestInstance(allocator, &tmp);
+        var db = try Directory.openTestInstance(allocator, &tmp);
         defer db.deinitTestInstance();
         try tickOnce(db);
-        try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entry_count);
+        try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entry_count);
     }
 }
 
@@ -290,7 +280,7 @@ test "repair_worker: multi-chunk resumable walk repairs every descendant" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
     db.config.rename_inline_threshold = 5;
     db.config.repair_worker_chunk_size = 7;
@@ -305,14 +295,14 @@ test "repair_worker: multi-chunk resumable walk repairs every descendant" {
         const child = try ops.createCategory(db, parent_id, "x", slug, "");
         if (i == 0) _ = try ops.createCategory(db, child, "GC", "gc", "");
     }
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try ops.updateCategory(db, parent_id, null, "new", null);
-    try std.testing.expect(db.slug_path_repair_queue.entryCount() > 0);
+    try std.testing.expect(db.slug_path_repair_queue().entryCount() > 0);
 
     try tickOnce(db);
-    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue.entryCount());
+    try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entryCount());
 
     var j: u32 = 0;
     while (j < 30) : (j += 1) {

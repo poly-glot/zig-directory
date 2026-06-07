@@ -71,7 +71,7 @@ pub const SubtreeCache = struct {
 };
 
 pub fn collectDescendants(
-    cat_by_parent: *btree.BPlusTree,
+    cat_by_parent: anytype,
     root: u64,
     allocator: std.mem.Allocator,
 ) ![]u64 {
@@ -112,7 +112,7 @@ pub const SubtreeLinkPage = struct {
 };
 
 pub fn listSubtreeLinkIds(
-    link_by_category: *btree.BPlusTree,
+    link_by_category: anytype,
     descendants: []const u64,
     offset: u32,
     limit: u32,
@@ -149,7 +149,7 @@ pub fn listSubtreeLinkIds(
 }
 
 pub fn collectDescendantsCached(
-    cat_by_parent: *btree.BPlusTree,
+    cat_by_parent: anytype,
     root: u64,
     cache: *SubtreeCache,
     allocator: std.mem.Allocator,
@@ -161,7 +161,7 @@ pub fn collectDescendantsCached(
 }
 
 pub fn listSubtreeLinkIdsScan(
-    link_by_category: *btree.BPlusTree,
+    link_by_category: anytype,
     descendants: []const u64,
     offset: u32,
     limit: u32,
@@ -202,7 +202,7 @@ pub fn listSubtreeLinkIdsScan(
 }
 
 pub fn countSubtreeLinks(
-    link_by_category: *btree.BPlusTree,
+    link_by_category: anytype,
     descendants: []const u64,
     allocator: std.mem.Allocator,
 ) !u64 {

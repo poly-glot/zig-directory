@@ -3,7 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const conn_mod = @import("connection.zig");
 const signal = @import("signal.zig");
-const Database = @import("database.zig").Database;
+const Directory = @import("directory.zig").Directory;
 const Config = @import("main.zig").Config;
 const binary_protocol = @import("binary_protocol.zig");
 
@@ -18,7 +18,7 @@ const CONNECTION_TIMEOUT_S: i64 = 30;
 
 pub const EpollServer = struct {
     allocator: std.mem.Allocator,
-    db: *Database,
+    db: *Directory,
     config: Config,
     epoll_fd: posix.fd_t,
     listen_fd: posix.fd_t,
@@ -39,7 +39,7 @@ pub const EpollServer = struct {
 
     const Self = @This();
 
-    pub fn createMulti(allocator: std.mem.Allocator, db: *Database, config: Config, count: u32) ![]*Self {
+    pub fn createMulti(allocator: std.mem.Allocator, db: *Directory, config: Config, count: u32) ![]*Self {
         const reactors = try allocator.alloc(*Self, count);
         errdefer allocator.free(reactors);
         for (reactors, 0..) |*rp, i| {
@@ -48,11 +48,11 @@ pub const EpollServer = struct {
         return reactors;
     }
 
-    pub fn create(allocator: std.mem.Allocator, db: *Database, config: Config) !*Self {
+    pub fn create(allocator: std.mem.Allocator, db: *Directory, config: Config) !*Self {
         return createOne(allocator, db, config, true);
     }
 
-    fn createOne(allocator: std.mem.Allocator, db: *Database, config: Config, register_shutdown: bool) !*Self {
+    fn createOne(allocator: std.mem.Allocator, db: *Directory, config: Config, register_shutdown: bool) !*Self {
         const listen_fd = try posix.socket(
             posix.AF.INET,
             @as(u32, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC),

@@ -17,7 +17,7 @@ pub fn forceSnapshot(db: anytype) !SnapshotResult {
 
     const start_ns = std.time.nanoTimestamp();
 
-    const wal_seq: u64 = if (db.wal_writer) |*w| w.getSequence() else 0;
+    const wal_seq: u64 = if (db.store.wal_writer) |*w| w.getSequence() else 0;
 
     var mgr = SnapshotManager.init(db.config.data_dir, 0);
     try mgr.createSnapshot(db, wal_seq);
@@ -68,10 +68,10 @@ pub const SnapshotManager = struct {
         {
             db.apply_mutex.lock();
             defer db.apply_mutex.unlock();
-            db.mt_drain_mutex.lock();
-            defer db.mt_drain_mutex.unlock();
+            db.store.mt_drain_mutex.lock();
+            defer db.store.mt_drain_mutex.unlock();
 
-            try db.cache.flushAll();
+            try db.store.cache.flushAll();
             try db.flushHeader();
         }
 
@@ -80,7 +80,7 @@ pub const SnapshotManager = struct {
         const snap_header = SnapshotHeader{
             .wal_sequence = wal_sequence,
             .timestamp = now,
-            .page_count = db.header.page_count,
+            .page_count = @intCast(db.store.header.page_count),
         };
 
         const tmp_path = try std.fs.path.join(std.heap.page_allocator, &.{ self.data_dir, "snapshot.meta.tmp" });
