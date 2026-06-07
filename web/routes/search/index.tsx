@@ -14,7 +14,6 @@ import {
   computeCategoryFacet,
   computeYearFacet,
 } from "./_lib/facets.ts";
-import { loadAncestorMap } from "./_lib/ancestors.ts";
 import type { Facets, Sort } from "./_lib/types.ts";
 import Hero from "../../components/search/Hero/Hero.tsx";
 import ResultsBody from "../../components/search/ResultsBody/ResultsBody.tsx";
@@ -51,14 +50,13 @@ async function buildSearchResult(
 ): Promise<Data> {
   const client = getClient();
   const rawResults = await client.search(q, { limit: 50 });
-  const ancestors = await loadAncestorMap(
-    client,
-    rawResults.links.map((l) => l.categoryId),
-    rawResults.categories,
-  );
+  const crumbIds = new Set<number>();
+  for (const c of rawResults.categories) crumbIds.add(c.id);
+  for (const l of rawResults.links) crumbIds.add(l.categoryId);
+  const chains = await client.breadcrumbsByIds([...crumbIds]);
   const categoryPaths: Record<number, string> = {};
   for (const c of rawResults.categories) {
-    categoryPaths[c.id] = buildPathLabel(c.id, ancestors);
+    categoryPaths[c.id] = buildPathLabel(c.id, chains);
   }
   const filteredLinks = applySort(
     applyFilters(rawResults.links, cat, year),
@@ -67,7 +65,7 @@ async function buildSearchResult(
   const facets: Facets = {
     categories: computeCategoryFacet(
       rawResults.links,
-      ancestors,
+      chains,
       q,
       sort,
       year,

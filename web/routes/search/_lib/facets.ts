@@ -1,4 +1,4 @@
-import type { Category, Link } from "../../../lib/dmoz-client.ts";
+import type { Crumb, Link } from "../../../lib/dmoz-client.ts";
 import { formatCategoryName } from "../../../lib/format.ts";
 import { buildHref } from "./queryParams.ts";
 import type { FacetItem, Sort, YearItem } from "./types.ts";
@@ -8,34 +8,26 @@ const FACET_LIMIT = 100;
 const MAX_PATH_SEGMENTS = 4;
 
 /**
- * Build a breadcrumb-style label for a category id by walking its parent
- * chain (e.g. `Arts › Visual_Arts › Drawing`). The canonical root ("Top")
- * is skipped so callers don't see it in the UI. `ancestors` must hold the
- * full chain from the route handler. Long chains are truncated with `…`
- * in the middle so deep DMOZ paths stay readable in the sidebar.
+ * Build a breadcrumb-style label from a category's root→leaf chain (e.g.
+ * `Arts › Visual_Arts › Drawing`). The canonical root ("Top") is skipped so
+ * callers don't see it in the UI. Long chains are truncated with `…` in the
+ * middle so deep DMOZ paths stay readable in the sidebar.
  */
 export function buildPathLabel(
   id: number,
-  ancestors: Map<number, Category>,
+  chains: Map<number, Crumb[]>,
 ): string {
-  const chain: string[] = [];
-  let cur = ancestors.get(id);
-  let guard = 0;
-  while (cur && guard++ < 16) {
-    chain.unshift(formatCategoryName(cur.name));
-    if (cur.parentId === 0) break;
-    cur = ancestors.get(cur.parentId);
-  }
-  if (chain.length > 0 && chain[0].toLowerCase() === "top") chain.shift();
-  if (chain.length <= MAX_PATH_SEGMENTS) return chain.join(" › ");
+  const names = (chains.get(id) ?? []).map((c) => formatCategoryName(c.name));
+  if (names.length > 0 && names[0].toLowerCase() === "top") names.shift();
+  if (names.length <= MAX_PATH_SEGMENTS) return names.join(" › ");
   // Keep the first (taxonomy context) and the last 2 (distinguishing
   // leaves — many DMOZ subtrees share a deep ancestor but diverge near
   // the bottom).
   return [
-    chain[0],
+    names[0],
     "…",
-    chain[chain.length - 2],
-    chain[chain.length - 1],
+    names[names.length - 2],
+    names[names.length - 1],
   ].join(" › ");
 }
 
@@ -65,7 +57,7 @@ export function applySort(links: Link[], sort: Sort): Link[] {
 
 export function computeCategoryFacet(
   links: Link[],
-  ancestors: Map<number, Category>,
+  chains: Map<number, Crumb[]>,
   q: string,
   sort: Sort,
   year: number,
@@ -77,11 +69,12 @@ export function computeCategoryFacet(
   }
   const items: FacetItem[] = [];
   for (const [id, count] of counts) {
-    const cur = ancestors.get(id);
-    if (!cur) continue;
+    const chain = chains.get(id);
+    if (!chain || chain.length === 0) continue;
     items.push({
       id,
-      label: buildPathLabel(id, ancestors) || formatCategoryName(cur.name),
+      label: buildPathLabel(id, chains) ||
+        formatCategoryName(chain[chain.length - 1].name),
       count,
       href: buildHref({ q, sort }, { cat: id, year }),
       active: id === activeCat,

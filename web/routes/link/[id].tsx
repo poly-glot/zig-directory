@@ -1,11 +1,6 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
-import {
-  type Category,
-  DmozError,
-  getClient,
-  type Link,
-} from "../../lib/dmoz-client.ts";
+import { DmozError, getClient, type Link } from "../../lib/dmoz-client.ts";
 import { formatLongDateOrDash, pad7, safeHostname } from "../../lib/format.ts";
 import { safeHref } from "../../lib/url.ts";
 import Eyebrow from "../../components/common/Eyebrow/Eyebrow.tsx";
@@ -29,18 +24,10 @@ async function buildCrumbs(
   client: ReturnType<typeof getClient>,
   startCategoryId: number,
 ): Promise<{ crumbs: Crumb[]; categoryPath: string }> {
-  // Intrinsically serial: each step's parentId is only known after the
-  // previous getCategory returns. The path is unknown at start so we
-  // can't use browsePath here either. Depth-bounded (DMOZ caps at ~6).
-  const ancestors: Category[] = [];
-  let cur: Category | null = await client.getCategory(startCategoryId);
-  while (cur) {
-    ancestors.unshift(cur);
-    if (cur.parentId === 0 || cur.parentId === cur.id) break;
-    cur = await client.getCategory(cur.parentId);
-  }
-  const slugs = ancestors.map((a) => a.slug || String(a.id));
-  const crumbs = ancestors.map((a, i) => ({
+  const chains = await client.breadcrumbsByIds([startCategoryId]);
+  const chain = chains.get(startCategoryId) ?? [];
+  const slugs = chain.map((a) => a.slug || String(a.id));
+  const crumbs = chain.map((a, i) => ({
     name: a.name,
     href: `/category/${slugs.slice(0, i + 1).join("/")}`,
   }));

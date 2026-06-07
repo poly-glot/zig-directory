@@ -38,6 +38,9 @@ const REQUEST_TIMEOUT_MS = 10_000;
 /** Server cap on a single get_categories_by_ids request. */
 export const GET_CATEGORIES_BY_IDS_MAX = 200;
 
+/** Server cap on a single breadcrumbs_by_ids request. */
+export const BREADCRUMBS_BY_IDS_MAX = 200;
+
 /** Bit 0 of Category.flags: category was reattached after orphan recovery. */
 export const FLAG_ORPHAN_RECOVERED = 0x01;
 
@@ -59,6 +62,13 @@ export interface BrowseResult {
   ancestors: Category[];
   children: Category[];
   totalLinksInSubtree: number;
+}
+
+/** One node of a breadcrumb chain: id + raw (unformatted) name + slug segment. */
+export interface Crumb {
+  id: number;
+  name: string;
+  slug: string;
 }
 
 /** A search-hit link carries which field matched: 0=title, 1=url, 2=description. */
@@ -501,6 +511,37 @@ export class DmozClient {
       this.assertOk(resp);
       const r = new BufferReader(resp.payload);
       for (let n = 0; n < resp.count; n++) out.push(readCategory(r));
+    }
+    return out;
+  }
+
+  /**
+   * Resolve the root→leaf breadcrumb chain (inclusive of each queried id) for
+   * many category ids in one call. Returns a map keyed by the requested id; an
+   * unresolved id maps to an empty chain. Replaces client-side parent-chain
+   * walking — the server owns hierarchy.
+   */
+  async breadcrumbsByIds(ids: number[]): Promise<Map<number, Crumb[]>> {
+    const out = new Map<number, Crumb[]>();
+    for (let i = 0; i < ids.length; i += BREADCRUMBS_BY_IDS_MAX) {
+      const chunk = ids.slice(i, i + BREADCRUMBS_BY_IDS_MAX);
+      const w = new BufferWriter().u16(chunk.length);
+      for (const id of chunk) w.u64(id);
+      const resp = await this.request(Op.BreadcrumbsByIds, w.build());
+      this.assertOk(resp);
+      const r = new BufferReader(resp.payload);
+      for (let g = 0; g < resp.count; g++) {
+        const len = r.u16();
+        const chain: Crumb[] = [];
+        for (let c = 0; c < len; c++) {
+          chain.push({
+            id: r.u64(),
+            name: r.fixedString(64),
+            slug: r.fixedString(128),
+          });
+        }
+        out.set(chunk[g], chain);
+      }
     }
     return out;
   }

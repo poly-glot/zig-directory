@@ -21,7 +21,6 @@ import AdminPaginator from "../../components/admin/AdminPaginator/AdminPaginator
 import AdminSearchBar from "../../islands/AdminSearchBar.tsx";
 import AdminBulkBar from "../../islands/AdminBulkBar.tsx";
 import AdminHintBanner from "../../islands/AdminHintBanner.tsx";
-import { loadAncestorMap } from "../search/_lib/ancestors.ts";
 
 /** Resolved Category-cell text for a link: leaf name + full "Top / … / leaf" path. */
 interface CategoryInfo {
@@ -38,19 +37,15 @@ async function loadCategoryInfo(
     ...new Set(links.map((l) => l.categoryId).filter((id) => id > 0)),
   ];
   if (ids.length === 0) return {};
-  const map = await loadAncestorMap(client, ids);
+  const chains = await client.breadcrumbsByIds(ids);
   const out: Record<number, CategoryInfo> = {};
   for (const id of ids) {
-    const names: string[] = [];
-    let cur = id;
-    for (let i = 0; i < 16 && cur > 0; i++) {
-      const c = map.get(cur);
-      if (!c) break;
-      names.unshift(c.name);
-      cur = c.parentId;
-    }
-    if (names.length > 0) {
-      out[id] = { name: names[names.length - 1], path: names.join(" / ") };
+    const chain = chains.get(id) ?? [];
+    if (chain.length > 0) {
+      out[id] = {
+        name: chain[chain.length - 1].name,
+        path: chain.map((c) => c.name).join(" / "),
+      };
     }
   }
   return out;

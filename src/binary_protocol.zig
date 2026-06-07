@@ -88,6 +88,7 @@ pub const Op = enum(u8) {
     list_links_by_submitter = 27,
     move_link = 28,
     get_categories_by_ids = 29,
+    breadcrumbs_by_ids = 30,
     bulk_update_link_status = 34,
     bulk_delete_links = 35,
     counts_by_status = 36,
@@ -95,6 +96,8 @@ pub const Op = enum(u8) {
 };
 
 pub const GET_CATEGORIES_BY_IDS_MAX: u16 = 200;
+pub const BREADCRUMBS_BY_IDS_MAX: u16 = 200;
+const CRUMB_SIZE: usize = 8 + @sizeOf(@FieldType(schema.Category, "name")) + @sizeOf(@FieldType(schema.Category, "slug"));
 
 pub const RESPONSE_RESERVE: usize = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(schema.Category);
 
@@ -232,6 +235,7 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
         .get_link => handleGet(schema.Link, db, resp, op_byte, payload, operations.getLink),
         .get_category => handleGet(schema.Category, db, resp, op_byte, payload, operations.getCategory),
         .get_categories_by_ids => handleGetCategoriesByIds(db, resp, op_byte, payload),
+        .breadcrumbs_by_ids => handleBreadcrumbsByIds(db, resp, op_byte, payload),
         .delete_link => handleDelete(db, resp, op_byte, payload, operations.deleteLink),
         .delete_category => handleDelete(db, resp, op_byte, payload, operations.deleteCategory),
         .update_category => handleBitmaskUpdate(operations.updateCategory, db, resp, op_byte, payload),
@@ -346,6 +350,58 @@ fn handleGetCategoriesByIds(
     }
 
     writeOkHeader(resp, op_byte, off, found);
+    return off;
+}
+
+fn writeCrumb(resp: []u8, off: usize, cat: schema.Category) usize {
+    var o = off;
+    std.mem.writeInt(u64, resp[o..][0..8], cat.id, .little);
+    o += 8;
+    const name_bytes = std.mem.asBytes(&cat.name);
+    @memcpy(resp[o..][0..name_bytes.len], name_bytes);
+    o += name_bytes.len;
+    const slug_bytes = std.mem.asBytes(&cat.slug);
+    @memcpy(resp[o..][0..slug_bytes.len], slug_bytes);
+    o += slug_bytes.len;
+    return o;
+}
+
+fn handleBreadcrumbsByIds(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    if (payload.len < 2) return writeErrorResp(resp, op_byte, .invalid);
+    const want: u16 = std.mem.readInt(u16, payload[0..2], .little);
+    if (want > BREADCRUMBS_BY_IDS_MAX) return writeErrorResp(resp, op_byte, .invalid);
+    if (payload.len < 2 + @as(usize, want) * 8) return writeErrorResp(resp, op_byte, .invalid);
+    if (resp.len < RESPONSE_HEADER_SIZE) return writeErrorResp(resp, op_byte, .err);
+
+    var off: usize = RESPONSE_HEADER_SIZE;
+    var groups: u16 = 0;
+    var i: usize = 0;
+    while (i < want) : (i += 1) {
+        if (off + 2 > resp.len) break;
+        const id = std.mem.readInt(u64, payload[2 + i * 8 ..][0..8], .little);
+
+        var anc_buf: [64]schema.Category = undefined;
+        const ancestors = operations.walkAncestors(db, id, &anc_buf) catch anc_buf[0..0];
+        const self_cat = operations.getCategory(db, id) catch null;
+
+        const len_off = off;
+        off += 2;
+        var written: u16 = 0;
+        if (self_cat) |sc| {
+            if (off + (ancestors.len + 1) * CRUMB_SIZE <= resp.len) {
+                for (ancestors) |a| {
+                    off = writeCrumb(resp, off, a);
+                    written += 1;
+                }
+                off = writeCrumb(resp, off, sc);
+                written += 1;
+            }
+        }
+        std.mem.writeInt(u16, resp[len_off..][0..2], written, .little);
+        groups += 1;
+    }
+
+    writeOkHeader(resp, op_byte, off, groups);
     return off;
 }
 
@@ -2304,6 +2360,63 @@ test "get_categories_by_ids (29): truncated payload returns invalid" {
     );
     try std.testing.expectEqual(@as(usize, RESPONSE_HEADER_SIZE), reply_len);
     try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+}
+
+test "breadcrumbs_by_ids (30): returns root->leaf inclusive chain per id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try operations.createCategory(db, 0, "Top", "top", "");
+    const arts = try operations.createCategory(db, top, "Arts", "arts", "");
+    const music = try operations.createCategory(db, arts, "Music", "music", "");
+
+    var payload: [2 + 8]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 1, .little);
+    std.mem.writeInt(u64, payload[2..][0..8], music, .little);
+
+    var resp: [8192]u8 = undefined;
+    const reply_len = handleBreadcrumbsByIds(db, &resp, @intFromEnum(Op.breadcrumbs_by_ids), &payload);
+
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[8..10], .little));
+
+    var off: usize = RESPONSE_HEADER_SIZE;
+    try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, resp[off..][0..2], .little));
+    off += 2;
+    try std.testing.expectEqual(top, std.mem.readInt(u64, resp[off..][0..8], .little));
+    off += CRUMB_SIZE;
+    try std.testing.expectEqual(arts, std.mem.readInt(u64, resp[off..][0..8], .little));
+    off += CRUMB_SIZE;
+    try std.testing.expectEqual(music, std.mem.readInt(u64, resp[off..][0..8], .little));
+    off += CRUMB_SIZE;
+    try std.testing.expectEqual(off, reply_len);
+}
+
+test "breadcrumbs_by_ids (30): unresolved id yields an empty group, preserving order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try operations.createCategory(db, 0, "Top", "top", "");
+
+    var payload: [2 + 16]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 2, .little);
+    std.mem.writeInt(u64, payload[2..][0..8], 999_999, .little);
+    std.mem.writeInt(u64, payload[10..][0..8], top, .little);
+
+    var resp: [8192]u8 = undefined;
+    _ = handleBreadcrumbsByIds(db, &resp, @intFromEnum(Op.breadcrumbs_by_ids), &payload);
+
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, resp[8..10], .little));
+    var off: usize = RESPONSE_HEADER_SIZE;
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, resp[off..][0..2], .little));
+    off += 2;
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[off..][0..2], .little));
 }
 
 fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {

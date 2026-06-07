@@ -34,6 +34,7 @@ export const enum Op {
   ListLinksBySubmitter = 27,
   MoveLink = 28,
   GetCategoriesByIds = 29,
+  BreadcrumbsByIds = 30,
   BulkUpdateLinkStatus = 34,
   BulkDeleteLinks = 35,
   CountsByStatus = 36,

@@ -46,21 +46,13 @@ async function loadView(
   return { categories, parentCategory };
 }
 
-/** Walk the parent_id chain leaf→root (depth-bounded) for the breadcrumb. */
 async function loadBreadcrumb(
   client: ReturnType<typeof getClient>,
   parentId: number,
 ): Promise<Crumb[]> {
   if (parentId === 0) return [];
-  const chain: Crumb[] = [];
-  let id = parentId;
-  for (let i = 0; i < 16 && id !== 0; i++) {
-    const cat = await client.getCategory(id).catch(() => null);
-    if (!cat) break;
-    chain.unshift({ id: cat.id, name: cat.name });
-    id = cat.parentId;
-  }
-  return chain;
+  const chains = await client.breadcrumbsByIds([parentId]);
+  return (chains.get(parentId) ?? []).map((c) => ({ id: c.id, name: c.name }));
 }
 
 async function applyAction(
