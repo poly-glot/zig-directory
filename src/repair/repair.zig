@@ -3,7 +3,7 @@ const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const operations_slug = @import("../operations/operations_slug.zig");
-const inverted = @import("../inverted_index.zig");
+const inverted = @import("zigstore").inverted_index;
 const repair_worker = @import("repair_worker.zig");
 
 const log = std.log.scoped(.repair);

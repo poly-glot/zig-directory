@@ -3,7 +3,7 @@ const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const changeset = @import("../changeset.zig");
-const inverted = @import("../inverted_index.zig");
+const inverted = @import("zigstore").inverted_index;
 const category = @import("operations_category.zig");
 const slug_mod = @import("operations_slug.zig");
 

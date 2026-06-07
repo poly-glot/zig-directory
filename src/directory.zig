@@ -1,6 +1,5 @@
 const std = @import("std");
 const zigstore = @import("zigstore");
-const bloom = @import("bloom.zig");
 const subtree_mod = @import("subtree.zig");
 const verifier = @import("verifier.zig");
 const changeset = @import("changeset.zig");
@@ -8,7 +7,6 @@ const apply_mod = @import("apply/apply.zig");
 const wal_apply = @import("wal/wal_apply.zig");
 const repair_worker = @import("repair/repair_worker.zig");
 const histogram = zigstore.histogram;
-const memtable = @import("memtable.zig");
 const binary_protocol = @import("binary_protocol.zig");
 const Config = @import("main.zig").Config;
 
@@ -66,7 +64,7 @@ pub const Directory = struct {
 
     subtree_cache: subtree_mod.SubtreeCache,
 
-    url_bloom: bloom.BloomFilter,
+    url_bloom: zigstore.BloomFilter,
 
     next_category_id: std.atomic.Value(u64),
     next_link_id: std.atomic.Value(u64),
@@ -189,7 +187,7 @@ pub const Directory = struct {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        var url_bloom = try bloom.BloomFilter.init(allocator, 1_000_000);
+        var url_bloom = try zigstore.BloomFilter.init(allocator, 1_000_000);
         errdefer url_bloom.deinit();
 
         const op_latency = blk: {
@@ -304,7 +302,7 @@ pub const Directory = struct {
     }
 
     fn drainOneInner(mt: *zigstore.MemTable, tree: *zigstore.BPlusTree) void {
-        const NUM_SHARDS = memtable.NUM_SHARDS;
+        const NUM_SHARDS = zigstore.MEMTABLE_SHARDS;
         mt.lockAll();
         var backs: [NUM_SHARDS]*zigstore.MemTable.Buffer = undefined;
         for (0..NUM_SHARDS) |i| backs[i] = mt.swapShardLocked(i);
@@ -330,7 +328,7 @@ pub const Directory = struct {
         }
 
         mt.lockAll();
-        for (0..memtable.NUM_SHARDS) |i| mt.resetShardBackLocked(i);
+        for (0..NUM_SHARDS) |i| mt.resetShardBackLocked(i);
         mt.unlockAll();
     }
 

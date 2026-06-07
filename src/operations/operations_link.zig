@@ -1,9 +1,8 @@
 const std = @import("std");
-const codec = @import("zigstore").codec;
+const zigstore = @import("zigstore");
+const codec = zigstore.codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
-const memtable = @import("../memtable.zig");
-const bloom = @import("../bloom.zig");
 const shared = @import("operations_shared.zig");
 const compute = @import("operations_changeset_compute.zig");
 const category = @import("operations_category.zig");
@@ -176,7 +175,7 @@ pub fn recountLinkStatuses(db: *Directory) !void {
     db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const bloom_capacity = @max(db.links_by_id().entry_count *| 2, 1_000_000);
-    const reseeded = bloom.BloomFilter.init(db.allocator, bloom_capacity) catch null;
+    const reseeded = zigstore.BloomFilter.init(db.allocator, bloom_capacity) catch null;
     if (reseeded) |new_bloom| {
         db.url_bloom.deinit();
         db.url_bloom = new_bloom;
@@ -621,7 +620,7 @@ test "createLink rollback: failure during secondary insert leaves no trace in pr
     const std_t = std.testing;
 
     const allocator = std_t.allocator;
-    var mt = memtable.MemTable.init(allocator);
+    var mt = zigstore.MemTable.init(allocator);
     defer mt.deinit();
 
     const k1 = codec.encodeU64(123);

@@ -691,7 +691,7 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
 
 const SearchScope = enum(u8) { both = 0, links_only = 1, categories_only = 2 };
 
-const inverted = @import("inverted_index.zig");
+const inverted = @import("zigstore").inverted_index;
 
 fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
