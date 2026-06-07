@@ -25,9 +25,9 @@ data/feedback/
 feedback/
 
 # Runtime database state — regenerated at runtime, must never ship in the
-# repo or image. The compressed seed dataset (data/dmozdb.dat.zip) is the
+# repo or image. The compressed seed dataset (data/store.dat.zip) is the
 # one intentionally-tracked file under data/.
-data/dmozdb.dat
+data/store.dat
 data/wal.bin
 data/*.hdr
 data/*.hdr.bak

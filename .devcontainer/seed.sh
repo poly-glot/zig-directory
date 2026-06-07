@@ -8,16 +8,16 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# 1) dmozdb directory DB — expand the tracked compressed snapshot. dmozdb loads
-#    dmozdb.dat directly; the WAL/snapshot files are recreated at runtime.
-if [ -f "$WORKSPACE/data/dmozdb.dat" ]; then
+# 1) dmozdb directory DB — expand the tracked compressed snapshot. The zigstore
+#    engine loads store.dat directly; the WAL/snapshot files are recreated at runtime.
+if [ -f "$WORKSPACE/data/store.dat" ]; then
   echo "[seed] dmozdb DB already present; skipping."
-elif [ -f "$WORKSPACE/data/dmozdb.dat.zip" ]; then
-  echo "[seed] expanding data/dmozdb.dat.zip -> data/dmozdb.dat ..."
-  unzip -q "$WORKSPACE/data/dmozdb.dat.zip" -d "$WORKSPACE/data"
+elif [ -f "$WORKSPACE/data/store.dat.zip" ]; then
+  echo "[seed] expanding data/store.dat.zip -> data/store.dat ..."
+  unzip -q "$WORKSPACE/data/store.dat.zip" -d "$WORKSPACE/data"
   echo "[seed] dmozdb DB seeded."
 else
-  echo "[seed] no data/dmozdb.dat.zip snapshot found; starting with an empty DB."
+  echo "[seed] no data/store.dat.zip snapshot found; starting with an empty DB."
 fi
 
 # 2) web user store — create a default admin so /admin is reachable in a fresh
