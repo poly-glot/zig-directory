@@ -1,17 +1,15 @@
 const std = @import("std");
-const types = @import("types.zig");
-const Database = @import("database.zig").Database;
-const Stats = @import("database.zig").Stats;
+const zigstore = @import("zigstore");
+const protocol = zigstore.protocol;
+const schema = @import("schema.zig");
+const Directory = @import("directory.zig").Directory;
 const operations = @import("operations/operations.zig");
-const conn_mod = @import("connection.zig");
 
 const log = std.log.scoped(.binary);
 
-pub const REQUEST_HEADER_SIZE: usize = 8;
+pub const RESPONSE_HEADER_SIZE: usize = protocol.RESPONSE_HEADER_SIZE;
 
-pub const RESPONSE_HEADER_SIZE: usize = 10;
-
-pub const HEADER_SIZE: usize = REQUEST_HEADER_SIZE;
+pub const HEADER_SIZE: usize = protocol.HEADER_SIZE;
 
 pub const Status = enum(u8) {
     ok = 0,
@@ -98,118 +96,34 @@ pub const Op = enum(u8) {
 
 pub const GET_CATEGORIES_BY_IDS_MAX: u16 = 200;
 
+pub const RESPONSE_RESERVE: usize = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(schema.Category);
+
+comptime {
+    if (RESPONSE_RESERVE > zigstore.connection.RESPONSE_BUF_SIZE) @compileError("RESPONSE_RESERVE exceeds the connection response buffer");
+}
+
 pub const BULK_IMPORT_MAX_BYTES: usize = 60 * 1024;
 pub const BULK_IMPORT_MAX_ITEMS: u32 = 50_000;
 pub const BULK_IMPORT_CHUNK: u32 = 500;
 
-fn ReadResult(comptime fields: []const struct { []const u8, type }) type {
-    var sf: [fields.len]std.builtin.Type.StructField = undefined;
-    for (fields, 0..) |f, i| {
-        sf[i] = .{
-            .name = @ptrCast(f[0]),
-            .type = f[1],
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(f[1]),
-        };
-    }
-    return @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = &sf,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
-}
-
-fn ParsedPayload(comptime fields: []const struct { []const u8, type }) type {
-    return struct {
-        result: ReadResult(fields),
-        rest: []const u8,
-    };
-}
-
-fn parsePayload(
-    comptime fields: []const struct { []const u8, type },
-    data: []const u8,
-) ?ParsedPayload(fields) {
-    var off: usize = 0;
-    var result: ReadResult(fields) = undefined;
-
-    inline for (fields) |f| {
-        const name: [:0]const u8 = @ptrCast(f[0]);
-        const T = f[1];
-
-        if (T == u64) {
-            if (off + 8 > data.len) return null;
-            @field(result, name) = std.mem.readInt(u64, data[off..][0..8], .little);
-            off += 8;
-        } else if (T == u32) {
-            if (off + 4 > data.len) return null;
-            @field(result, name) = std.mem.readInt(u32, data[off..][0..4], .little);
-            off += 4;
-        } else if (T == []const u8) {
-            if (off + 2 > data.len) return null;
-            const len = std.mem.readInt(u16, data[off..][0..2], .little);
-            off += 2;
-            if (off + len > data.len) return null;
-            @field(result, name) = data[off..][0..len];
-            off += len;
-        } else {
-            @compileError("parsePayload: unsupported type for field '" ++ f[0] ++ "'");
-        }
-    }
-
-    return .{ .result = result, .rest = data[off..] };
-}
-
-fn advancePayload(
-    comptime fields: []const struct { []const u8, type },
-    data: []const u8,
-) ?[]const u8 {
-    var off: usize = 0;
-    inline for (fields) |f| {
-        const T = f[1];
-        if (T == u64) {
-            if (off + 8 > data.len) return null;
-            off += 8;
-        } else if (T == u32) {
-            if (off + 4 > data.len) return null;
-            off += 4;
-        } else if (T == []const u8) {
-            if (off + 2 > data.len) return null;
-            const len = std.mem.readInt(u16, data[off..][0..2], .little);
-            off += 2;
-            if (off + len > data.len) return null;
-            off += len;
-        }
-    }
-    return data[off..];
-}
-
-fn writeResponseHeader(
-    buf: []u8,
-    total_len: u32,
-    op: u8,
-    status: Status,
-    sub_status: SubStatus,
-    count: u16,
-) void {
-    std.mem.writeInt(u32, buf[0..4], total_len, .little);
-    buf[4] = op;
-    buf[5] = @intFromEnum(status);
-    buf[6] = @intFromEnum(sub_status);
-    buf[7] = 0;
-    std.mem.writeInt(u16, buf[8..10], count, .little);
-}
+const parsePayload = protocol.parsePayload;
+const advancePayload = protocol.advancePayload;
+const readOptionalString = protocol.readOptionalString;
 
 fn writeResp(buf: []u8, op: u8, status: Status, count: u16, payload: []const u8) usize {
-    const total: usize = RESPONSE_HEADER_SIZE + payload.len;
-    if (buf.len < total) {
-        return 0;
-    }
-    writeResponseHeader(buf, @intCast(total), op, status, .none, count);
-    if (payload.len > 0) @memcpy(buf[RESPONSE_HEADER_SIZE..][0..payload.len], payload);
-    return total;
+    return protocol.writeResp(buf, op, baseStatus(status), count, payload);
+}
+
+fn writeRowList(comptime T: type, resp: []u8, op_byte: u8, items: []const T) usize {
+    return protocol.writeRowList(T, resp, op_byte, items);
+}
+
+fn writeOkHeader(resp: []u8, op_byte: u8, total_len: usize, count: u16) void {
+    protocol.writeOkHeader(resp, op_byte, @intCast(total_len), count);
+}
+
+fn writeRawHeader(resp: []u8, op_byte: u8, total_len: usize, status: Status, sub: SubStatus, count: u16) void {
+    protocol.writeRawHeader(resp, op_byte, @intCast(total_len), @intFromEnum(status), @intFromEnum(sub), count);
 }
 
 fn writeErrorResp(buf: []u8, op: u8, status: Status) usize {
@@ -217,18 +131,16 @@ fn writeErrorResp(buf: []u8, op: u8, status: Status) usize {
 }
 
 fn writeErrorRespSub(buf: []u8, op: u8, status: Status, sub: SubStatus) usize {
-    const total: u32 = @intCast(RESPONSE_HEADER_SIZE);
-    writeResponseHeader(buf, total, op, status, sub, 0);
-    return total;
+    return protocol.writeRawErrorResp(buf, op, @intFromEnum(status), @intFromEnum(sub));
+}
+
+fn baseStatus(status: Status) protocol.Status {
+    return @enumFromInt(@intFromEnum(status));
 }
 
 fn writeMappedError(buf: []u8, op: u8, err: anyerror) usize {
     const pair = mapErrorWithSubStatus(err);
     return writeErrorRespSub(buf, op, pair.status, pair.sub_status);
-}
-
-fn mapError(err: anyerror) Status {
-    return mapErrorWithSubStatus(err).status;
 }
 
 fn BatchCreateHandler(
@@ -237,7 +149,7 @@ fn BatchCreateHandler(
     comptime createFn: anytype,
 ) type {
     return struct {
-        fn handle(db: *Database, resp: []u8, payload: []const u8, count: u16) usize {
+        fn handle(db: *Directory, resp: []u8, payload: []const u8, count: u16) usize {
             const ITEM_BYTES: usize = 10;
             if (resp.len < RESPONSE_HEADER_SIZE) return 0;
 
@@ -286,7 +198,7 @@ fn BatchCreateHandler(
                 }
             }
 
-            writeResponseHeader(resp, @intCast(off), op_code, .ok, .none, written);
+            writeOkHeader(resp, op_code, off, written);
             return off;
         }
     };
@@ -309,76 +221,16 @@ const category_fields = &[_]struct { []const u8, type }{
 const CreateLinks = BatchCreateHandler(link_fields, @intFromEnum(Op.create_link), operations.createLink);
 const CreateCategories = BatchCreateHandler(category_fields, @intFromEnum(Op.create_category), operations.createCategory);
 
-const RESPONSE_RESERVE = RESPONSE_HEADER_SIZE + @as(usize, GET_CATEGORIES_BY_IDS_MAX) * @sizeOf(types.Category);
-
-fn pipelineHasRoom(resp_off: usize, buf_len: usize) bool {
-    return resp_off == 0 or buf_len - resp_off >= RESPONSE_RESERVE;
-}
-
-pub fn processFrames(
-    db: *Database,
-    conn: *conn_mod.Connection,
-) void {
-    const bp = conn.buf orelse return;
-    const data = bp.request_buf[0..conn.bytes_read];
-    var consumed: usize = 0;
-    var resp_off: usize = 0;
-
-    while (consumed + REQUEST_HEADER_SIZE <= data.len) {
-        if (!pipelineHasRoom(resp_off, bp.response_buf.len)) break;
-        if (resp_off + RESPONSE_HEADER_SIZE > bp.response_buf.len) break;
-
-        const frame = data[consumed..];
-        const total_len = std.mem.readInt(u32, frame[0..4], .little);
-
-        if (total_len > data.len - consumed) break;
-
-        const op_byte = frame[4];
-
-        if (total_len < REQUEST_HEADER_SIZE) {
-            resp_off += writeErrorResp(bp.response_buf[resp_off..], op_byte, .invalid);
-            consumed += REQUEST_HEADER_SIZE;
-            continue;
-        }
-
-        const count = std.mem.readInt(u16, frame[6..8], .little);
-        const payload = frame[REQUEST_HEADER_SIZE..total_len];
-
-        const op: Op = std.meta.intToEnum(Op, op_byte) catch {
-            resp_off += writeErrorResp(bp.response_buf[resp_off..], op_byte, .invalid);
-            consumed += total_len;
-            continue;
-        };
-
-        const t0 = std.time.nanoTimestamp();
-        const written = dispatch(db, op, op_byte, payload, count, bp.response_buf[resp_off..]);
-        const t1 = std.time.nanoTimestamp();
-        const dt: u64 = if (t1 > t0) @intCast(t1 - t0) else 0;
-        db.op_latency[op_byte].recordValue(dt);
-
-        if (written == 0) break;
-        resp_off += written;
-        consumed += total_len;
-    }
-
-    if (consumed > 0) {
-        const remaining = conn.bytes_read - consumed;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, bp.request_buf[0..remaining], bp.request_buf[consumed..conn.bytes_read]);
-        }
-        conn.bytes_read = remaining;
-    }
-
-    conn.response_len = resp_off;
-}
-
-fn dispatch(db: *Database, op: Op, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+    const op: Op = std.meta.intToEnum(Op, op_byte) catch {
+        return writeErrorResp(resp, op_byte, .invalid);
+    };
     return switch (op) {
         .ping => writeResp(resp, op_byte, .ok, 0, &.{}),
         .create_link => CreateLinks.handle(db, resp, payload, count),
         .create_category => CreateCategories.handle(db, resp, payload, count),
-        .get_link => handleGet(types.Link, db, resp, op_byte, payload, operations.getLink),
-        .get_category => handleGet(types.Category, db, resp, op_byte, payload, operations.getCategory),
+        .get_link => handleGet(schema.Link, db, resp, op_byte, payload, operations.getLink),
+        .get_category => handleGet(schema.Category, db, resp, op_byte, payload, operations.getCategory),
         .get_categories_by_ids => handleGetCategoriesByIds(db, resp, op_byte, payload),
         .delete_link => handleDelete(db, resp, op_byte, payload, operations.deleteLink),
         .delete_category => handleDelete(db, resp, op_byte, payload, operations.deleteCategory),
@@ -441,11 +293,11 @@ pub const ListSubtreeLinksRequest = struct {
 
 fn handleGet(
     comptime T: type,
-    db: *Database,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
-    comptime getter: fn (*Database, u64) anyerror!?T,
+    comptime getter: fn (*Directory, u64) anyerror!?T,
 ) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
@@ -458,7 +310,7 @@ fn handleGet(
 }
 
 fn handleGetCategoriesByIds(
-    db: *Database,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
@@ -473,7 +325,7 @@ fn handleGetCategoriesByIds(
         return writeErrorResp(resp, op_byte, .invalid);
     }
 
-    const cat_size = @sizeOf(types.Category);
+    const cat_size = @sizeOf(schema.Category);
     if (resp.len < RESPONSE_HEADER_SIZE + @as(usize, want) * cat_size) {
         return writeErrorResp(resp, op_byte, .err);
     }
@@ -493,16 +345,16 @@ fn handleGetCategoriesByIds(
         }
     }
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, found);
+    writeOkHeader(resp, op_byte, off, found);
     return off;
 }
 
 fn handleDelete(
-    db: *Database,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
-    comptime deleteFn: fn (*Database, u64) anyerror!void,
+    comptime deleteFn: fn (*Directory, u64) anyerror!void,
 ) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
@@ -513,8 +365,8 @@ fn handleDelete(
 }
 
 fn handleBitmaskUpdate(
-    comptime updateFn: fn (*Database, u64, ?[]const u8, ?[]const u8, ?[]const u8) anyerror!void,
-    db: *Database,
+    comptime updateFn: fn (*Directory, u64, ?[]const u8, ?[]const u8, ?[]const u8) anyerror!void,
+    db: *Directory,
     resp: []u8,
     op_byte: u8,
     payload: []const u8,
@@ -537,7 +389,7 @@ fn handleBitmaskUpdate(
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleMoveCategory(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleMoveCategory(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const new_parent = std.mem.readInt(u64, payload[8..16], .little);
@@ -547,7 +399,7 @@ fn handleMoveCategory(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleMoveLink(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleMoveLink(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const new_cat = std.mem.readInt(u64, payload[8..16], .little);
@@ -557,20 +409,20 @@ fn handleMoveLink(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) u
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleListRootCategories(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListRootCategories(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const offset = std.mem.readInt(u32, payload[0..4], .little);
     const limit = std.mem.readInt(u32, payload[4..8], .little);
-    const N = comptime defaultListBufLen(types.Category);
-    var buf: [N]types.Category = undefined;
+    const N = comptime defaultListBufLen(schema.Category);
+    var buf: [N]schema.Category = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const items = operations.listChildren(db, 0, offset, max, &buf) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
-    return writeRowList(types.Category, resp, op_byte, items);
+    return writeRowList(schema.Category, resp, op_byte, items);
 }
 
-fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleBrowsePath(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 2) return writeErrorResp(resp, op_byte, .invalid);
     const path_len: usize = std.mem.readInt(u16, payload[0..2], .little);
     if (2 + path_len > payload.len) return writeErrorResp(resp, op_byte, .invalid);
@@ -581,10 +433,10 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     const cat = (operations.getCategory(db, cat_id) catch null) orelse
         return writeErrorResp(resp, op_byte, .not_found);
 
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
-    const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(types.Category) + 2 + 2 + 8;
+    const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(schema.Category) + 2 + 2 + 8;
     if (resp.len < MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
 
     var off: usize = RESPONSE_HEADER_SIZE;
@@ -593,14 +445,14 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     @memcpy(resp[off..][0..cat_bytes.len], cat_bytes);
     off += cat_bytes.len;
 
-    var anc_buf: [64]types.Category = undefined;
+    var anc_buf: [64]schema.Category = undefined;
     const ancestors = operations.walkAncestors(db, cat_id, &anc_buf) catch
         return writeErrorResp(resp, op_byte, .err);
     const anc_count_off = off;
     off += 2;
     var anc_written: u16 = 0;
     for (ancestors) |a| {
-        if (off + @sizeOf(types.Category) + 2 + 8 > resp.len) break;
+        if (off + @sizeOf(schema.Category) + 2 + 8 > resp.len) break;
         const ab = std.mem.asBytes(&a);
         @memcpy(resp[off..][0..ab.len], ab);
         off += ab.len;
@@ -608,14 +460,14 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
     }
     std.mem.writeInt(u16, resp[anc_count_off..][0..2], anc_written, .little);
 
-    var children_buf: [100]types.Category = undefined;
+    var children_buf: [100]schema.Category = undefined;
     const children = operations.listChildren(db, cat_id, 0, 100, &children_buf) catch
         return writeErrorResp(resp, op_byte, .err);
     const child_count_off = off;
     off += 2;
     var children_written: u16 = 0;
     for (children) |child| {
-        if (off + @sizeOf(types.Category) + 8 > resp.len) break;
+        if (off + @sizeOf(schema.Category) + 8 > resp.len) break;
         const cb = std.mem.asBytes(&child);
         @memcpy(resp[off..][0..cb.len], cb);
         off += cb.len;
@@ -628,38 +480,38 @@ fn handleBrowsePath(db: *Database, resp: []u8, op_byte: u8, payload: []const u8)
         hit
     else blk: {
         const desc = subtree.collectDescendantsCached(
-            &db.cat_by_parent,
+            db.cat_by_parent(),
             cat_id,
             &db.subtree_cache,
             db.allocator,
         ) catch break :blk 0;
         defer db.allocator.free(desc);
-        const t = subtree.countSubtreeLinks(&db.link_by_category, desc, db.allocator) catch break :blk 0;
+        const t = subtree.countSubtreeLinks(db.link_by_category(), desc, db.allocator) catch break :blk 0;
         db.subtree_cache.putLinkCount(cat_id, t) catch {};
         break :blk t;
     };
     std.mem.writeInt(u64, resp[off..][0..8], total_links, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleListChildren(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListChildren(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const parent_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
     const limit = std.mem.readInt(u32, payload[12..16], .little);
-    const N = comptime defaultListBufLen(types.Category);
-    var buf: [N]types.Category = undefined;
+    const N = comptime defaultListBufLen(schema.Category);
+    var buf: [N]schema.Category = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const items = operations.listChildren(db, parent_id, offset, max, &buf) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
-    return writeRowList(types.Category, resp, op_byte, items);
+    return writeRowList(schema.Category, resp, op_byte, items);
 }
 
-fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const cat_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
@@ -667,8 +519,8 @@ fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) 
     const extras = readOptionalListExtras(payload, 16) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const N = comptime defaultListBufLen(types.Link);
-    var buf: [N]types.Link = undefined;
+    const N = comptime defaultListBufLen(schema.Link);
+    var buf: [N]schema.Link = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const page = operations.listLinks(db, cat_id, offset, max, &buf, extras.status, extras.after_id) catch |err| {
         return writeMappedError(resp, op_byte, err);
@@ -676,15 +528,15 @@ fn handleListLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) 
     return writeLinkPage(resp, op_byte, page);
 }
 
-fn handleListAllLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListAllLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const offset = std.mem.readInt(u32, payload[0..4], .little);
     const limit = std.mem.readInt(u32, payload[4..8], .little);
     const extras = readOptionalListExtras(payload, 8) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const N = comptime defaultListBufLen(types.Link);
-    var buf: [N]types.Link = undefined;
+    const N = comptime defaultListBufLen(schema.Link);
+    var buf: [N]schema.Link = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const page = operations.listAllLinks(db, offset, max, &buf, extras.status, extras.after_id) catch |err| {
         return writeMappedError(resp, op_byte, err);
@@ -692,7 +544,7 @@ fn handleListAllLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u
     return writeLinkPage(resp, op_byte, page);
 }
 
-fn handleListLinksBySubmitter(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListLinksBySubmitter(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const submitter_id = std.mem.readInt(u64, payload[0..8], .little);
     const offset = std.mem.readInt(u32, payload[8..12], .little);
@@ -700,8 +552,8 @@ fn handleListLinksBySubmitter(db: *Database, resp: []u8, op_byte: u8, payload: [
     const extras = readOptionalListExtras(payload, 16) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const N = comptime defaultListBufLen(types.Link);
-    var buf: [N]types.Link = undefined;
+    const N = comptime defaultListBufLen(schema.Link);
+    var buf: [N]schema.Link = undefined;
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     const page = operations.listLinksBySubmitter(db, submitter_id, offset, max, &buf, extras.status, extras.after_id) catch |err| {
         return writeMappedError(resp, op_byte, err);
@@ -733,16 +585,16 @@ fn readOptionalListExtras(payload: []const u8, fixed_len: usize) ?OptionalListEx
 }
 
 fn writeLinkPage(resp: []u8, op_byte: u8, page: operations.LinkPage) usize {
-    var off = writeRowList(types.Link, resp, op_byte, page.items);
+    var off = writeRowList(schema.Link, resp, op_byte, page.items);
     const written = std.mem.readInt(u16, resp[8..10], .little);
     if (off + 8 > resp.len) return writeErrorResp(resp, op_byte, .err);
     std.mem.writeInt(u64, resp[off..][0..8], page.next_after_id, .little);
     off += 8;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, written);
+    writeOkHeader(resp, op_byte, off, written);
     return off;
 }
 
-fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 17) return writeErrorResp(resp, op_byte, .invalid);
     const req = ListSubtreeLinksRequest.parse(payload);
     req.validate() catch |err| return writeMappedError(resp, op_byte, err);
@@ -752,14 +604,14 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
     const status_filter = extras.status;
     const cursor_mode = extras.after_id > 0;
 
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const subtree = @import("subtree.zig");
 
     const descendants = subtree.collectDescendantsCached(
-        &db.cat_by_parent,
+        db.cat_by_parent(),
         req.cat_id,
         &db.subtree_cache,
         db.allocator,
@@ -780,7 +632,7 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
     const scan_threshold: u32 = db.config.subtree_scan_threshold;
     const slice = if (descendants.len > scan_threshold)
         subtree.listSubtreeLinkIdsScan(
-            &db.link_by_category,
+            db.link_by_category(),
             descendants,
             fetch_offset,
             fetch_limit,
@@ -788,7 +640,7 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
         ) catch |err| return writeMappedError(resp, op_byte, err)
     else
         subtree.listSubtreeLinkIds(
-            &db.link_by_category,
+            db.link_by_category(),
             descendants,
             fetch_offset,
             fetch_limit,
@@ -822,7 +674,7 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
             next_after_id = last_written_id;
             if (status_filter == null) break else continue;
         }
-        if (off + @sizeOf(types.Link) + 16 > resp.len) {
+        if (off + @sizeOf(schema.Link) + 16 > resp.len) {
             if (status_filter == null) break else continue;
         }
         const lb = std.mem.asBytes(&link);
@@ -839,15 +691,15 @@ fn handleListSubtreeLinks(db: *Database, resp: []u8, op_byte: u8, payload: []con
     std.mem.writeInt(u64, resp[off..][0..8], next_after_id, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
 const SearchScope = enum(u8) { both = 0, links_only = 1, categories_only = 2 };
 
-const inverted = @import("inverted_index.zig");
+const inverted = @import("zigstore").inverted_index;
 
-fn linkMatchField(link: types.Link, query: []const u8) u8 {
+fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     var it = inverted.TokenIterator.init(query);
     while (it.next(&tok_buf)) |tok| {
@@ -858,7 +710,7 @@ fn linkMatchField(link: types.Link, query: []const u8) u8 {
     return 0;
 }
 
-fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 6) return writeErrorResp(resp, op_byte, .invalid);
     const query_len: usize = std.mem.readInt(u16, payload[0..2], .little);
     if (query_len < 2) return writeErrorResp(resp, op_byte, .invalid);
@@ -882,16 +734,16 @@ fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usi
     const max = @min(limit, 50);
     var off: usize = RESPONSE_HEADER_SIZE;
 
-    var cat_buf: [50]types.Category = undefined;
+    var cat_buf: [50]schema.Category = undefined;
     const cats = if (scope == .links_only)
         cat_buf[0..0]
     else
-        operations.searchCategories(db, query, max, &cat_buf) catch &[0]types.Category{};
+        operations.searchCategories(db, query, max, &cat_buf) catch &[0]schema.Category{};
     const cat_count_off = off;
     off += 2;
     var cats_written: u16 = 0;
     for (cats) |cat| {
-        if (off + @sizeOf(types.Category) + 2 > resp.len) break;
+        if (off + @sizeOf(schema.Category) + 2 > resp.len) break;
         const cb = std.mem.asBytes(&cat);
         @memcpy(resp[off..][0..cb.len], cb);
         off += cb.len;
@@ -899,16 +751,16 @@ fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usi
     }
     std.mem.writeInt(u16, resp[cat_count_off..][0..2], cats_written, .little);
 
-    var link_buf: [50]types.Link = undefined;
+    var link_buf: [50]schema.Link = undefined;
     const links = if (scope == .categories_only)
         link_buf[0..0]
     else
-        operations.searchLinks(db, query, max, &link_buf) catch &[0]types.Link{};
+        operations.searchLinks(db, query, max, &link_buf) catch &[0]schema.Link{};
     const link_count_off = off;
     off += 2;
     var links_written: u16 = 0;
     for (links) |link| {
-        if (off + @sizeOf(types.Link) + 1 > resp.len) break;
+        if (off + @sizeOf(schema.Link) + 1 > resp.len) break;
         const lb = std.mem.asBytes(&link);
         @memcpy(resp[off..][0..lb.len], lb);
         off += lb.len;
@@ -918,7 +770,7 @@ fn handleSearch(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usi
     }
     std.mem.writeInt(u16, resp[link_count_off..][0..2], links_written, .little);
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -952,21 +804,21 @@ fn writeIndexHealthFrame(state_snapshot: anytype, resp: []u8) usize {
     return off;
 }
 
-fn handleIndexHealth(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleIndexHealth(db: *Directory, resp: []u8, op_byte: u8) usize {
     const snap = db.verifier_state.snapshot(db);
     const off = writeIndexHealthFrame(snap, resp);
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleRunVerifier(db: *Database, resp: []u8, op_byte: u8) usize {
-    db.verifier_mutex.lock();
-    db.verifier_cond.signal();
-    db.verifier_mutex.unlock();
+fn handleRunVerifier(db: *Directory, resp: []u8, op_byte: u8) usize {
+    @import("verifier.zig").runOnce(db, &db.verifier_state) catch |err| {
+        log.warn("run_verifier failed: {}", .{err});
+    };
     return handleIndexHealth(db, resp, op_byte);
 }
 
-fn handleRebuildIndex(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleRebuildIndex(db: *Directory, resp: []u8, op_byte: u8) usize {
     const repair = @import("repair/repair.zig");
     const stats = repair.rebuildAllIndices(db) catch |err| {
         log.err("rebuild_index failed: {}", .{err});
@@ -984,13 +836,12 @@ fn handleRebuildIndex(db: *Database, resp: []u8, op_byte: u8) usize {
     std.mem.writeInt(u64, resp[off..][0..8], stats.queue_entries_drained, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleSnapshot(db: *Database, resp: []u8, op_byte: u8) usize {
-    const snapshot = @import("snapshot.zig");
-    const result = snapshot.forceSnapshot(db) catch |err| {
+fn handleSnapshot(db: *Directory, resp: []u8, op_byte: u8) usize {
+    const result = zigstore.snapshot.forceSnapshot(db.store.snapshotHost()) catch |err| {
         if (err != error.SnapshotInProgress) {
             log.err("snapshot op failed: {}", .{err});
         }
@@ -1006,11 +857,11 @@ fn handleSnapshot(db: *Database, resp: []u8, op_byte: u8) usize {
     std.mem.writeInt(u64, resp[off..][0..8], result.duration_ms, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleOpLatencyStats(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleOpLatencyStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     const PER_OP_BYTES: usize = 1 + 7 * 8;
 
     var off: usize = RESPONSE_HEADER_SIZE;
@@ -1047,11 +898,11 @@ fn handleOpLatencyStats(db: *Database, resp: []u8, op_byte: u8) usize {
     }
 
     resp[count_off] = emitted;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleBulkImport(db: *Database, resp: []u8, op_byte: u8, payload: []const u8, count: u16) usize {
+fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8, count: u16) usize {
     const PAYLOAD_BYTES: usize = 48;
     if (resp.len < RESPONSE_HEADER_SIZE + PAYLOAD_BYTES) return writeErrorResp(resp, op_byte, .err);
 
@@ -1129,11 +980,11 @@ fn handleBulkImport(db: *Database, resp: []u8, op_byte: u8, payload: []const u8,
     std.mem.writeInt(u64, resp[off..][0..8], elapsed_ms, .little);
     off += 8;
 
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     const ITEM_BYTES: usize = 10;
     if (resp.len < RESPONSE_HEADER_SIZE + ITEM_BYTES) return 0;
 
@@ -1146,7 +997,7 @@ fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []con
     var off: usize = RESPONSE_HEADER_SIZE;
     const r = parsed.result;
     const opts = operations.CreateLinkOpts{
-        .status = @intFromEnum(types.LinkStatus.pending),
+        .status = @intFromEnum(schema.LinkStatus.pending),
         .submitter_id = submitter_id,
     };
     const id = operations.createLinkWithOpts(
@@ -1163,7 +1014,7 @@ fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []con
         off += 2;
         @memset(resp[off..][0..8], 0);
         off += 8;
-        writeResponseHeader(resp, @intCast(off), op_byte, pair.status, pair.sub_status, 1);
+        writeRawHeader(resp, op_byte, off, pair.status, pair.sub_status, 1);
         return off;
     };
     resp[off] = @intFromEnum(Status.ok);
@@ -1171,11 +1022,11 @@ fn handleCreateSubmission(db: *Database, resp: []u8, op_byte: u8, payload: []con
     off += 2;
     std.mem.writeInt(u64, resp[off..][0..8], id, .little);
     off += 8;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 1);
+    writeOkHeader(resp, op_byte, off, 1);
     return off;
 }
 
-fn handleUpdateLinkStatus(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleUpdateLinkStatus(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 9) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const status = payload[8];
@@ -1200,9 +1051,9 @@ fn handleBulkLinkOp(
     op_byte: u8,
     payload: []const u8,
     id_off: usize,
-    db: *Database,
+    db: *Directory,
     status: u8,
-    comptime applyOne: fn (*Database, u64, u8) BulkResultCode,
+    comptime applyOne: fn (*Directory, u64, u8) BulkResultCode,
 ) usize {
     if (payload.len < id_off + 2) return writeErrorResp(resp, op_byte, .invalid);
     const count = std.mem.readInt(u16, payload[id_off..][0..2], .little);
@@ -1234,11 +1085,11 @@ fn handleBulkLinkOp(
 
     std.mem.writeInt(u16, resp[ok_off..][0..2], ok_count, .little);
     std.mem.writeInt(u16, resp[err_off..][0..2], err_count, .little);
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn applyBulkStatus(db: *Database, id: u64, status: u8) BulkResultCode {
+fn applyBulkStatus(db: *Directory, id: u64, status: u8) BulkResultCode {
     operations.updateLinkStatusBulkOne(db, id, status) catch |err| return switch (err) {
         error.LinkNotFound => .not_found,
         error.AlreadyInState => .already_in_state,
@@ -1247,7 +1098,7 @@ fn applyBulkStatus(db: *Database, id: u64, status: u8) BulkResultCode {
     return .ok;
 }
 
-fn applyBulkDelete(db: *Database, id: u64, status: u8) BulkResultCode {
+fn applyBulkDelete(db: *Directory, id: u64, status: u8) BulkResultCode {
     _ = status;
     operations.deleteLink(db, id) catch |err| return switch (err) {
         error.LinkNotFound => .not_found,
@@ -1256,18 +1107,18 @@ fn applyBulkDelete(db: *Database, id: u64, status: u8) BulkResultCode {
     return .ok;
 }
 
-fn handleBulkUpdateLinkStatus(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleBulkUpdateLinkStatus(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 3) return writeErrorResp(resp, op_byte, .invalid);
     const status = payload[0];
     if (status > 2) return writeErrorResp(resp, op_byte, .invalid);
     return handleBulkLinkOp(resp, op_byte, payload, 1, db, status, applyBulkStatus);
 }
 
-fn handleBulkDeleteLinks(db: *Database, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleBulkDeleteLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     return handleBulkLinkOp(resp, op_byte, payload, 0, db, 0, applyBulkDelete);
 }
 
-fn handleCountsByStatus(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleCountsByStatus(db: *Directory, resp: []u8, op_byte: u8) usize {
     const counts = operations.countsByStatus(db) catch |err| return writeMappedError(resp, op_byte, err);
     if (resp.len < RESPONSE_HEADER_SIZE + 24) return writeErrorResp(resp, op_byte, .err);
     var off: usize = RESPONSE_HEADER_SIZE;
@@ -1277,11 +1128,11 @@ fn handleCountsByStatus(db: *Database, resp: []u8, op_byte: u8) usize {
     off += 8;
     std.mem.writeInt(u64, resp[off..][0..8], counts.rejected, .little);
     off += 8;
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleStats(db: *Database, resp: []u8, op_byte: u8) usize {
+fn handleStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     const s = db.getStats();
     const values = [_]u64{
         s.category_count,
@@ -1299,32 +1150,7 @@ fn handleStats(db: *Database, resp: []u8, op_byte: u8) usize {
         std.mem.writeInt(u64, resp[off..][0..8], val, .little);
         off += 8;
     }
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, 0);
-    return off;
-}
-
-fn readOptionalString(payload: []const u8, off: *usize, mask: u8, bit: u8) ?(?[]const u8) {
-    if (mask & bit == 0) return @as(?[]const u8, null);
-    if (off.* + 2 > payload.len) return null;
-    const len = std.mem.readInt(u16, payload[off.*..][0..2], .little);
-    off.* += 2;
-    if (off.* + len > payload.len) return null;
-    const s = payload[off.*..][0..len];
-    off.* += len;
-    return s;
-}
-
-fn writeRowList(comptime T: type, resp: []u8, op_byte: u8, items: []const T) usize {
-    var off: usize = RESPONSE_HEADER_SIZE;
-    var written_count: u16 = 0;
-    for (items) |item| {
-        const bytes = std.mem.asBytes(&item);
-        if (off + bytes.len > resp.len) break;
-        @memcpy(resp[off..][0..bytes.len], bytes);
-        off += bytes.len;
-        written_count += 1;
-    }
-    writeResponseHeader(resp, @intCast(off), op_byte, .ok, .none, written_count);
+    writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
@@ -1423,13 +1249,13 @@ test "index_health response carries slug_path_repair_queue fields" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var task = types.RepairTask{ .cat_id = 1, .op = .renamed_slug };
+    var task = schema.RepairTask{ .cat_id = 1, .op = .renamed_slug };
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, 1, .big);
-    try db.slug_path_repair_queue.insert(&key, std.mem.asBytes(&task));
+    try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
 
     var resp: [4096]u8 = undefined;
     const off = handleIndexHealth(db, &resp, @intFromEnum(Op.index_health));
@@ -1489,7 +1315,7 @@ test "create_link: oversized URL produces status=invalid, sub_status=field_too_l
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1529,7 +1355,7 @@ test "list_subtree_links: unsupported order_code produces sub_status=unsupported
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [17]u8 = undefined;
@@ -1550,7 +1376,7 @@ test "list_subtree_links: small subtree (<= scan_threshold) and large subtree bo
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const ops = @import("operations/operations.zig");
@@ -1564,10 +1390,10 @@ test "list_subtree_links: small subtree (<= scan_threshold) and large subtree bo
         const url = std.fmt.bufPrint(&url_buf, "https://x{d}.t", .{i}) catch unreachable;
         _ = try ops.createLink(db, cat_ids[i], url, "L", "");
     }
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], top_id, .little);
@@ -1596,7 +1422,7 @@ test "list_subtree_links: oversize offset produces sub_status=offset_too_large" 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [17]u8 = undefined;
@@ -1616,7 +1442,7 @@ test "op_latency_stats (23): empty histograms produce count=0 response" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var resp: [4096]u8 = undefined;
@@ -1630,11 +1456,11 @@ test "op_latency_stats (23): records latency through processFrames + reports per
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    var bp: conn_mod.BufferPair = .{};
-    var conn: conn_mod.Connection = .{};
+    var bp: zigstore.connection.BufferPair = .{};
+    var conn: zigstore.connection.Connection = .{};
     conn.buf = &bp;
 
     var off: usize = 0;
@@ -1648,7 +1474,7 @@ test "op_latency_stats (23): records latency through processFrames + reports per
     }
     conn.bytes_read = off;
 
-    processFrames(db, &conn);
+    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency, RESPONSE_RESERVE);
 
     var resp: [4096]u8 = undefined;
     const reply_len = handleOpLatencyStats(db, &resp, @intFromEnum(Op.op_latency_stats));
@@ -1678,7 +1504,7 @@ test "handleStats refuses an undersized response buffer instead of overflowing i
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var tail: [RESPONSE_HEADER_SIZE + 8]u8 = undefined;
@@ -1692,18 +1518,11 @@ test "handleStats refuses an undersized response buffer instead of overflowing i
     try std.testing.expectEqual(@intFromEnum(Status.ok), exact[5]);
 }
 
-test "pipelineHasRoom defers a frame once the buffer can't hold a worst-case response" {
-    const buf = conn_mod.RESPONSE_BUF_SIZE;
-    try std.testing.expect(pipelineHasRoom(0, buf));
-    try std.testing.expect(pipelineHasRoom(buf - RESPONSE_RESERVE, buf));
-    try std.testing.expect(!pipelineHasRoom(buf - RESPONSE_RESERVE + 1, buf));
-}
-
 test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration_ms" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     _ = try operations.createCategory(db, 0, "Top", "top", "");
@@ -1714,9 +1533,8 @@ test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
     try std.testing.expectEqual(@intFromEnum(SubStatus.none), resp[6]);
 
-    const snapshot_mod = @import("snapshot.zig");
-    const snap = (try snapshot_mod.SnapshotManager.loadSnapshotMeta(db.config.data_dir)).?;
-    try std.testing.expectEqual(snapshot_mod.SNAP_MAGIC, snap.magic);
+    const snap = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(db.config.data_dir)).?;
+    try std.testing.expectEqual(zigstore.snapshot.SNAP_MAGIC, snap.magic);
 
     const reported_seq = std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE..][0..8], .little);
     try std.testing.expectEqual(snap.wal_sequence, reported_seq);
@@ -1726,11 +1544,11 @@ test "snapshot op (22): concurrent invocation returns already_in_progress" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
-    db.snapshot_in_progress.store(true, .release);
-    defer db.snapshot_in_progress.store(false, .release);
+    db.store.snapshot_in_progress.store(true, .release);
+    defer db.store.snapshot_in_progress.store(false, .release);
 
     var resp: [128]u8 = undefined;
     const off = handleSnapshot(db, &resp, @intFromEnum(Op.snapshot));
@@ -1743,7 +1561,7 @@ test "create_link: duplicate URL produces status=duplicate, sub_status=duplicate
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1804,7 +1622,7 @@ test "bulk_import (24): empty count returns all-zero stats" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var resp: [128]u8 = undefined;
@@ -1824,7 +1642,7 @@ test "bulk_import (24): inserts 1000 items in a single frame" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -1868,7 +1686,7 @@ test "bulk_import (24): mid-stream invalid item is counted, subsequent items go 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -1904,7 +1722,7 @@ test "bulk_import (24): payload exceeding byte cap is rejected" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const oversized = try allocator.alloc(u8, BULK_IMPORT_MAX_BYTES + 1);
@@ -1922,7 +1740,7 @@ test "create_submission: writes a pending Link with the supplied submitter_id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1960,7 +1778,7 @@ test "create_submission: writes a pending Link with the supplied submitter_id" {
     try std.testing.expect(id > 0);
 
     const link = (try operations.getLink(db, id)).?;
-    try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
     try std.testing.expectEqual(@as(u64, 7777), link.submitter_id);
 }
 
@@ -1968,7 +1786,7 @@ test "update_link_status: flips pending → approved" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -1978,12 +1796,12 @@ test "update_link_status: flips pending → approved" {
         "https://x.example",
         "X",
         "",
-        .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 1 },
+        .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 1 },
     );
 
     var payload: [9]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], id, .little);
-    payload[8] = @intFromEnum(types.LinkStatus.approved);
+    payload[8] = @intFromEnum(schema.LinkStatus.approved);
 
     var resp: [64]u8 = undefined;
     const reply_len = handleUpdateLinkStatus(db, &resp, @intFromEnum(Op.update_link_status), &payload);
@@ -1991,29 +1809,29 @@ test "update_link_status: flips pending → approved" {
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
 
     const link = (try operations.getLink(db, id)).?;
-    try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.approved)), link.status);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.approved)), link.status);
 }
 
 test "list_all_links (op=16) with trailing status byte filters by status" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
 
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 1 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://b.example", "b", "", .{ .status = @intFromEnum(types.LinkStatus.approved), .submitter_id = 2 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://c.example", "c", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 3 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://d.example", "d", "", .{ .status = @intFromEnum(types.LinkStatus.rejected), .submitter_id = 4 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://e.example", "e", "", .{ .status = @intFromEnum(types.LinkStatus.approved), .submitter_id = 5 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://f.example", "f", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 6 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 1 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://b.example", "b", "", .{ .status = @intFromEnum(schema.LinkStatus.approved), .submitter_id = 2 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://c.example", "c", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 3 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://d.example", "d", "", .{ .status = @intFromEnum(schema.LinkStatus.rejected), .submitter_id = 4 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://e.example", "e", "", .{ .status = @intFromEnum(schema.LinkStatus.approved), .submitter_id = 5 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://f.example", "f", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 6 });
 
     var payload: [9]u8 = undefined;
     std.mem.writeInt(u32, payload[0..4], 0, .little);
     std.mem.writeInt(u32, payload[4..8], 50, .little);
-    payload[8] = @intFromEnum(types.LinkStatus.pending);
+    payload[8] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
     const reply_len = handleListAllLinks(db, &resp, @intFromEnum(Op.list_all_links), &payload);
@@ -2024,9 +1842,9 @@ test "list_all_links (op=16) with trailing status byte filters by status" {
     try std.testing.expectEqual(@as(u16, 3), item_count);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(types.Link);
-        const link = std.mem.bytesToValue(types.Link, resp[start..][0..@sizeOf(types.Link)]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(schema.Link);
+        const link = std.mem.bytesToValue(schema.Link, resp[start..][0..@sizeOf(schema.Link)]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
     }
 
     var payload_all: [8]u8 = undefined;
@@ -2043,23 +1861,23 @@ test "list_links (op=13) with trailing status byte filters within a category" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
     const other_id = try operations.createCategory(db, 0, "Other", "other", "");
 
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(types.LinkStatus.approved) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, other_id, "https://o1.example", "o1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, other_id, "https://o2.example", "o2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(schema.LinkStatus.approved) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, other_id, "https://o1.example", "o1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, other_id, "https://o2.example", "o2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], cat_id, .little);
     std.mem.writeInt(u32, payload[8..12], 0, .little);
     std.mem.writeInt(u32, payload[12..16], 50, .little);
-    payload[16] = @intFromEnum(types.LinkStatus.pending);
+    payload[16] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
     const reply_len = handleListLinks(db, &resp, @intFromEnum(Op.list_links), &payload);
@@ -2070,9 +1888,9 @@ test "list_links (op=13) with trailing status byte filters within a category" {
     try std.testing.expectEqual(@as(u16, 2), item_count);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(types.Link);
-        const link = std.mem.bytesToValue(types.Link, resp[start..][0..@sizeOf(types.Link)]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(schema.Link);
+        const link = std.mem.bytesToValue(schema.Link, resp[start..][0..@sizeOf(schema.Link)]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
         try std.testing.expectEqual(cat_id, link.category_id);
     }
 }
@@ -2081,20 +1899,20 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://x1.example", "x1", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 100 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://x2.example", "x2", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 100 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://x3.example", "x3", "", .{ .status = @intFromEnum(types.LinkStatus.approved), .submitter_id = 100 });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://y1.example", "y1", "", .{ .status = @intFromEnum(types.LinkStatus.pending), .submitter_id = 200 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://x1.example", "x1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 100 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://x2.example", "x2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 100 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://x3.example", "x3", "", .{ .status = @intFromEnum(schema.LinkStatus.approved), .submitter_id = 100 });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://y1.example", "y1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending), .submitter_id = 200 });
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], 100, .little);
     std.mem.writeInt(u32, payload[8..12], 0, .little);
     std.mem.writeInt(u32, payload[12..16], 50, .little);
-    payload[16] = @intFromEnum(types.LinkStatus.pending);
+    payload[16] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
     const reply_len = handleListLinksBySubmitter(db, &resp, @intFromEnum(Op.list_links_by_submitter), &payload);
@@ -2105,9 +1923,9 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     try std.testing.expectEqual(@as(u16, 2), item_count);
     var i: usize = 0;
     while (i < item_count) : (i += 1) {
-        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(types.Link);
-        const link = std.mem.bytesToValue(types.Link, resp[start..][0..@sizeOf(types.Link)]);
-        try std.testing.expectEqual(@as(u8, @intFromEnum(types.LinkStatus.pending)), link.status);
+        const start = RESPONSE_HEADER_SIZE + i * @sizeOf(schema.Link);
+        const link = std.mem.bytesToValue(schema.Link, resp[start..][0..@sizeOf(schema.Link)]);
+        try std.testing.expectEqual(@as(u8, @intFromEnum(schema.LinkStatus.pending)), link.status);
         try std.testing.expectEqual(@as(u64, 100), link.submitter_id);
     }
 }
@@ -2116,24 +1934,24 @@ test "list_subtree_links (op=17) with trailing status byte filters whole subtree
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try operations.createCategory(db, 0, "Top", "top", "");
     const a_id = try operations.createCategory(db, top_id, "A", "a", "");
     const b_id = try operations.createCategory(db, top_id, "B", "b", "");
 
-    _ = try operations.createLinkWithOpts(db, a_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, a_id, "https://a2.example", "a2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, a_id, "https://a3.example", "a3", "", .{ .status = @intFromEnum(types.LinkStatus.approved) });
-    _ = try operations.createLinkWithOpts(db, b_id, "https://b1.example", "b1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, a_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, a_id, "https://a2.example", "a2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, a_id, "https://a3.example", "a3", "", .{ .status = @intFromEnum(schema.LinkStatus.approved) });
+    _ = try operations.createLinkWithOpts(db, b_id, "https://b1.example", "b1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
 
     var payload: [18]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], top_id, .little);
     payload[8] = 0;
     std.mem.writeInt(u32, payload[9..13], 0, .little);
     std.mem.writeInt(u32, payload[13..17], 50, .little);
-    payload[17] = @intFromEnum(types.LinkStatus.pending);
+    payload[17] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [16384]u8 = undefined;
     const reply_len = handleListSubtreeLinks(db, &resp, @intFromEnum(Op.list_subtree_links), &payload);
@@ -2143,7 +1961,7 @@ test "list_subtree_links (op=17) with trailing status byte filters whole subtree
     const returned = std.mem.readInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 3), returned);
 
-    const link_bytes_end = RESPONSE_HEADER_SIZE + 4 + returned * @sizeOf(types.Link);
+    const link_bytes_end = RESPONSE_HEADER_SIZE + 4 + returned * @sizeOf(schema.Link);
     const total = std.mem.readInt(u64, resp[link_bytes_end..][0..8], .little);
     try std.testing.expectEqual(@as(u64, 3), total);
 }
@@ -2152,12 +1970,12 @@ test "bulk_update_link_status (op=34) reports per-id result codes" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
-    const approved = @intFromEnum(types.LinkStatus.approved);
-    const a = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
+    const approved = @intFromEnum(schema.LinkStatus.approved);
+    const a = try operations.createLinkWithOpts(db, cat_id, "https://a.example", "a", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
     const b = try operations.createLinkWithOpts(db, cat_id, "https://b.example", "b", "", .{ .status = approved });
     const c: u64 = 999_999;
 
@@ -2199,7 +2017,7 @@ test "bulk_update_link_status (op=34) caps at 200" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [3]u8 = undefined;
@@ -2215,7 +2033,7 @@ test "bulk_delete_links (op=35): mixed found / not-found" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
@@ -2243,14 +2061,14 @@ test "counts_by_status (op=36) returns per-status totals" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(types.LinkStatus.pending) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(types.LinkStatus.approved) });
-    _ = try operations.createLinkWithOpts(db, cat_id, "https://r1.example", "r1", "", .{ .status = @intFromEnum(types.LinkStatus.rejected) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p1.example", "p1", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://p2.example", "p2", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://a1.example", "a1", "", .{ .status = @intFromEnum(schema.LinkStatus.approved) });
+    _ = try operations.createLinkWithOpts(db, cat_id, "https://r1.example", "r1", "", .{ .status = @intFromEnum(schema.LinkStatus.rejected) });
 
     var resp: [128]u8 = undefined;
     const len = handleCountsByStatus(db, &resp, @intFromEnum(Op.counts_by_status));
@@ -2265,7 +2083,7 @@ test "search (op=14): scope byte filters sections and links carry match_field" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try operations.createCategory(db, 0, "Top", "top", "");
@@ -2282,11 +2100,11 @@ test "search (op=14): scope byte filters sections and links carry match_field" {
         fn run(resp: []const u8) Parsed {
             var off: usize = RESPONSE_HEADER_SIZE;
             const cc = std.mem.readInt(u16, resp[off..][0..2], .little);
-            off += 2 + @as(usize, cc) * @sizeOf(types.Category);
+            off += 2 + @as(usize, cc) * @sizeOf(schema.Category);
             const lc = std.mem.readInt(u16, resp[off..][0..2], .little);
             off += 2;
             var mf: u8 = 255;
-            if (lc > 0) mf = resp[off + @sizeOf(types.Link)];
+            if (lc > 0) mf = resp[off + @sizeOf(schema.Link)];
             return .{ .cat_count = cc, .link_count = lc, .first_match_field = mf };
         }
     }.run;
@@ -2338,7 +2156,7 @@ test "list_all_links with out-of-range status returns invalid" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [9]u8 = undefined;
@@ -2356,7 +2174,7 @@ test "update_link_status: out-of-range status returns invalid + unsupported_orde
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [9]u8 = undefined;
@@ -2374,7 +2192,7 @@ test "get_categories_by_ids (29): mix of hits and misses returns only the hits" 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const a_id = try operations.createCategory(db, 0, "Alpha", "alpha", "");
@@ -2399,18 +2217,18 @@ test "get_categories_by_ids (29): mix of hits and misses returns only the hits" 
     const count = std.mem.readInt(u16, resp[8..10], .little);
     try std.testing.expectEqual(@as(u16, 2), count);
 
-    const cat_size = @sizeOf(types.Category);
+    const cat_size = @sizeOf(schema.Category);
     try std.testing.expectEqual(
         @as(usize, RESPONSE_HEADER_SIZE + 2 * cat_size),
         reply_len,
     );
 
     const cat0 = std.mem.bytesToValue(
-        types.Category,
+        schema.Category,
         resp[RESPONSE_HEADER_SIZE..][0..cat_size],
     );
     const cat1 = std.mem.bytesToValue(
-        types.Category,
+        schema.Category,
         resp[RESPONSE_HEADER_SIZE + cat_size ..][0..cat_size],
     );
     try std.testing.expectEqual(a_id, cat0.id);
@@ -2421,7 +2239,7 @@ test "get_categories_by_ids (29): count > GET_CATEGORIES_BY_IDS_MAX returns inva
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [2]u8 = undefined;
@@ -2441,7 +2259,7 @@ test "get_categories_by_ids (29): truncated payload returns invalid" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     var payload: [2 + 8]u8 = undefined;
@@ -2463,15 +2281,15 @@ fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {
     defer std.debug.assert(gpa.deinit() == .ok);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db = Database.openTestInstance(gpa.allocator(), &tmp) catch return;
+    const db = Directory.openTestInstance(gpa.allocator(), &tmp) catch return;
     defer db.deinitTestInstance();
 
-    var bp: conn_mod.BufferPair = .{};
-    var conn = conn_mod.Connection{ .phase = .reading_request, .buf = &bp };
+    var bp: zigstore.connection.BufferPair = .{};
+    var conn = zigstore.connection.Connection{ .phase = .reading_request, .buf = &bp };
     const n = @min(input.len, bp.request_buf.len);
     @memcpy(bp.request_buf[0..n], input[0..n]);
     conn.bytes_read = n;
-    processFrames(db, &conn);
+    protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency, RESPONSE_RESERVE);
 }
 
 test "fuzz: processFrames tolerates arbitrary request frames" {

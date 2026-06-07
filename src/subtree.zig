@@ -1,9 +1,7 @@
 const std = @import("std");
-const types = @import("types.zig");
-const btree = @import("btree/btree.zig");
-const page_cache = @import("page_cache.zig");
-const freelist = @import("freelist.zig");
-const page = @import("page.zig");
+const codec = @import("zigstore").codec;
+const schema = @import("schema.zig");
+const Directory = @import("directory.zig").Directory;
 
 pub const MAX_DESCENDANTS: u32 = 1_000_000;
 pub const SubtreeError = error{ SubtreeTooLarge, OutOfMemory };
@@ -70,7 +68,7 @@ pub const SubtreeCache = struct {
 };
 
 pub fn collectDescendants(
-    cat_by_parent: *btree.BPlusTree,
+    cat_by_parent: anytype,
     root: u64,
     allocator: std.mem.Allocator,
 ) ![]u64 {
@@ -87,12 +85,12 @@ pub fn collectDescendants(
 
     while (queue.items.len > 0) {
         const cur = queue.pop().?;
-        const start_key = types.ParentChildKey.encode(cur, 0);
+        const start_key = schema.ParentChildKey.encode(cur, 0);
         var iter = try cat_by_parent.rangeScan(&start_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
-            if (types.decodeU64(entry.key[0..8]) != cur) break;
-            const child = types.decodeU64(entry.key[8..16]);
+            if (codec.decodeU64(entry.key[0..8]) != cur) break;
+            const child = codec.decodeU64(entry.key[8..16]);
             const gop = try visited.getOrPut(child);
             if (gop.found_existing) continue;
             if (visited.count() > MAX_DESCENDANTS) return SubtreeError.SubtreeTooLarge;
@@ -111,7 +109,7 @@ pub const SubtreeLinkPage = struct {
 };
 
 pub fn listSubtreeLinkIds(
-    link_by_category: *btree.BPlusTree,
+    link_by_category: anytype,
     descendants: []const u64,
     offset: u32,
     limit: u32,
@@ -125,18 +123,18 @@ pub fn listSubtreeLinkIds(
     const offset_u64: u64 = offset;
 
     for (descendants) |cat_id| {
-        const start_key = types.CategoryLinkKey.encode(cat_id, 0);
+        const start_key = schema.CategoryLinkKey.encode(cat_id, 0);
         var iter = try link_by_category.rangeScan(&start_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
-            if (types.decodeU64(entry.key[0..8]) != cat_id) break;
+            if (codec.decodeU64(entry.key[0..8]) != cat_id) break;
             total += 1;
             if (skipped < offset_u64) {
                 skipped += 1;
                 continue;
             }
             if (page_ids.items.len >= limit) continue;
-            const link_id = types.decodeU64(entry.key[8..16]);
+            const link_id = codec.decodeU64(entry.key[8..16]);
             try page_ids.append(allocator, link_id);
         }
     }
@@ -148,7 +146,7 @@ pub fn listSubtreeLinkIds(
 }
 
 pub fn collectDescendantsCached(
-    cat_by_parent: *btree.BPlusTree,
+    cat_by_parent: anytype,
     root: u64,
     cache: *SubtreeCache,
     allocator: std.mem.Allocator,
@@ -160,7 +158,7 @@ pub fn collectDescendantsCached(
 }
 
 pub fn listSubtreeLinkIdsScan(
-    link_by_category: *btree.BPlusTree,
+    link_by_category: anytype,
     descendants: []const u64,
     offset: u32,
     limit: u32,
@@ -201,7 +199,7 @@ pub fn listSubtreeLinkIdsScan(
 }
 
 pub fn countSubtreeLinks(
-    link_by_category: *btree.BPlusTree,
+    link_by_category: anytype,
     descendants: []const u64,
     allocator: std.mem.Allocator,
 ) !u64 {
@@ -221,78 +219,66 @@ pub fn countSubtreeLinks(
 }
 
 test "collectDescendants returns inclusive sorted set on a tiny synthetic tree" {
-    const path = "/tmp/test_subtree_basic.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-    var cat_by_parent = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
-
+    const cat_by_parent = db.cat_by_parent();
     const edges = [_][2]u64{ .{ 1, 2 }, .{ 1, 3 }, .{ 2, 4 }, .{ 2, 5 } };
     inline for (edges) |edge| {
-        const k = types.ParentChildKey.encode(edge[0], edge[1]);
-        const v = types.encodeU64(edge[1]);
+        const k = schema.ParentChildKey.encode(edge[0], edge[1]);
+        const v = codec.encodeU64(edge[1]);
         try cat_by_parent.insert(&k, &v);
     }
 
-    const result = try collectDescendants(&cat_by_parent, 1, std.testing.allocator);
+    const result = try collectDescendants(cat_by_parent, 1, std.testing.allocator);
     defer std.testing.allocator.free(result);
 
     try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 2, 3, 4, 5 }, result);
 }
 
 test "collectDescendants tolerates cycles via the visited set" {
-    const path = "/tmp/test_subtree_cycle.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-    var cat_by_parent = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
-
+    const cat_by_parent = db.cat_by_parent();
     const edges = [_][2]u64{ .{ 1, 1 }, .{ 1, 2 }, .{ 2, 1 }, .{ 2, 3 } };
     inline for (edges) |edge| {
-        const k = types.ParentChildKey.encode(edge[0], edge[1]);
-        const v = types.encodeU64(edge[1]);
+        const k = schema.ParentChildKey.encode(edge[0], edge[1]);
+        const v = codec.encodeU64(edge[1]);
         try cat_by_parent.insert(&k, &v);
     }
 
-    const result = try collectDescendants(&cat_by_parent, 1, std.testing.allocator);
+    const result = try collectDescendants(cat_by_parent, 1, std.testing.allocator);
     defer std.testing.allocator.free(result);
 
     try std.testing.expectEqualSlices(u64, &[_]u64{ 1, 2, 3 }, result);
 }
 
 test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
-    const path = "/tmp/test_subtree_links.db";
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
-    defer std.fs.cwd().deleteFile(path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var cache = try page_cache.PageCache.init(std.testing.allocator, file, 64);
-    defer cache.deinit();
-    var fl = freelist.FreeList.init(&cache, page.INVALID_PAGE);
-
-    var link_by_category = btree.BPlusTree.init(&cache, &fl, page.INVALID_PAGE);
+    const link_by_category = db.link_by_category();
     var cid: u64 = 1;
     while (cid <= 3) : (cid += 1) {
         var lid: u64 = 1;
         while (lid <= 10) : (lid += 1) {
             const link_id = cid * 100 + lid;
-            const k = types.CategoryLinkKey.encode(cid, link_id);
-            const v = types.encodeU64(link_id);
+            const k = schema.CategoryLinkKey.encode(cid, link_id);
+            const v = codec.encodeU64(link_id);
             try link_by_category.insert(&k, &v);
         }
     }
 
     var ids = [_]u64{ 1, 2, 3 };
     const r1 = try listSubtreeLinkIds(
-        &link_by_category,
+        link_by_category,
         ids[0..],
         0,
         15,
@@ -304,7 +290,7 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
     try std.testing.expectEqual(@as(u64, 101), r1.link_ids[0]);
 
     const r2 = try listSubtreeLinkIds(
-        &link_by_category,
+        link_by_category,
         ids[0..],
         15,
         15,

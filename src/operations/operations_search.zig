@@ -1,7 +1,7 @@
 const std = @import("std");
-const types = @import("../types.zig");
-const Database = @import("../database.zig").Database;
-const inverted = @import("../inverted_index.zig");
+const schema = @import("../schema.zig");
+const Directory = @import("../directory.zig").Directory;
+const inverted = @import("zigstore").inverted_index;
 const category = @import("operations_category.zig");
 const link_mod = @import("operations_link.zig");
 const shared = @import("operations_shared.zig");
@@ -9,15 +9,15 @@ const shared = @import("operations_shared.zig");
 const log = shared.log;
 
 pub fn searchCategories(
-    db: *Database,
+    db: *Directory,
     query: []const u8,
     limit: u32,
-    buf: []types.Category,
-) ![]types.Category {
+    buf: []schema.Category,
+) ![]schema.Category {
     return searchViaIndexTree(
-        types.Category,
+        schema.Category,
         db,
-        &db.categories_index_tree,
+        db.categories_index_tree(),
         query,
         limit,
         buf,
@@ -26,15 +26,15 @@ pub fn searchCategories(
 }
 
 pub fn searchLinks(
-    db: *Database,
+    db: *Directory,
     query: []const u8,
     limit: u32,
-    buf: []types.Link,
-) ![]types.Link {
+    buf: []schema.Link,
+) ![]schema.Link {
     return searchViaIndexTree(
-        types.Link,
+        schema.Link,
         db,
-        &db.links_index_tree,
+        db.links_index_tree(),
         query,
         limit,
         buf,
@@ -43,7 +43,7 @@ pub fn searchLinks(
 }
 
 fn searchTreeByToken(
-    tree: *@import("../btree/btree.zig").BPlusTree,
+    tree: *@import("zigstore").BPlusTree,
     token: []const u8,
     allocator: std.mem.Allocator,
 ) ![]u64 {
@@ -77,12 +77,12 @@ fn searchTreeByToken(
 
 fn searchViaIndexTree(
     comptime T: type,
-    db: *Database,
-    tree: *@import("../btree/btree.zig").BPlusTree,
+    db: *Directory,
+    tree: *@import("zigstore").BPlusTree,
     query: []const u8,
     limit: u32,
     buf: []T,
-    comptime getter: fn (*Database, u64) anyerror!?T,
+    comptime getter: fn (*Directory, u64) anyerror!?T,
 ) ![]T {
     const max = @min(limit, @as(u32, @intCast(buf.len)));
     if (max == 0) return buf[0..0];
@@ -148,13 +148,13 @@ test "search: B+Tree-backed link search finds tokenised title" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const link_id = try link_mod.createLink(db, top_id, "https://example.com/c", "Cannabis Stuff", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "cannabis", 8, &buf);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(link_id, hits[0].id);
@@ -164,13 +164,13 @@ test "search: B+Tree-backed category search finds tokenised name" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const cat_id = try category.createCategory(db, top_id, "Computers", "computers", "");
 
-    var buf: [8]types.Category = undefined;
+    var buf: [8]schema.Category = undefined;
     const hits = try searchCategories(db, "computers", 8, &buf);
 
     var found = false;
@@ -184,14 +184,14 @@ test "search: multi-token query AND-intersects per-token posting lists" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const l1 = try link_mod.createLink(db, top_id, "https://example.com/1", "Alpha Beta", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/2", "Alpha Only", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "alpha beta", 8, &buf);
 
     try std.testing.expectEqual(@as(usize, 1), hits.len);
@@ -202,14 +202,14 @@ test "search: AND-of-tokens — \"foo bar\" excludes the foo-only doc" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const foo_bar_test = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "foo bar", 8, &buf);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(foo_bar_test, hits[0].id);
@@ -219,14 +219,14 @@ test "search: shared token \"test\" returns both docs in ascending id order" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const a = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
     const b = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "test", 8, &buf);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expect(hits[0].id < hits[1].id);
@@ -238,14 +238,14 @@ test "search: token absent from corpus returns empty result set" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
     _ = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
 
-    var buf: [8]types.Link = undefined;
+    var buf: [8]schema.Link = undefined;
     const hits = try searchLinks(db, "nonexistent", 8, &buf);
     try std.testing.expectEqual(@as(usize, 0), hits.len);
 }

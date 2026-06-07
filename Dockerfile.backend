@@ -23,7 +23,7 @@ RUN ZIG_ARCH="$(uname -m)" && \
     ln -s /usr/local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 WORKDIR /build
-COPY build.zig ./
+COPY build.zig build.zig.zon ./
 COPY src/ src/
 # -Dcpu=baseline: the CI builder and the OKE Ampere A1 nodes are different arm64
 # microarchitectures. A default (native-CPU) build emits instructions the build

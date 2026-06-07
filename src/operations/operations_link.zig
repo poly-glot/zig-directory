@@ -1,8 +1,8 @@
 const std = @import("std");
-const types = @import("../types.zig");
-const Database = @import("../database.zig").Database;
-const memtable = @import("../memtable.zig");
-const bloom = @import("../bloom.zig");
+const zigstore = @import("zigstore");
+const codec = zigstore.codec;
+const schema = @import("../schema.zig");
+const Directory = @import("../directory.zig").Directory;
 const shared = @import("operations_shared.zig");
 const compute = @import("operations_changeset_compute.zig");
 const category = @import("operations_category.zig");
@@ -13,12 +13,12 @@ const MAX_TITLE_LEN = shared.MAX_TITLE_LEN;
 const MAX_LINK_DESC_LEN = shared.MAX_LINK_DESC_LEN;
 
 pub const CreateLinkOpts = struct {
-    status: u8 = @intFromEnum(types.LinkStatus.approved),
+    status: u8 = @intFromEnum(schema.LinkStatus.approved),
     submitter_id: u64 = 0,
 };
 
 pub fn createLink(
-    db: *Database,
+    db: *Directory,
     category_id: u64,
     url: []const u8,
     title: []const u8,
@@ -28,7 +28,7 @@ pub fn createLink(
 }
 
 pub fn createLinkWithOpts(
-    db: *Database,
+    db: *Directory,
     category_id: u64,
     url: []const u8,
     title: []const u8,
@@ -43,14 +43,14 @@ pub fn createLinkWithOpts(
         if ((try category.getCategory(db, category_id)) == null) return OperationError.CategoryNotFound;
     }
 
-    const url_hash = types.hashUrl(url);
-    const hash_key = types.encodeU64(url_hash);
+    const url_hash = codec.hash(url);
+    const hash_key = codec.encodeU64(url_hash);
     if (db.url_bloom.mayContain(url)) {
-        const mt_hash = db.mt_link_by_url_hash.get(&hash_key);
+        const mt_hash = db.mt_link_by_url_hash().get(&hash_key);
         var hash_buf: [8]u8 = undefined;
         const tree_hash = switch (mt_hash) {
             .found, .deleted => null,
-            .not_found => try db.link_by_url_hash.search(&hash_key, &hash_buf),
+            .not_found => try db.link_by_url_hash().search(&hash_key, &hash_buf),
         };
         const existing_id_bytes: ?[]const u8 = switch (mt_hash) {
             .found => |v| v,
@@ -59,7 +59,7 @@ pub fn createLinkWithOpts(
         };
         if (existing_id_bytes) |bytes| {
             if (bytes.len >= 8) {
-                const existing_link_id = types.decodeU64(bytes);
+                const existing_link_id = codec.decodeU64(bytes);
                 if (try getLink(db, existing_link_id)) |existing_link| {
                     if (std.mem.eql(u8, existing_link.url.slice(), url)) {
                         return OperationError.DuplicateUrl;
@@ -72,12 +72,12 @@ pub fn createLinkWithOpts(
     const id = db.next_link_id.fetchAdd(1, .monotonic);
     const now = std.time.timestamp();
 
-    const link = types.Link{
+    const link = schema.Link{
         .id = id,
         .category_id = category_id,
-        .url = types.FixedString(64).fromSlice(url),
-        .title = types.FixedString(128).fromSlice(title),
-        .description = types.FixedString(256).fromSlice(desc),
+        .url = codec.FixedString(64).fromSlice(url),
+        .title = codec.FixedString(128).fromSlice(title),
+        .description = codec.FixedString(256).fromSlice(desc),
         .sort_order = 0,
         ._pad0 = 0,
         .created_at = now,
@@ -95,21 +95,21 @@ pub fn createLinkWithOpts(
     return id;
 }
 
-pub fn getLink(db: *Database, id: u64) !?types.Link {
-    const key = types.encodeU64(id);
-    const mt_result = db.mt_links_by_id.get(&key);
-    var tree_buf: [@sizeOf(types.Link)]u8 = undefined;
+pub fn getLink(db: *Directory, id: u64) !?schema.Link {
+    const key = codec.encodeU64(id);
+    const mt_result = db.mt_links_by_id().get(&key);
+    var tree_buf: [@sizeOf(schema.Link)]u8 = undefined;
     const val = switch (mt_result) {
         .found => |v| v,
         .deleted => return null,
-        .not_found => (try db.links_by_id.search(&key, &tree_buf)) orelse return null,
+        .not_found => (try db.links_by_id().search(&key, &tree_buf)) orelse return null,
     };
-    if (val.len != @sizeOf(types.Link)) return OperationError.DatabaseCorrupted;
-    return std.mem.bytesToValue(types.Link, val[0..@sizeOf(types.Link)]);
+    if (val.len != @sizeOf(schema.Link)) return OperationError.DatabaseCorrupted;
+    return std.mem.bytesToValue(schema.Link, val[0..@sizeOf(schema.Link)]);
 }
 
 pub fn updateLink(
-    db: *Database,
+    db: *Directory,
     id: u64,
     url: ?[]const u8,
     title: ?[]const u8,
@@ -122,9 +122,9 @@ pub fn updateLink(
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
 
     var new_link = old_link;
-    if (url) |new_url| new_link.url = types.FixedString(64).fromSlice(new_url);
-    if (title) |t| new_link.title = types.FixedString(128).fromSlice(t);
-    if (desc) |d| new_link.description = types.FixedString(256).fromSlice(d);
+    if (url) |new_url| new_link.url = codec.FixedString(64).fromSlice(new_url);
+    if (title) |t| new_link.title = codec.FixedString(128).fromSlice(t);
+    if (desc) |d| new_link.description = codec.FixedString(256).fromSlice(d);
     new_link.updated_at = std.time.timestamp();
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
@@ -134,7 +134,7 @@ pub fn updateLink(
     try db.commit(cs);
 }
 
-pub fn updateLinkStatus(db: *Database, id: u64, status: u8) !void {
+pub fn updateLinkStatus(db: *Directory, id: u64, status: u8) !void {
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
     var new_link = old_link;
     new_link.status = status;
@@ -147,7 +147,7 @@ pub fn updateLinkStatus(db: *Database, id: u64, status: u8) !void {
     try db.commit(cs);
 }
 
-pub fn updateLinkStatusBulkOne(db: *Database, id: u64, status: u8) !void {
+pub fn updateLinkStatusBulkOne(db: *Directory, id: u64, status: u8) !void {
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
     if (old_link.status == status) return OperationError.AlreadyInState;
     var new_link = old_link;
@@ -163,7 +163,7 @@ pub fn updateLinkStatusBulkOne(db: *Database, id: u64, status: u8) !void {
 
 pub const StatusCounts = struct { pending: u64, approved: u64, rejected: u64 };
 
-pub fn countsByStatus(db: *Database) !StatusCounts {
+pub fn countsByStatus(db: *Directory) !StatusCounts {
     return .{
         .pending = db.links_pending_count.load(.monotonic),
         .approved = db.links_approved_count.load(.monotonic),
@@ -171,11 +171,11 @@ pub fn countsByStatus(db: *Database) !StatusCounts {
     };
 }
 
-pub fn recountLinkStatuses(db: *Database) !void {
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+pub fn recountLinkStatuses(db: *Directory) !void {
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
-    const bloom_capacity = @max(db.links_by_id.entry_count *| 2, 1_000_000);
-    const reseeded = bloom.BloomFilter.init(db.allocator, bloom_capacity) catch null;
+    const bloom_capacity = @max(db.links_by_id().entry_count *| 2, 1_000_000);
+    const reseeded = zigstore.BloomFilter.init(db.allocator, bloom_capacity) catch null;
     if (reseeded) |new_bloom| {
         db.url_bloom.deinit();
         db.url_bloom = new_bloom;
@@ -184,16 +184,16 @@ pub fn recountLinkStatuses(db: *Database) !void {
     var pending: u64 = 0;
     var approved: u64 = 0;
     var rejected: u64 = 0;
-    const start_key = types.encodeU64(0);
-    var iter = try db.links_by_id.rangeScan(&start_key, null);
+    const start_key = codec.encodeU64(0);
+    var iter = try db.links_by_id().rangeScan(&start_key, null);
     while (try iter.next()) |entry| {
-        if (entry.value.len != @sizeOf(types.Link)) continue;
-        const link = std.mem.bytesToValue(types.Link, entry.value[0..@sizeOf(types.Link)]);
+        if (entry.value.len != @sizeOf(schema.Link)) continue;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
         db.url_bloom.add(link.url.slice());
         switch (link.status) {
-            @intFromEnum(types.LinkStatus.pending) => pending += 1,
-            @intFromEnum(types.LinkStatus.approved) => approved += 1,
-            @intFromEnum(types.LinkStatus.rejected) => rejected += 1,
+            @intFromEnum(schema.LinkStatus.pending) => pending += 1,
+            @intFromEnum(schema.LinkStatus.approved) => approved += 1,
+            @intFromEnum(schema.LinkStatus.rejected) => rejected += 1,
             else => {},
         }
     }
@@ -203,7 +203,7 @@ pub fn recountLinkStatuses(db: *Database) !void {
     db.links_rejected_count.store(rejected, .monotonic);
 }
 
-pub fn moveLink(db: *Database, id: u64, new_category_id: u64) !void {
+pub fn moveLink(db: *Directory, id: u64, new_category_id: u64) !void {
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
 
     if (new_category_id == 0) return OperationError.CategoryNotFound;
@@ -225,7 +225,7 @@ pub fn moveLink(db: *Database, id: u64, new_category_id: u64) !void {
     try db.commit(cs);
 }
 
-pub fn deleteLink(db: *Database, id: u64) !void {
+pub fn deleteLink(db: *Directory, id: u64) !void {
     const link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
@@ -235,23 +235,23 @@ pub fn deleteLink(db: *Database, id: u64) !void {
     try db.commit(cs);
 }
 
-pub const LinkPage = struct { items: []types.Link, next_after_id: u64 };
+pub const LinkPage = struct { items: []schema.Link, next_after_id: u64 };
 
 pub fn listLinks(
-    db: *Database,
+    db: *Directory,
     category_id: u64,
     offset: u32,
     limit: u32,
-    buf: []types.Link,
+    buf: []schema.Link,
     status_filter: ?u8,
     after_id: u64,
 ) !LinkPage {
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     const cursor_mode = after_id > 0;
     const seek_id: u64 = if (cursor_mode) after_id +| 1 else 0;
-    const start_key = types.CategoryLinkKey.encode(category_id, seek_id);
-    const end_key = types.CategoryLinkKey.encode(category_id, std.math.maxInt(u64));
+    const start_key = schema.CategoryLinkKey.encode(category_id, seek_id);
+    const end_key = schema.CategoryLinkKey.encode(category_id, std.math.maxInt(u64));
 
     var count: u32 = 0;
     var skipped: u32 = 0;
@@ -259,10 +259,10 @@ pub fn listLinks(
     var next_after_id: u64 = 0;
     var last_id: u64 = 0;
 
-    var iter = try db.link_by_category.rangeScan(&start_key, &end_key);
+    var iter = try db.link_by_category().rangeScan(&start_key, &end_key);
     while (try iter.next()) |entry| {
         if (entry.value.len < 8) return OperationError.DatabaseCorrupted;
-        const link_id = types.decodeU64(entry.value);
+        const link_id = codec.decodeU64(entry.value);
         const link = (try getLink(db, link_id)) orelse continue;
         if (status_filter) |s| if (link.status != s) continue;
         if (!cursor_mode and skipped < offset) {
@@ -282,20 +282,20 @@ pub fn listLinks(
 }
 
 pub fn listLinksBySubmitter(
-    db: *Database,
+    db: *Directory,
     submitter_id: u64,
     offset: u32,
     limit: u32,
-    buf: []types.Link,
+    buf: []schema.Link,
     status_filter: ?u8,
     after_id: u64,
 ) !LinkPage {
-    db.drainOneMemtable(&db.mt_link_by_submitter, &db.link_by_submitter);
+    db.drainOneMemtable(db.mt_link_by_submitter(), db.link_by_submitter());
 
     const cursor_mode = after_id > 0;
     const seek_id: u64 = if (cursor_mode) after_id +| 1 else 0;
-    const start_key = types.SubmitterLinkKey.encode(submitter_id, seek_id);
-    const end_key = types.SubmitterLinkKey.encode(submitter_id, std.math.maxInt(u64));
+    const start_key = schema.SubmitterLinkKey.encode(submitter_id, seek_id);
+    const end_key = schema.SubmitterLinkKey.encode(submitter_id, std.math.maxInt(u64));
 
     var count: u32 = 0;
     var skipped: u32 = 0;
@@ -303,10 +303,10 @@ pub fn listLinksBySubmitter(
     var next_after_id: u64 = 0;
     var last_id: u64 = 0;
 
-    var iter = try db.link_by_submitter.rangeScan(&start_key, &end_key);
+    var iter = try db.link_by_submitter().rangeScan(&start_key, &end_key);
     while (try iter.next()) |entry| {
         if (entry.value.len < 8) return OperationError.DatabaseCorrupted;
-        const link_id = types.decodeU64(entry.value);
+        const link_id = codec.decodeU64(entry.value);
         const link = (try getLink(db, link_id)) orelse continue;
         if (status_filter) |s| if (link.status != s) continue;
         if (!cursor_mode and skipped < offset) {
@@ -326,18 +326,18 @@ pub fn listLinksBySubmitter(
 }
 
 pub fn listAllLinks(
-    db: *Database,
+    db: *Directory,
     offset: u32,
     limit: u32,
-    buf: []types.Link,
+    buf: []schema.Link,
     status_filter: ?u8,
     after_id: u64,
 ) !LinkPage {
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const cursor_mode = after_id > 0;
     const seek_id: u64 = if (cursor_mode) after_id +| 1 else 0;
-    const start_key = types.encodeU64(seek_id);
+    const start_key = codec.encodeU64(seek_id);
 
     var count: u32 = 0;
     var skipped: u32 = 0;
@@ -345,10 +345,10 @@ pub fn listAllLinks(
     var next_after_id: u64 = 0;
     var last_id: u64 = 0;
 
-    var iter = try db.links_by_id.rangeScan(&start_key, null);
+    var iter = try db.links_by_id().rangeScan(&start_key, null);
     while (try iter.next()) |entry| {
-        if (entry.value.len != @sizeOf(types.Link)) continue;
-        const link = std.mem.bytesToValue(types.Link, entry.value[0..@sizeOf(types.Link)]);
+        if (entry.value.len != @sizeOf(schema.Link)) continue;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
         if (status_filter) |s| if (link.status != s) continue;
         if (!cursor_mode and skipped < offset) {
             skipped += 1;
@@ -370,7 +370,7 @@ test "listLinksBySubmitter: returns only the requested user's submissions, order
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -382,7 +382,7 @@ test "listLinksBySubmitter: returns only the requested user's submissions, order
     _ = try createLinkWithOpts(db, top_id, "https://b2.example", "b2", "", .{ .submitter_id = 200 });
     _ = try createLinkWithOpts(db, top_id, "https://a3.example", "a3", "", .{ .submitter_id = 100 });
 
-    var buf: [10]types.Link = undefined;
+    var buf: [10]schema.Link = undefined;
 
     const a_links = (try listLinksBySubmitter(db, 100, 0, 10, &buf, null, 0)).items;
     try std.testing.expectEqual(@as(usize, 3), a_links.len);
@@ -402,7 +402,7 @@ test "listLinksBySubmitter: pagination via offset" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -413,7 +413,7 @@ test "listLinksBySubmitter: pagination via offset" {
         _ = try createLinkWithOpts(db, top_id, url, "x", "", .{ .submitter_id = 42 });
     }
 
-    var buf: [10]types.Link = undefined;
+    var buf: [10]schema.Link = undefined;
     const page1 = (try listLinksBySubmitter(db, 42, 0, 2, &buf, null, 0)).items;
     try std.testing.expectEqual(@as(usize, 2), page1.len);
     const first_id = page1[0].id;
@@ -429,7 +429,7 @@ test "listLinksBySubmitter: cursor (after_id) resumes past the given id" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -441,7 +441,7 @@ test "listLinksBySubmitter: cursor (after_id) resumes past the given id" {
         ids[i] = try createLinkWithOpts(db, top_id, url, "c", "", .{ .submitter_id = 77 });
     }
 
-    var buf: [10]types.Link = undefined;
+    var buf: [10]schema.Link = undefined;
 
     const p1 = try listLinksBySubmitter(db, 77, 0, 2, &buf, null, 0);
     try std.testing.expectEqual(@as(usize, 2), p1.items.len);
@@ -465,13 +465,13 @@ test "countsByStatus tallies per-status totals" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const pending = @intFromEnum(types.LinkStatus.pending);
-    const approved = @intFromEnum(types.LinkStatus.approved);
-    const rejected = @intFromEnum(types.LinkStatus.rejected);
+    const pending = @intFromEnum(schema.LinkStatus.pending);
+    const approved = @intFromEnum(schema.LinkStatus.approved);
+    const rejected = @intFromEnum(schema.LinkStatus.rejected);
 
     _ = try createLinkWithOpts(db, top_id, "https://p1.example", "p1", "", .{ .status = pending });
     _ = try createLinkWithOpts(db, top_id, "https://p2.example", "p2", "", .{ .status = pending });
@@ -490,13 +490,13 @@ test "countsByStatus: status change moves the tally; text edit does not" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const pending = @intFromEnum(types.LinkStatus.pending);
-    const approved = @intFromEnum(types.LinkStatus.approved);
-    const rejected = @intFromEnum(types.LinkStatus.rejected);
+    const pending = @intFromEnum(schema.LinkStatus.pending);
+    const approved = @intFromEnum(schema.LinkStatus.approved);
+    const rejected = @intFromEnum(schema.LinkStatus.rejected);
 
     const id = try createLinkWithOpts(db, top_id, "https://flip.example", "f", "", .{ .status = pending });
     {
@@ -534,11 +534,11 @@ test "countsByStatus: deleteLink decrements the tally" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const approved = @intFromEnum(types.LinkStatus.approved);
+    const approved = @intFromEnum(schema.LinkStatus.approved);
     const id = try createLinkWithOpts(db, top_id, "https://del.example", "d", "", .{ .status = approved });
     try std.testing.expectEqual(@as(u64, 1), (try countsByStatus(db)).approved);
 
@@ -551,11 +551,11 @@ test "recountLinkStatuses: counters are reseeded from disk on reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const pending = @intFromEnum(types.LinkStatus.pending);
-    const approved = @intFromEnum(types.LinkStatus.approved);
+    const pending = @intFromEnum(schema.LinkStatus.pending);
+    const approved = @intFromEnum(schema.LinkStatus.approved);
 
     {
-        var db = try Database.openTestInstance(allocator, &tmp);
+        var db = try Directory.openTestInstance(allocator, &tmp);
         defer db.deinitTestInstance();
         const top_id = try category.createCategory(db, 0, "Top", "top", "");
         _ = try createLinkWithOpts(db, top_id, "https://p1.example", "p1", "", .{ .status = pending });
@@ -564,7 +564,7 @@ test "recountLinkStatuses: counters are reseeded from disk on reopen" {
     }
 
     {
-        var db = try Database.openTestInstance(allocator, &tmp);
+        var db = try Directory.openTestInstance(allocator, &tmp);
         defer db.deinitTestInstance();
         try db.recover();
         const c = try countsByStatus(db);
@@ -578,12 +578,12 @@ test "updateLinkStatusBulkOne maps no-op to AlreadyInState and missing to LinkNo
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const pending = @intFromEnum(types.LinkStatus.pending);
-    const approved = @intFromEnum(types.LinkStatus.approved);
+    const pending = @intFromEnum(schema.LinkStatus.pending);
+    const approved = @intFromEnum(schema.LinkStatus.approved);
     const id = try createLinkWithOpts(db, top_id, "https://s.example", "s", "", .{ .status = pending });
 
     try updateLinkStatusBulkOne(db, id, approved);
@@ -598,13 +598,13 @@ test "deleteLink removes link_by_submitter entry" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const link_id = try createLinkWithOpts(db, top_id, "https://gone.example", "g", "", .{ .submitter_id = 7 });
 
-    var buf: [4]types.Link = undefined;
+    var buf: [4]schema.Link = undefined;
     {
         const before = (try listLinksBySubmitter(db, 7, 0, 4, &buf, null, 0)).items;
         try std.testing.expectEqual(@as(usize, 1), before.len);
@@ -620,10 +620,10 @@ test "createLink rollback: failure during secondary insert leaves no trace in pr
     const std_t = std.testing;
 
     const allocator = std_t.allocator;
-    var mt = memtable.MemTable.init(allocator);
+    var mt = zigstore.MemTable.init(allocator);
     defer mt.deinit();
 
-    const k1 = types.encodeU64(123);
+    const k1 = codec.encodeU64(123);
     try mt.put(&k1, "value");
 
     const before = mt.get(&k1);
@@ -639,7 +639,7 @@ test "createLink cascades link_count_subtree up the chain" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -660,7 +660,7 @@ test "createLink: links_index_tree has token entries" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -668,13 +668,13 @@ test "createLink: links_index_tree has token entries" {
 
     var v_buf: [8]u8 = undefined;
     var key_buf: [128]u8 = undefined;
-    const id_be = types.encodeU64(link_id);
+    const id_be = codec.encodeU64(link_id);
 
     const expected_tokens = [_][]const u8{ "hello", "https", "greeting" };
     for (expected_tokens) |tok| {
         @memcpy(key_buf[0..tok.len], tok);
         @memcpy(key_buf[tok.len..][0..8], &id_be);
-        const found = try db.links_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf);
+        const found = try db.links_index_tree().search(key_buf[0 .. tok.len + 8], &v_buf);
         try std.testing.expect(found != null);
     }
 }
@@ -683,7 +683,7 @@ test "deleteLink cascades link_count_subtree decrement" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -702,7 +702,7 @@ test "deleteLink: tokens are removed from links_index_tree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -710,12 +710,12 @@ test "deleteLink: tokens are removed from links_index_tree" {
 
     var v_buf: [8]u8 = undefined;
     var key_buf: [128]u8 = undefined;
-    const id_be = types.encodeU64(link_id);
+    const id_be = codec.encodeU64(link_id);
     const expected_tokens = [_][]const u8{ "goodbye", "https", "farewell" };
     for (expected_tokens) |tok| {
         @memcpy(key_buf[0..tok.len], tok);
         @memcpy(key_buf[tok.len..][0..8], &id_be);
-        const found = try db.links_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf);
+        const found = try db.links_index_tree().search(key_buf[0 .. tok.len + 8], &v_buf);
         try std.testing.expect(found != null);
     }
     try std.testing.expect((try getLink(db, link_id)) != null);
@@ -727,7 +727,7 @@ test "deleteLink: tokens are removed from links_index_tree" {
     for (expected_tokens) |tok| {
         @memcpy(key_buf[0..tok.len], tok);
         @memcpy(key_buf[tok.len..][0..8], &id_be);
-        const found = try db.links_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf);
+        const found = try db.links_index_tree().search(key_buf[0 .. tok.len + 8], &v_buf);
         try std.testing.expect(found == null);
     }
 }
@@ -736,7 +736,7 @@ test "updateLink: title tokens swapped in links_index_tree" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -744,12 +744,12 @@ test "updateLink: title tokens swapped in links_index_tree" {
 
     var v_buf: [8]u8 = undefined;
     var key_buf: [128]u8 = undefined;
-    const id_be = types.encodeU64(link_id);
+    const id_be = codec.encodeU64(link_id);
     {
         const tok = "hello";
         @memcpy(key_buf[0..tok.len], tok);
         @memcpy(key_buf[tok.len..][0..8], &id_be);
-        const found = try db.links_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf);
+        const found = try db.links_index_tree().search(key_buf[0 .. tok.len + 8], &v_buf);
         try std.testing.expect(found != null);
     }
 
@@ -759,14 +759,14 @@ test "updateLink: title tokens swapped in links_index_tree" {
         const tok = "hello";
         @memcpy(key_buf[0..tok.len], tok);
         @memcpy(key_buf[tok.len..][0..8], &id_be);
-        const found = try db.links_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf);
+        const found = try db.links_index_tree().search(key_buf[0 .. tok.len + 8], &v_buf);
         try std.testing.expect(found == null);
     }
     {
         const tok = "world";
         @memcpy(key_buf[0..tok.len], tok);
         @memcpy(key_buf[tok.len..][0..8], &id_be);
-        const found = try db.links_index_tree.search(key_buf[0 .. tok.len + 8], &v_buf);
+        const found = try db.links_index_tree().search(key_buf[0 .. tok.len + 8], &v_buf);
         try std.testing.expect(found != null);
     }
 
@@ -778,7 +778,7 @@ test "multiple links cascade correctly" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
@@ -801,19 +801,19 @@ test "moveLink: happy path swaps category + updates both chains" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "A", "a", "");
     const b_id = try ops.createCategory(db, top_id, "B", "b", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
-    db.drainOneMemtable(&db.mt_cat_by_parent, &db.cat_by_parent);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const link_id = try ops.createLink(db, a_id, "https://move.test/x", "Move Me", "");
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
-    db.drainOneMemtable(&db.mt_link_by_category, &db.link_by_category);
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     try ops.moveLink(db, link_id, b_id);
 
@@ -832,16 +832,16 @@ test "moveLink: same category is a no-op success" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "A", "a", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     const link_id = try ops.createLink(db, a_id, "https://noop.test/x", "Noop", "");
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     try ops.moveLink(db, link_id, a_id);
 
@@ -853,12 +853,12 @@ test "moveLink: missing link returns LinkNotFound" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     const result = ops.moveLink(db, 9999, top_id);
     try std.testing.expectError(OperationError.LinkNotFound, result);
@@ -868,16 +868,16 @@ test "moveLink: missing target category returns CategoryNotFound" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try Database.openTestInstance(allocator, &tmp);
+    var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
 
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "A", "a", "");
-    db.drainOneMemtable(&db.mt_categories_by_id, &db.categories_by_id);
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     const link_id = try ops.createLink(db, a_id, "https://x.test/x", "X", "");
-    db.drainOneMemtable(&db.mt_links_by_id, &db.links_by_id);
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const result = ops.moveLink(db, link_id, 99999);
     try std.testing.expectError(OperationError.CategoryNotFound, result);

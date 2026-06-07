@@ -1,29 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
+const zigstore = @import("zigstore");
 
-pub const page = @import("page.zig");
-pub const file_header = @import("file_header.zig");
-pub const btree = @import("btree/btree.zig");
-pub const page_cache = @import("page_cache.zig");
-pub const freelist = @import("freelist.zig");
-pub const types = @import("types.zig");
-pub const inverted_index = @import("inverted_index.zig");
-pub const memtable = @import("memtable.zig");
-pub const bloom = @import("bloom.zig");
+pub const schema = @import("schema.zig");
 pub const operations = @import("operations/operations.zig");
-pub const database = @import("database.zig");
-pub const epoll_server = @import("epoll.zig");
-pub const connection = @import("connection.zig");
-pub const signal = @import("signal.zig");
-pub const wal = @import("wal/wal.zig");
-pub const wal_replay = @import("wal/wal_replay.zig");
-pub const snapshot = @import("snapshot.zig");
+pub const directory = @import("directory.zig");
 pub const binary_protocol = @import("binary_protocol.zig");
 pub const subtree = @import("subtree.zig");
 pub const verifier = @import("verifier.zig");
 
-const Database = database.Database;
-const EpollServer = epoll_server.EpollServer;
+const Directory = directory.Directory;
 
 const log = std.log.scoped(.dmozdb);
 
@@ -150,6 +136,23 @@ pub const Config = struct {
     pub fn isProtectedMode(self: *const Config) bool {
         return self.bind_address[0] != 127 and self.trusted_count == 0 and self.trusted_cidr_count == 0;
     }
+
+    pub fn toServerConfig(self: *const Config) zigstore.ServerConfig {
+        var sc = zigstore.ServerConfig{
+            .port = self.port,
+            .bind_address = self.bind_address,
+            .cache_size_mb = self.cache_size_mb,
+            .thread_count = self.thread_count,
+            .snapshot_interval_s = self.snapshot_interval_s,
+            .wal_sync_interval_ms = self.wal_sync_interval_ms,
+            .wal_batch_size = self.wal_batch_size,
+            .trusted_count = self.trusted_count,
+            .trusted_cidr_count = self.trusted_cidr_count,
+        };
+        @memcpy(&sc.trusted_ips, &self.trusted_ips);
+        @memcpy(std.mem.asBytes(&sc.trusted_cidrs), std.mem.asBytes(&self.trusted_cidrs));
+        return sc;
+    }
 };
 
 fn octetsToU32(a: [4]u8) u32 {
@@ -187,12 +190,6 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
     return octets;
 }
 
-fn runReactor(reactor: *EpollServer) void {
-    reactor.run() catch |err| {
-        log.err("Reactor error: {}", .{err});
-    };
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -207,7 +204,7 @@ pub fn main() !void {
         config.trusted_count,
     });
 
-    const db = try Database.init(allocator, config);
+    const db = try Directory.init(allocator, config);
     defer db.deinit();
 
     try db.recover();
@@ -215,56 +212,13 @@ pub fn main() !void {
 
     log.info("Database ready. Starting server on port {d}...", .{config.port});
 
-    signal.setupSignalHandlers() catch |err| {
-        log.err("Failed to setup signal handlers: {}", .{err});
-        return err;
-    };
-
-    const num_reactors: u32 = @max(config.thread_count / 2, 1);
-    log.info("Starting {d} reactor(s)...", .{num_reactors});
-
-    const reactors = try EpollServer.createMulti(allocator, db, config, num_reactors);
-    defer {
-        for (reactors) |r| r.destroy();
-        allocator.free(reactors);
-    }
-
-    var reactor_threads = try allocator.alloc(std.Thread, num_reactors - 1);
-    defer allocator.free(reactor_threads);
-
-    for (reactors[1..], 0..) |r, i| {
-        reactor_threads[i] = std.Thread.spawn(.{}, runReactor, .{r}) catch |err| {
-            log.err("Failed to spawn reactor thread: {}", .{err});
-            return err;
-        };
-    }
-
-    reactors[0].run() catch |err| {
-        log.err("Primary reactor error: {}", .{err});
-        return err;
-    };
-
-    for (reactor_threads) |t| t.join();
-
-    log.info("Shutdown complete.", .{});
+    try zigstore.run(directory.Store, db, Directory.handler(), config.toServerConfig());
 }
 
 test {
-    _ = page;
-    _ = file_header;
-    _ = btree;
-    _ = page_cache;
-    _ = freelist;
-    _ = types;
-    _ = inverted_index;
+    _ = schema;
     _ = operations;
-    _ = database;
-    _ = epoll_server;
-    _ = connection;
-    _ = signal;
-    _ = wal;
-    _ = wal_replay;
-    _ = snapshot;
+    _ = directory;
     _ = binary_protocol;
     _ = subtree;
     _ = verifier;
@@ -275,7 +229,6 @@ test {
     _ = @import("apply/apply_link.zig");
     _ = @import("apply/apply_category.zig");
     _ = @import("apply/apply_repair.zig");
-    _ = @import("commit.zig");
     _ = @import("repair/repair_worker.zig");
     _ = @import("operations/operations_shared.zig");
     _ = @import("operations/operations_changeset_compute.zig");
@@ -284,12 +237,6 @@ test {
     _ = @import("operations/operations_search.zig");
     _ = @import("operations/operations_slug.zig");
     _ = @import("repair/repair.zig");
-    _ = @import("histogram.zig");
-    _ = @import("btree/btree_search.zig");
-    _ = @import("btree/btree_insert.zig");
-    _ = @import("btree/btree_delete.zig");
-    _ = @import("btree/btree_repair.zig");
-    _ = @import("btree/btree_helpers.zig");
 }
 
 test "parseIpv4 valid" {
