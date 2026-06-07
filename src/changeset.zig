@@ -1,6 +1,7 @@
 const std = @import("std");
-const types = @import("types.zig");
-
+const codec = @import("zigstore").codec;
+const wire_codec = @import("zigstore").wire_codec;
+const schema = @import("schema.zig");
 pub const Op = enum(u8) {
     link_inserted = 1,
     link_deleted = 2,
@@ -36,39 +37,39 @@ pub const SlugPathSwap = struct {
 
 pub const EnqueueOnApply = struct {
     seq: u64 = 0,
-    op: types.RepairOp = .renamed_slug,
+    op: schema.RepairOp = .renamed_slug,
     old_slug_prefix: []const u8 = &.{},
     created_at: i64 = 0,
 };
 
 pub const LinkInsertEffect = struct {
-    link: types.Link,
+    link: schema.Link,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
 };
 
 pub const LinkDeleteEffect = struct {
-    link: types.Link,
+    link: schema.Link,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
 };
 
 pub const LinkTextUpdateEffect = struct {
-    old_link: types.Link,
-    new_link: types.Link,
+    old_link: schema.Link,
+    new_link: schema.Link,
     old_tokens: []const Token,
     new_tokens: []const Token,
 };
 
 pub const LinkRecatEffect = struct {
-    link: types.Link,
+    link: schema.Link,
     old_category_id: u64,
     old_chain_updates: []const AncestorUpdate,
     new_chain_updates: []const AncestorUpdate,
 };
 
 pub const CategoryInsertEffect = struct {
-    cat: types.Category,
+    cat: schema.Category,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
     slug_path: []const u8,
@@ -76,22 +77,22 @@ pub const CategoryInsertEffect = struct {
 };
 
 pub const CategoryDeleteEffect = struct {
-    cat: types.Category,
+    cat: schema.Category,
     ancestor_updates: []const AncestorUpdate,
     tokens: []const Token,
     slug_path: []const u8,
 };
 
 pub const CategoryTextUpdateEffect = struct {
-    old_cat: types.Category,
-    new_cat: types.Category,
+    old_cat: schema.Category,
+    new_cat: schema.Category,
     old_tokens: []const Token,
     new_tokens: []const Token,
 };
 
 pub const CategoryRenameEffect = struct {
-    old_cat: types.Category,
-    new_cat: types.Category,
+    old_cat: schema.Category,
+    new_cat: schema.Category,
     old_slug_path: []const u8,
     new_slug_path: []const u8,
     descendant_swaps: []const SlugPathSwap,
@@ -100,7 +101,7 @@ pub const CategoryRenameEffect = struct {
 };
 
 pub const CategoryMoveEffect = struct {
-    cat: types.Category,
+    cat: schema.Category,
     old_parent_id: u64,
     new_parent_id: u64,
     old_chain_updates: []const AncestorUpdate,
@@ -139,10 +140,7 @@ pub const ChangeSet = union(Op) {
 
 pub const SCHEMA_VERSION: u8 = 1;
 
-pub const EncodeError = error{
-    OutOfMemory,
-    StringTooLong,
-};
+pub const CHANGESET_OP: u8 = 100;
 
 pub const DecodeError = error{
     BufferTooShort,
@@ -161,7 +159,7 @@ pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
 
     inline for (@typeInfo(ChangeSet).@"union".fields) |uf| {
         if (std.mem.eql(u8, uf.name, @tagName(std.meta.activeTag(cs)))) {
-            try encodeStruct(allocator, &buf, @field(cs, uf.name));
+            try wire_codec.encodeStruct(allocator, &buf, @field(cs, uf.name));
         }
     }
 
@@ -176,99 +174,11 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
     var cur: usize = 2;
     inline for (@typeInfo(ChangeSet).@"union".fields) |uf| {
         if (@field(Op, uf.name) == tag) {
-            const variant = try decodeStruct(arena, uf.type, bytes, &cur);
+            const variant = try wire_codec.decodeStruct(arena, uf.type, bytes, &cur);
             return @unionInit(ChangeSet, uf.name, variant);
         }
     }
     unreachable;
-}
-
-fn encodeStruct(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
-    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |f| {
-        try encodeField(a, buf, @field(value, f.name));
-    }
-}
-
-fn encodeField(a: std.mem.Allocator, buf: *std.ArrayList(u8), value: anytype) EncodeError!void {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .int => |info| {
-            var b: [@divExact(info.bits, 8)]u8 = undefined;
-            std.mem.writeInt(T, &b, value, .big);
-            try buf.appendSlice(a, &b);
-        },
-        .bool => try buf.append(a, if (value) 1 else 0),
-        .@"enum" => try buf.append(a, @intFromEnum(value)),
-        .@"struct" => |s| {
-            if (s.layout == .@"extern") {
-                try buf.appendSlice(a, std.mem.asBytes(&value));
-            } else try encodeStruct(a, buf, value);
-        },
-        .pointer => |p| {
-            comptime std.debug.assert(p.size == .slice);
-            if (value.len > std.math.maxInt(u32)) return EncodeError.StringTooLong;
-            try encodeField(a, buf, @as(u32, @intCast(value.len)));
-            if (p.child == u8) {
-                try buf.appendSlice(a, value);
-            } else for (value) |item| try encodeField(a, buf, item);
-        },
-        else => @compileError("changeset: unsupported field type " ++ @typeName(T)),
-    }
-}
-
-fn decodeStruct(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cur: *usize) DecodeError!T {
-    var out: T = undefined;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        @field(out, f.name) = try decodeField(arena, f.type, bytes, cur);
-    }
-    return out;
-}
-
-fn decodeField(arena: std.mem.Allocator, comptime T: type, bytes: []const u8, cur: *usize) DecodeError!T {
-    switch (@typeInfo(T)) {
-        .int => |info| {
-            const sz = @divExact(info.bits, 8);
-            if (cur.* + sz > bytes.len) return DecodeError.BufferTooShort;
-            const v = std.mem.readInt(T, bytes[cur.*..][0..sz], .big);
-            cur.* += sz;
-            return v;
-        },
-        .bool => {
-            if (cur.* >= bytes.len) return DecodeError.BufferTooShort;
-            const v = bytes[cur.*] != 0;
-            cur.* += 1;
-            return v;
-        },
-        .@"enum" => {
-            if (cur.* >= bytes.len) return DecodeError.BufferTooShort;
-            const v = std.meta.intToEnum(T, bytes[cur.*]) catch return DecodeError.InvalidEnumValue;
-            cur.* += 1;
-            return v;
-        },
-        .@"struct" => |s| {
-            if (s.layout == .@"extern") {
-                if (cur.* + @sizeOf(T) > bytes.len) return DecodeError.BufferTooShort;
-                const v = std.mem.bytesToValue(T, bytes[cur.*..][0..@sizeOf(T)]);
-                cur.* += @sizeOf(T);
-                return v;
-            } else return try decodeStruct(arena, T, bytes, cur);
-        },
-        .pointer => |p| {
-            comptime std.debug.assert(p.size == .slice);
-            const n = try decodeField(arena, u32, bytes, cur);
-            if (p.child == u8) {
-                if (cur.* + n > bytes.len) return DecodeError.BufferTooShort;
-                const out = try arena.dupe(u8, bytes[cur.* .. cur.* + n]);
-                cur.* += n;
-                return out;
-            }
-            if (n > bytes.len - cur.*) return DecodeError.BufferTooShort;
-            const out = try arena.alloc(p.child, n);
-            for (out) |*item| item.* = try decodeField(arena, p.child, bytes, cur);
-            return out;
-        },
-        else => @compileError("changeset: unsupported field type " ++ @typeName(T)),
-    }
 }
 
 test "ChangeSet variant tags match Op enum" {
@@ -282,12 +192,12 @@ test "encode/decode roundtrip — link_inserted" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const link = types.Link{
+    const link = schema.Link{
         .id = 42,
         .category_id = 7,
-        .url = types.FixedString(64).fromSlice("https://example.com"),
-        .title = types.FixedString(128).fromSlice("Example"),
-        .description = types.FixedString(256).fromSlice("desc"),
+        .url = codec.FixedString(64).fromSlice("https://example.com"),
+        .title = codec.FixedString(128).fromSlice("Example"),
+        .description = codec.FixedString(256).fromSlice("desc"),
         .sort_order = 0,
         .created_at = 1000,
         .updated_at = 1000,
@@ -328,7 +238,7 @@ test "encode/decode roundtrip — link_deleted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const link = types.Link{ .id = 99, .category_id = 5 };
+    const link = schema.Link{ .id = 99, .category_id = 5 };
     const ancestors = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 5, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
@@ -355,8 +265,8 @@ test "encode/decode roundtrip — link_text_updated" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const old_link = types.Link{ .id = 11, .title = types.FixedString(128).fromSlice("Old") };
-    const new_link = types.Link{ .id = 11, .title = types.FixedString(128).fromSlice("New") };
+    const old_link = schema.Link{ .id = 11, .title = codec.FixedString(128).fromSlice("Old") };
+    const new_link = schema.Link{ .id = 11, .title = codec.FixedString(128).fromSlice("New") };
     const old_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .title }});
     const new_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "new"), .field = .title }});
     const cs = ChangeSet{ .link_text_updated = .{
@@ -387,7 +297,7 @@ test "encode/decode roundtrip — link_recategorized" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const link = types.Link{ .id = 7, .category_id = 22 };
+    const link = schema.Link{ .id = 7, .category_id = 22 };
     const old_chain = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 5, .link_count_subtree_delta = 3, .child_count_subtree_delta = 1 },
     });
@@ -422,11 +332,11 @@ test "encode/decode roundtrip — category_inserted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cat = types.Category{
+    const cat = schema.Category{
         .id = 50,
         .parent_id = 1,
-        .name = types.FixedString(64).fromSlice("Books"),
-        .slug = types.FixedString(128).fromSlice("books"),
+        .name = codec.FixedString(64).fromSlice("Books"),
+        .slug = codec.FixedString(128).fromSlice("books"),
     };
     const ancestors = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
@@ -460,7 +370,7 @@ test "encode/decode roundtrip — category_deleted" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cat = types.Category{ .id = 60, .parent_id = 1 };
+    const cat = schema.Category{ .id = 60, .parent_id = 1 };
     const ancestors = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
@@ -491,8 +401,8 @@ test "encode/decode roundtrip — category_text_updated" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const old_cat = types.Category{ .id = 70, .description = types.FixedString(1024).fromSlice("Old desc") };
-    const new_cat = types.Category{ .id = 70, .description = types.FixedString(1024).fromSlice("New desc") };
+    const old_cat = schema.Category{ .id = 70, .description = codec.FixedString(1024).fromSlice("Old desc") };
+    const new_cat = schema.Category{ .id = 70, .description = codec.FixedString(1024).fromSlice("New desc") };
     const old_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .desc }});
     const new_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "new"), .field = .desc }});
     const cs = ChangeSet{ .category_text_updated = .{
@@ -521,8 +431,8 @@ test "encode/decode roundtrip — category_renamed" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const old_cat = types.Category{ .id = 80, .slug = types.FixedString(128).fromSlice("old") };
-    const new_cat = types.Category{ .id = 80, .slug = types.FixedString(128).fromSlice("new") };
+    const old_cat = schema.Category{ .id = 80, .slug = codec.FixedString(128).fromSlice("old") };
+    const new_cat = schema.Category{ .id = 80, .slug = codec.FixedString(128).fromSlice("new") };
     const cs = ChangeSet{ .category_renamed = .{
         .old_cat = old_cat,
         .new_cat = new_cat,
@@ -553,7 +463,7 @@ test "encode/decode roundtrip — category_moved" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const cat = types.Category{ .id = 90, .parent_id = 200 };
+    const cat = schema.Category{ .id = 90, .parent_id = 200 };
     const old_chain = try a.dupe(AncestorUpdate, &.{
         .{ .cat_id = 100, .link_count_subtree_delta = 4, .child_count_subtree_delta = 2 },
     });

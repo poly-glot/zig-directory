@@ -1,7 +1,7 @@
 const std = @import("std");
-const types = @import("../types.zig");
+const codec = @import("zigstore").codec;
 const changeset = @import("../changeset.zig");
-const Database = @import("../database.zig").Database;
+const Directory = @import("../directory.zig").Directory;
 
 const apply_link = @import("apply_link.zig");
 const apply_category = @import("apply_category.zig");
@@ -10,9 +10,9 @@ const apply_repair = @import("apply_repair.zig");
 pub const ApplyError = error{
     OutOfMemory,
     NotImplemented,
-} || @import("../btree/btree.zig").BTreeError;
+} || @import("zigstore").BTreeError;
 
-pub fn apply(db: *Database, cs: changeset.ChangeSet) !void {
+pub fn apply(db: *Directory, cs: changeset.ChangeSet) !void {
     return switch (cs) {
         .link_inserted => |e| apply_link.applyLinkInserted(db, e),
         .link_deleted => |e| apply_link.applyLinkDeleted(db, e),
@@ -43,7 +43,7 @@ fn applyDeltaU32(base: u32, delta: i64) u32 {
 }
 
 pub fn cascadeAncestorCounts(
-    db: *Database,
+    db: *Directory,
     updates: []const changeset.AncestorUpdate,
     direct_target_id: u64,
     comptime direct_field: DirectField,
@@ -64,7 +64,7 @@ pub fn cascadeAncestorCounts(
                 @field(cat, fld) -= 1;
             }
         }
-        const ancestor_key = types.encodeU64(upd.cat_id);
-        try db.mt_categories_by_id.put(&ancestor_key, std.mem.asBytes(&cat));
+        const ancestor_key = codec.encodeU64(upd.cat_id);
+        try db.mt_categories_by_id().put(&ancestor_key, std.mem.asBytes(&cat));
     }
 }
