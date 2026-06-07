@@ -223,6 +223,9 @@
 .section.gray {
   background: var(--paper-2);
 }
+.section.empty {
+  background: var(--surface-empty);
+}
 .section.dark {
   background: var(--ink);
   color: var(--paper);

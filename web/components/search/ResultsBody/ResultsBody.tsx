@@ -133,9 +133,11 @@ function ListingsSection(
   );
 }
 
-function SectionBanner({ children }: { children: preact.ComponentChildren }) {
+function SectionBanner(
+  { children, tint }: { children: preact.ComponentChildren; tint?: boolean },
+) {
   return (
-    <section class="section">
+    <section class={tint ? "section empty" : "section"}>
       <div class="container">{children}</div>
     </section>
   );
@@ -167,7 +169,7 @@ export default function ResultsBody(props: Props) {
   }
   if (!hasQuery) {
     return (
-      <SectionBanner>
+      <SectionBanner tint>
         <ul class="list">
           <EmptyPrompt />
         </ul>
@@ -176,7 +178,7 @@ export default function ResultsBody(props: Props) {
   }
   if (totalRaw === 0) {
     return (
-      <SectionBanner>
+      <SectionBanner tint>
         <ul class="list">
           <NoResults query={query} />
         </ul>

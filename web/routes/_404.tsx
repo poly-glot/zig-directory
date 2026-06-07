@@ -54,7 +54,7 @@ export default define.page<typeof handler>(function NotFoundPage(props) {
   const categories = props.data?.categories ?? [];
   return (
     <>
-      <section class="section">
+      <section class="section empty">
         <div class="container">
           <div class={`${styles.layout} notfound`}>
             <div class={`${styles.big} big`}>404</div>

@@ -210,7 +210,7 @@ export default define.page<typeof handler>(function CategoryPage(props) {
 
   return (
     <>
-      <div class={`container ${styles.page}`}>
+      <div class={`container ${styles.page} ${isEmpty ? styles.flush : ""}`}>
         {category
           ? (() => {
             // Skip the canonical "Top" root — it isn't a navigable page;

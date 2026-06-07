@@ -2,7 +2,7 @@ import Eyebrow from "../../common/Eyebrow/Eyebrow.tsx";
 
 export default function EmptyState() {
   return (
-    <section class="section">
+    <section class="section empty">
       <div class="container text-center">
         <Eyebrow muted label="Empty" />
         <h2 class="h1 mt-16">Nothing listed here yet.</h2>

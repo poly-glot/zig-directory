@@ -2,6 +2,10 @@
   padding-bottom: 64px;
 }
 
+.page.flush {
+  padding-bottom: 0;
+}
+
 /* Two-column shell with sticky aside — also used by /search. Shared as a
    layout utility, scoped here. */
 .shell {
