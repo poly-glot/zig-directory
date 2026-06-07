@@ -237,33 +237,35 @@ pub fn deleteLink(db: *Directory, id: u64) !void {
 
 pub const LinkPage = struct { items: []schema.Link, next_after_id: u64 };
 
-pub fn listLinks(
+fn resolveLinkById(db: *Directory, value: []const u8) !?schema.Link {
+    if (value.len < 8) return OperationError.DatabaseCorrupted;
+    return getLink(db, codec.decodeU64(value));
+}
+
+fn resolveLinkValue(_: *Directory, value: []const u8) !?schema.Link {
+    if (value.len != @sizeOf(schema.Link)) return null;
+    return std.mem.bytesToValue(schema.Link, value[0..@sizeOf(schema.Link)]);
+}
+
+fn paginateLinks(
     db: *Directory,
-    category_id: u64,
+    iter: anytype,
     offset: u32,
     limit: u32,
     buf: []schema.Link,
     status_filter: ?u8,
     after_id: u64,
+    comptime resolve: anytype,
 ) !LinkPage {
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
-
     const cursor_mode = after_id > 0;
-    const seek_id: u64 = if (cursor_mode) after_id +| 1 else 0;
-    const start_key = schema.CategoryLinkKey.encode(category_id, seek_id);
-    const end_key = schema.CategoryLinkKey.encode(category_id, std.math.maxInt(u64));
-
     var count: u32 = 0;
     var skipped: u32 = 0;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
     var next_after_id: u64 = 0;
     var last_id: u64 = 0;
+    const max = @min(limit, @as(u32, @intCast(buf.len)));
 
-    var iter = try db.link_by_category().rangeScan(&start_key, &end_key);
     while (try iter.next()) |entry| {
-        if (entry.value.len < 8) return OperationError.DatabaseCorrupted;
-        const link_id = codec.decodeU64(entry.value);
-        const link = (try getLink(db, link_id)) orelse continue;
+        const link = (try resolve(db, entry.value)) orelse continue;
         if (status_filter) |s| if (link.status != s) continue;
         if (!cursor_mode and skipped < offset) {
             skipped += 1;
@@ -279,6 +281,23 @@ pub fn listLinks(
     }
 
     return .{ .items = buf[0..count], .next_after_id = next_after_id };
+}
+
+pub fn listLinks(
+    db: *Directory,
+    category_id: u64,
+    offset: u32,
+    limit: u32,
+    buf: []schema.Link,
+    status_filter: ?u8,
+    after_id: u64,
+) !LinkPage {
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    const seek_id: u64 = if (after_id > 0) after_id +| 1 else 0;
+    const start_key = schema.CategoryLinkKey.encode(.{ category_id, seek_id });
+    const end_key = schema.CategoryLinkKey.encode(.{ category_id, std.math.maxInt(u64) });
+    var iter = try db.link_by_category().rangeScan(&start_key, &end_key);
+    return paginateLinks(db, &iter, offset, limit, buf, status_filter, after_id, resolveLinkById);
 }
 
 pub fn listLinksBySubmitter(
@@ -291,38 +310,11 @@ pub fn listLinksBySubmitter(
     after_id: u64,
 ) !LinkPage {
     db.drainOneMemtable(db.mt_link_by_submitter(), db.link_by_submitter());
-
-    const cursor_mode = after_id > 0;
-    const seek_id: u64 = if (cursor_mode) after_id +| 1 else 0;
-    const start_key = schema.SubmitterLinkKey.encode(submitter_id, seek_id);
-    const end_key = schema.SubmitterLinkKey.encode(submitter_id, std.math.maxInt(u64));
-
-    var count: u32 = 0;
-    var skipped: u32 = 0;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    var next_after_id: u64 = 0;
-    var last_id: u64 = 0;
-
+    const seek_id: u64 = if (after_id > 0) after_id +| 1 else 0;
+    const start_key = schema.SubmitterLinkKey.encode(.{ submitter_id, seek_id });
+    const end_key = schema.SubmitterLinkKey.encode(.{ submitter_id, std.math.maxInt(u64) });
     var iter = try db.link_by_submitter().rangeScan(&start_key, &end_key);
-    while (try iter.next()) |entry| {
-        if (entry.value.len < 8) return OperationError.DatabaseCorrupted;
-        const link_id = codec.decodeU64(entry.value);
-        const link = (try getLink(db, link_id)) orelse continue;
-        if (status_filter) |s| if (link.status != s) continue;
-        if (!cursor_mode and skipped < offset) {
-            skipped += 1;
-            continue;
-        }
-        if (count >= max) {
-            next_after_id = last_id;
-            break;
-        }
-        buf[count] = link;
-        last_id = link.id;
-        count += 1;
-    }
-
-    return .{ .items = buf[0..count], .next_after_id = next_after_id };
+    return paginateLinks(db, &iter, offset, limit, buf, status_filter, after_id, resolveLinkById);
 }
 
 pub fn listAllLinks(
@@ -334,36 +326,10 @@ pub fn listAllLinks(
     after_id: u64,
 ) !LinkPage {
     db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
-
-    const cursor_mode = after_id > 0;
-    const seek_id: u64 = if (cursor_mode) after_id +| 1 else 0;
+    const seek_id: u64 = if (after_id > 0) after_id +| 1 else 0;
     const start_key = codec.encodeU64(seek_id);
-
-    var count: u32 = 0;
-    var skipped: u32 = 0;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    var next_after_id: u64 = 0;
-    var last_id: u64 = 0;
-
     var iter = try db.links_by_id().rangeScan(&start_key, null);
-    while (try iter.next()) |entry| {
-        if (entry.value.len != @sizeOf(schema.Link)) continue;
-        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
-        if (status_filter) |s| if (link.status != s) continue;
-        if (!cursor_mode and skipped < offset) {
-            skipped += 1;
-            continue;
-        }
-        if (count >= max) {
-            next_after_id = last_id;
-            break;
-        }
-        buf[count] = link;
-        last_id = link.id;
-        count += 1;
-    }
-
-    return .{ .items = buf[0..count], .next_after_id = next_after_id };
+    return paginateLinks(db, &iter, offset, limit, buf, status_filter, after_id, resolveLinkValue);
 }
 
 test "listLinksBySubmitter: returns only the requested user's submissions, ordered by id" {

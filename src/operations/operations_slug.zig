@@ -13,7 +13,7 @@ pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
     var top_buf: [2048]u8 = undefined;
 
     if (try db.categories_by_slug_path().search(path, &v_buf)) |val| {
-        if (val.len == 8) maybe_id = std.mem.readInt(u64, val[0..8], .big);
+        if (val.len == 8) maybe_id = codec.decodeU64(val[0..8]);
     }
     if (maybe_id == null and !std.mem.startsWith(u8, path, "top/")) {
         const need = "top/".len + path.len;
@@ -23,7 +23,7 @@ pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
             const with_top = top_buf[0..need];
             if (try db.categories_by_slug_path().search(with_top, &v_buf)) |val| {
                 if (val.len == 8) {
-                    maybe_id = std.mem.readInt(u64, val[0..8], .big);
+                    maybe_id = codec.decodeU64(val[0..8]);
                     resolved_path = with_top;
                 }
             }
@@ -31,7 +31,7 @@ pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
     }
     if (maybe_id == null and std.mem.indexOfScalar(u8, path, '/') == null) {
         if (try db.categories_by_slug_only().search(path, &v_buf)) |val| {
-            if (val.len == 8) maybe_id = std.mem.readInt(u64, val[0..8], .big);
+            if (val.len == 8) maybe_id = codec.decodeU64(val[0..8]);
         }
     }
     const cat_id = maybe_id orelse return null;
@@ -88,6 +88,44 @@ pub fn buildCanonicalSlugPath(db: *Directory, cat: *const schema.Category, buf: 
         pos += slug.len;
     }
     if (pos == 0) return null;
+    return buf[0..pos];
+}
+
+pub fn composeOldDescendantPath(
+    db: *Directory,
+    old_root_path: []const u8,
+    root_id: u64,
+    descendant_id: u64,
+    buf: []u8,
+) ![]const u8 {
+    var chain: [64]u64 = undefined;
+    var depth: u32 = 0;
+    var cur = descendant_id;
+    while (cur != root_id and depth < chain.len) : (depth += 1) {
+        chain[depth] = cur;
+        const c = (try category.getCategory(db, cur)) orelse return error.NotFound;
+        cur = c.parent_id;
+        if (cur == 0) return error.NotFound;
+    }
+    if (cur != root_id) return error.NotFound;
+
+    var pos: usize = 0;
+    if (old_root_path.len > buf.len) return error.NotFound;
+    @memcpy(buf[pos..][0..old_root_path.len], old_root_path);
+    pos += old_root_path.len;
+
+    var i: usize = depth;
+    while (i > 0) {
+        i -= 1;
+        const c = (try category.getCategory(db, chain[i])) orelse return error.NotFound;
+        const slug = c.slug.slice();
+        if (slug.len == 0) continue;
+        if (pos + 1 + slug.len > buf.len) return error.NotFound;
+        buf[pos] = '/';
+        pos += 1;
+        @memcpy(buf[pos..][0..slug.len], slug);
+        pos += slug.len;
+    }
     return buf[0..pos];
 }
 

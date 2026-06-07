@@ -594,6 +594,57 @@ fn writeLinkPage(resp: []u8, op_byte: u8, page: operations.LinkPage) usize {
     return off;
 }
 
+fn writeSubtreeLinkPage(
+    db: *Directory,
+    resp: []u8,
+    start_off: usize,
+    link_ids: []const u64,
+    limit: u32,
+    status_filter: ?u8,
+    after_id: u64,
+    offset: u32,
+    initial_total: u64,
+) struct { off: usize, written: u32, total: u64, next_after_id: u64 } {
+    const cursor_mode = after_id > 0;
+    var off = start_off;
+    var written: u32 = 0;
+    var total: u64 = initial_total;
+    var skipped: u32 = 0;
+    var passed_cursor = !cursor_mode;
+    var next_after_id: u64 = 0;
+    var last_written_id: u64 = 0;
+
+    for (link_ids) |lid| {
+        const link = (operations.getLink(db, lid) catch null) orelse continue;
+        if (status_filter) |s| {
+            if (link.status != s) continue;
+            total += 1;
+        }
+        if (!passed_cursor) {
+            if (link.id == after_id) passed_cursor = true;
+            continue;
+        }
+        if (!cursor_mode and status_filter != null and skipped < offset) {
+            skipped += 1;
+            continue;
+        }
+        if (written >= limit) {
+            next_after_id = last_written_id;
+            if (status_filter == null) break else continue;
+        }
+        if (off + @sizeOf(schema.Link) + 16 > resp.len) {
+            if (status_filter == null) break else continue;
+        }
+        const lb = std.mem.asBytes(&link);
+        @memcpy(resp[off..][0..lb.len], lb);
+        off += lb.len;
+        last_written_id = link.id;
+        written += 1;
+    }
+
+    return .{ .off = off, .written = written, .total = total, .next_after_id = next_after_id };
+}
+
 fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 17) return writeErrorResp(resp, op_byte, .invalid);
     const req = ListSubtreeLinksRequest.parse(payload);
@@ -648,47 +699,26 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
         ) catch |err| return writeMappedError(resp, op_byte, err);
     defer db.allocator.free(slice.link_ids);
 
-    var off: usize = RESPONSE_HEADER_SIZE + 4;
-    var written: u32 = 0;
-    var total: u64 = if (status_filter == null) slice.total else 0;
-    var skipped: u32 = 0;
-    var passed_cursor = !cursor_mode;
-    var next_after_id: u64 = 0;
-    var last_written_id: u64 = 0;
+    const start_off = RESPONSE_HEADER_SIZE + 4;
+    const initial_total: u64 = if (status_filter == null) slice.total else 0;
+    const pg = writeSubtreeLinkPage(
+        db,
+        resp,
+        start_off,
+        slice.link_ids,
+        limit,
+        status_filter,
+        extras.after_id,
+        req.offset,
+        initial_total,
+    );
+    var off = pg.off;
 
-    for (slice.link_ids) |lid| {
-        const link = (operations.getLink(db, lid) catch null) orelse continue;
-        if (status_filter) |s| {
-            if (link.status != s) continue;
-            total += 1;
-        }
-        if (!passed_cursor) {
-            if (link.id == extras.after_id) passed_cursor = true;
-            continue;
-        }
-        if (!cursor_mode and status_filter != null and skipped < req.offset) {
-            skipped += 1;
-            continue;
-        }
-        if (written >= limit) {
-            next_after_id = last_written_id;
-            if (status_filter == null) break else continue;
-        }
-        if (off + @sizeOf(schema.Link) + 16 > resp.len) {
-            if (status_filter == null) break else continue;
-        }
-        const lb = std.mem.asBytes(&link);
-        @memcpy(resp[off..][0..lb.len], lb);
-        off += lb.len;
-        last_written_id = link.id;
-        written += 1;
-    }
-
-    std.mem.writeInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], written, .little);
+    std.mem.writeInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], pg.written, .little);
     if (off + 16 > resp.len) return writeErrorResp(resp, op_byte, .err);
-    std.mem.writeInt(u64, resp[off..][0..8], total, .little);
+    std.mem.writeInt(u64, resp[off..][0..8], pg.total, .little);
     off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], next_after_id, .little);
+    std.mem.writeInt(u64, resp[off..][0..8], pg.next_after_id, .little);
     off += 8;
 
     writeOkHeader(resp, op_byte, off, 0);

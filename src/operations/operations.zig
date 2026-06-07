@@ -39,5 +39,5 @@ pub const searchCategories = search.searchCategories;
 pub const searchLinks = search.searchLinks;
 
 pub const resolveSlugPath = slug_mod.resolveSlugPath;
-pub const buildSlugPath = slug_mod.buildSlugPath;
 pub const buildCanonicalSlugPath = slug_mod.buildCanonicalSlugPath;
+pub const composeOldDescendantPath = slug_mod.composeOldDescendantPath;

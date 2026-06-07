@@ -1,16 +1,12 @@
 const std = @import("std");
 const codec = @import("zigstore").codec;
+const BPlusTree = @import("zigstore").BPlusTree;
 const changeset = @import("../changeset.zig");
 const Directory = @import("../directory.zig").Directory;
 
 const apply_link = @import("apply_link.zig");
 const apply_category = @import("apply_category.zig");
 const apply_repair = @import("apply_repair.zig");
-
-pub const ApplyError = error{
-    OutOfMemory,
-    NotImplemented,
-} || @import("zigstore").BTreeError;
 
 pub fn apply(db: *Directory, cs: changeset.ChangeSet) !void {
     return switch (cs) {
@@ -66,5 +62,25 @@ pub fn cascadeAncestorCounts(
         }
         const ancestor_key = codec.encodeU64(upd.cat_id);
         try db.mt_categories_by_id().put(&ancestor_key, std.mem.asBytes(&cat));
+    }
+}
+
+pub fn writeTokens(
+    tree: *BPlusTree,
+    tokens: []const changeset.Token,
+    id: u64,
+    comptime mode: enum { insert, delete },
+) !void {
+    for (tokens) |t| {
+        var key_buf: [4096]u8 = undefined;
+        const key_len = t.text.len + 8;
+        if (key_len > key_buf.len) continue;
+        @memcpy(key_buf[0..t.text.len], t.text);
+        const id_be = codec.encodeU64(id);
+        @memcpy(key_buf[t.text.len..][0..8], &id_be);
+        switch (mode) {
+            .insert => try tree.insert(key_buf[0..key_len], &.{}),
+            .delete => _ = try tree.delete(key_buf[0..key_len]),
+        }
     }
 }

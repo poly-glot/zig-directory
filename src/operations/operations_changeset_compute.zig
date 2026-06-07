@@ -7,6 +7,21 @@ const inverted = @import("zigstore").inverted_index;
 const category = @import("operations_category.zig");
 const slug_mod = @import("operations_slug.zig");
 
+const TokenSource = struct { text: []const u8, field: changeset.TokenField };
+
+fn appendTokens(out: *std.ArrayList(changeset.Token), allocator: std.mem.Allocator, sources: []const TokenSource) !void {
+    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    for (sources) |f| {
+        var iter = inverted.TokenIterator.init(f.text);
+        while (iter.next(&tok_buf)) |tok| {
+            try out.append(allocator, .{
+                .text = try allocator.dupe(u8, tok),
+                .field = f.field,
+            });
+        }
+    }
+}
+
 pub fn computeCategoryInsertChangeSet(
     db: *Directory,
     cat: schema.Category,
@@ -26,21 +41,11 @@ pub fn computeCategoryInsertChangeSet(
     }
 
     var tokens: std.ArrayList(changeset.Token) = .{};
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    const fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&tokens, allocator, &.{
         .{ .text = cat.name.slice(), .field = .name },
         .{ .text = cat.slug.slice(), .field = .slug },
         .{ .text = cat.description.slice(), .field = .desc },
-    };
-    for (fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     const slug_slice = cat.slug.slice();
     const slug_path: []const u8 = blk: {
@@ -89,39 +94,19 @@ pub fn computeCategoryTextUpdateChangeSet(
     new_cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-
     var old_tokens: std.ArrayList(changeset.Token) = .{};
-    const old_fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&old_tokens, allocator, &.{
         .{ .text = old_cat.name.slice(), .field = .name },
         .{ .text = old_cat.slug.slice(), .field = .slug },
         .{ .text = old_cat.description.slice(), .field = .desc },
-    };
-    for (old_fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try old_tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     var new_tokens: std.ArrayList(changeset.Token) = .{};
-    const new_fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&new_tokens, allocator, &.{
         .{ .text = new_cat.name.slice(), .field = .name },
         .{ .text = new_cat.slug.slice(), .field = .slug },
         .{ .text = new_cat.description.slice(), .field = .desc },
-    };
-    for (new_fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try new_tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     return changeset.ChangeSet{ .category_text_updated = .{
         .old_cat = old_cat,
@@ -131,39 +116,73 @@ pub fn computeCategoryTextUpdateChangeSet(
     } };
 }
 
-fn composeOldDescendantPath(
-    db: *Directory,
-    old_root_path: []const u8,
-    root_id: u64,
-    descendant_id: u64,
-    buf: []u8,
-) ![]const u8 {
-    var chain: [64]u64 = undefined;
-    var depth: u32 = 0;
-    var cur = descendant_id;
-    while (cur != root_id and depth < chain.len) : (depth += 1) {
-        chain[depth] = cur;
-        const c = (try category.getCategory(db, cur)) orelse return error.NotFound;
-        cur = c.parent_id;
-        if (cur == 0) return error.NotFound;
-    }
-    var pos: usize = 0;
-    if (old_root_path.len > buf.len) return error.NotFound;
-    @memcpy(buf[pos..][0..old_root_path.len], old_root_path);
-    pos += old_root_path.len;
+const DescendantSwaps = struct {
+    swaps: []changeset.SlugPathSwap,
+    above_threshold: bool,
+    enqueue: changeset.EnqueueOnApply,
+};
 
-    var idx: i32 = @intCast(@as(i64, @intCast(depth)) - 1);
-    while (idx >= 0) : (idx -= 1) {
-        const c = (try category.getCategory(db, chain[@intCast(idx)])) orelse return error.NotFound;
-        const slug = c.slug.slice();
-        if (slug.len == 0) continue;
-        if (pos + 1 + slug.len > buf.len) return error.NotFound;
-        buf[pos] = '/';
-        pos += 1;
-        @memcpy(buf[pos..][0..slug.len], slug);
-        pos += slug.len;
+fn collectDescendantSwaps(
+    db: *Directory,
+    root_id: u64,
+    old_path: []const u8,
+    new_path: []const u8,
+    op: schema.RepairOp,
+    allocator: std.mem.Allocator,
+) !DescendantSwaps {
+    const threshold = db.config.rename_inline_threshold;
+    var swaps: std.ArrayList(changeset.SlugPathSwap) = .{};
+    var above_threshold = false;
+    var descendant_count: u32 = 0;
+
+    var stack: std.ArrayList(u64) = .{};
+    defer stack.deinit(allocator);
+    try stack.append(allocator, root_id);
+
+    walk: while (stack.pop()) |cur_id| {
+        var children_buf: [256]schema.Category = undefined;
+        var offset: u32 = 0;
+        while (true) {
+            const children = try category.listChildren(db, cur_id, offset, 256, &children_buf);
+            if (children.len == 0) break;
+            for (children) |child| {
+                descendant_count += 1;
+                if (descendant_count > threshold) {
+                    above_threshold = true;
+                    break :walk;
+                }
+                var d_old_buf: [2048]u8 = undefined;
+                const d_old = slug_mod.composeOldDescendantPath(db, old_path, root_id, child.id, &d_old_buf) catch continue;
+                var d_new_buf: [2048]u8 = undefined;
+                const d_new = slug_mod.composeOldDescendantPath(db, new_path, root_id, child.id, &d_new_buf) catch continue;
+                try swaps.append(allocator, .{
+                    .old_path = try allocator.dupe(u8, d_old),
+                    .new_path = try allocator.dupe(u8, d_new),
+                    .cat_id = child.id,
+                });
+                try stack.append(allocator, child.id);
+            }
+            offset += @intCast(children.len);
+            if (children.len < 256) break;
+        }
     }
-    return buf[0..pos];
+
+    var enqueue: changeset.EnqueueOnApply = .{};
+    if (above_threshold) {
+        swaps.clearAndFree(allocator);
+        enqueue = .{
+            .seq = db.next_repair_seq.fetchAdd(1, .monotonic),
+            .op = op,
+            .old_slug_prefix = try allocator.dupe(u8, old_path),
+            .created_at = std.time.milliTimestamp(),
+        };
+    }
+
+    return .{
+        .swaps = try swaps.toOwnedSlice(allocator),
+        .above_threshold = above_threshold,
+        .enqueue = enqueue,
+    };
 }
 
 pub fn computeCategoryRenameChangeSet(
@@ -189,62 +208,16 @@ pub fn computeCategoryRenameChangeSet(
         break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent_path, new_slug });
     };
 
-    const threshold = db.config.rename_inline_threshold;
-    var swaps: std.ArrayList(changeset.SlugPathSwap) = .{};
-    var above_threshold = false;
-    var descendant_count: u32 = 0;
-
-    var stack: std.ArrayList(u64) = .{};
-    defer stack.deinit(allocator);
-    try stack.append(allocator, new_cat.id);
-
-    walk: while (stack.pop()) |cur_id| {
-        var children_buf: [256]schema.Category = undefined;
-        var offset: u32 = 0;
-        while (true) {
-            const children = try category.listChildren(db, cur_id, offset, 256, &children_buf);
-            if (children.len == 0) break;
-            for (children) |child| {
-                descendant_count += 1;
-                if (descendant_count > threshold) {
-                    above_threshold = true;
-                    break :walk;
-                }
-                var d_old_buf: [2048]u8 = undefined;
-                const d_old = composeOldDescendantPath(db, old_path, new_cat.id, child.id, &d_old_buf) catch continue;
-                var d_new_buf: [2048]u8 = undefined;
-                const d_new = composeOldDescendantPath(db, new_path, new_cat.id, child.id, &d_new_buf) catch continue;
-                try swaps.append(allocator, .{
-                    .old_path = try allocator.dupe(u8, d_old),
-                    .new_path = try allocator.dupe(u8, d_new),
-                    .cat_id = child.id,
-                });
-                try stack.append(allocator, child.id);
-            }
-            offset += @intCast(children.len);
-            if (children.len < 256) break;
-        }
-    }
-
-    var enqueue: changeset.EnqueueOnApply = .{};
-    if (above_threshold) {
-        swaps.clearAndFree(allocator);
-        enqueue = .{
-            .seq = db.next_repair_seq.fetchAdd(1, .monotonic),
-            .op = .renamed_slug,
-            .old_slug_prefix = try allocator.dupe(u8, old_path),
-            .created_at = std.time.milliTimestamp(),
-        };
-    }
+    const ds = try collectDescendantSwaps(db, new_cat.id, old_path, new_path, .renamed_slug, allocator);
 
     return changeset.ChangeSet{ .category_renamed = .{
         .old_cat = old_cat,
         .new_cat = new_cat,
         .old_slug_path = old_path,
         .new_slug_path = new_path,
-        .descendant_swaps = try swaps.toOwnedSlice(allocator),
-        .above_threshold = above_threshold,
-        .enqueue = enqueue,
+        .descendant_swaps = ds.swaps,
+        .above_threshold = ds.above_threshold,
+        .enqueue = ds.enqueue,
     } };
 }
 
@@ -267,21 +240,11 @@ pub fn computeCategoryDeleteChangeSet(
     }
 
     var tokens: std.ArrayList(changeset.Token) = .{};
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    const fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&tokens, allocator, &.{
         .{ .text = cat.name.slice(), .field = .name },
         .{ .text = cat.slug.slice(), .field = .slug },
         .{ .text = cat.description.slice(), .field = .desc },
-    };
-    for (fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     var path_buf: [2048]u8 = undefined;
     const path_slice = (try slug_mod.buildSlugPath(db, cat.id, &path_buf)) orelse cat.slug.slice();
@@ -361,53 +324,7 @@ pub fn computeCategoryMoveChangeSet(
         break :blk out;
     };
 
-    const threshold = db.config.rename_inline_threshold;
-    var swaps: std.ArrayList(changeset.SlugPathSwap) = .{};
-    var above_threshold = false;
-    var descendant_count: u32 = 0;
-
-    var stack: std.ArrayList(u64) = .{};
-    defer stack.deinit(allocator);
-    try stack.append(allocator, cat.id);
-
-    walk: while (stack.pop()) |cur_id| {
-        var children_buf: [256]schema.Category = undefined;
-        var offset: u32 = 0;
-        while (true) {
-            const children = try category.listChildren(db, cur_id, offset, 256, &children_buf);
-            if (children.len == 0) break;
-            for (children) |child| {
-                descendant_count += 1;
-                if (descendant_count > threshold) {
-                    above_threshold = true;
-                    break :walk;
-                }
-                var d_old_buf: [2048]u8 = undefined;
-                const d_old = composeOldDescendantPath(db, old_slug_path, cat.id, child.id, &d_old_buf) catch continue;
-                var d_new_buf: [2048]u8 = undefined;
-                const d_new = composeOldDescendantPath(db, new_slug_path, cat.id, child.id, &d_new_buf) catch continue;
-                try swaps.append(allocator, .{
-                    .old_path = try allocator.dupe(u8, d_old),
-                    .new_path = try allocator.dupe(u8, d_new),
-                    .cat_id = child.id,
-                });
-                try stack.append(allocator, child.id);
-            }
-            offset += @intCast(children.len);
-            if (children.len < 256) break;
-        }
-    }
-
-    var enqueue: changeset.EnqueueOnApply = .{};
-    if (above_threshold) {
-        swaps.clearAndFree(allocator);
-        enqueue = .{
-            .seq = db.next_repair_seq.fetchAdd(1, .monotonic),
-            .op = .moved_parent,
-            .old_slug_prefix = try allocator.dupe(u8, old_slug_path),
-            .created_at = std.time.milliTimestamp(),
-        };
-    }
+    const ds = try collectDescendantSwaps(db, cat.id, old_slug_path, new_slug_path, .moved_parent, allocator);
 
     return changeset.ChangeSet{ .category_moved = .{
         .cat = cat_post_move,
@@ -419,9 +336,9 @@ pub fn computeCategoryMoveChangeSet(
         .new_slug_path = new_slug_path,
         .link_subtree_delta = link_subtree_delta,
         .child_subtree_delta = child_subtree_delta,
-        .descendant_swaps = try swaps.toOwnedSlice(allocator),
-        .above_threshold = above_threshold,
-        .enqueue = enqueue,
+        .descendant_swaps = ds.swaps,
+        .above_threshold = ds.above_threshold,
+        .enqueue = ds.enqueue,
     } };
 }
 
@@ -444,21 +361,11 @@ pub fn computeLinkInsertChangeSet(
     }
 
     var tokens: std.ArrayList(changeset.Token) = .{};
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    const fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&tokens, allocator, &.{
         .{ .text = link.title.slice(), .field = .title },
         .{ .text = link.url.slice(), .field = .url },
         .{ .text = link.description.slice(), .field = .desc },
-    };
-    for (fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     return changeset.ChangeSet{ .link_inserted = .{
         .link = link,
@@ -472,39 +379,19 @@ pub fn computeLinkTextUpdateChangeSet(
     new_link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-
     var old_tokens: std.ArrayList(changeset.Token) = .{};
-    const old_fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&old_tokens, allocator, &.{
         .{ .text = old_link.title.slice(), .field = .title },
         .{ .text = old_link.url.slice(), .field = .url },
         .{ .text = old_link.description.slice(), .field = .desc },
-    };
-    for (old_fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try old_tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     var new_tokens: std.ArrayList(changeset.Token) = .{};
-    const new_fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&new_tokens, allocator, &.{
         .{ .text = new_link.title.slice(), .field = .title },
         .{ .text = new_link.url.slice(), .field = .url },
         .{ .text = new_link.description.slice(), .field = .desc },
-    };
-    for (new_fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try new_tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     return changeset.ChangeSet{ .link_text_updated = .{
         .old_link = old_link,
@@ -533,21 +420,11 @@ pub fn computeLinkDeleteChangeSet(
     }
 
     var tokens: std.ArrayList(changeset.Token) = .{};
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    const fields = [_]struct { text: []const u8, field: changeset.TokenField }{
+    try appendTokens(&tokens, allocator, &.{
         .{ .text = link.title.slice(), .field = .title },
         .{ .text = link.url.slice(), .field = .url },
         .{ .text = link.description.slice(), .field = .desc },
-    };
-    for (fields) |f| {
-        var iter = inverted.TokenIterator.init(f.text);
-        while (iter.next(&tok_buf)) |tok| {
-            try tokens.append(allocator, .{
-                .text = try allocator.dupe(u8, tok),
-                .field = f.field,
-            });
-        }
-    }
+    });
 
     return changeset.ChangeSet{ .link_deleted = .{
         .link = link,

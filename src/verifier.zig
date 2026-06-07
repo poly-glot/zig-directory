@@ -224,41 +224,41 @@ fn countOrphans(db: *Directory) !u64 {
     return orphans;
 }
 
-fn countSubtreeDrift(db: *Directory) !u64 {
-    const ops = @import("operations/operations.zig");
+const SubtreeComputed = struct { link_subtree: u64, child_subtree: u32 };
 
-    var top_id: u64 = 0;
-    {
-        const min_key = codec.encodeU64(0);
-        var iter = try db.categories_by_id().rangeScan(&min_key, null);
-        while (try iter.next()) |entry| {
-            if (entry.value.len < @sizeOf(schema.Category)) continue;
-            const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
-            if (cat.parent_id == 0) {
-                top_id = cat.id;
-                break;
-            }
-        }
+fn findTopId(db: *Directory) !u64 {
+    const min_key = codec.encodeU64(0);
+    var iter = try db.categories_by_id().rangeScan(&min_key, null);
+    while (try iter.next()) |entry| {
+        if (entry.value.len < @sizeOf(schema.Category)) continue;
+        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+        if (cat.parent_id == 0) return cat.id;
     }
-    if (top_id == 0) return 0;
+    return 0;
+}
 
+fn tallyDirectLinks(db: *Directory) !std.AutoHashMap(u64, u32) {
     var direct_links = std.AutoHashMap(u64, u32).init(db.allocator);
-    defer direct_links.deinit();
-    {
-        const min_key: [16]u8 = .{0} ** 16;
-        var iter = try db.link_by_category().rangeScan(&min_key, null);
-        while (try iter.next()) |entry| {
-            if (entry.key.len < 8) continue;
-            const cid = std.mem.readInt(u64, entry.key[0..8], .big);
-            const gop = try direct_links.getOrPut(cid);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* +|= 1;
-        }
+    errdefer direct_links.deinit();
+    const min_key: [16]u8 = .{0} ** 16;
+    var iter = try db.link_by_category().rangeScan(&min_key, null);
+    while (try iter.next()) |entry| {
+        if (entry.key.len < 8) continue;
+        const cid = codec.decodeU64(entry.key[0..8]);
+        const gop = try direct_links.getOrPut(cid);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
     }
+    return direct_links;
+}
 
-    const Computed = struct { link_subtree: u64, child_subtree: u32 };
-    var computed = std.AutoHashMap(u64, Computed).init(db.allocator);
-    defer computed.deinit();
+fn computeSubtreeAggregates(
+    db: *Directory,
+    top_id: u64,
+    direct_links: *const std.AutoHashMap(u64, u32),
+) !std.AutoHashMap(u64, SubtreeComputed) {
+    var computed = std.AutoHashMap(u64, SubtreeComputed).init(db.allocator);
+    errdefer computed.deinit();
 
     const StackFrame = struct { id: u64, expanded: bool };
     var stack = std.ArrayList(StackFrame){};
@@ -284,12 +284,26 @@ fn countSubtreeDrift(db: *Directory) !u64 {
         const child_ids = try collectAllChildIds(db, top.id);
         defer db.allocator.free(child_ids);
         for (child_ids) |cid| {
-            const c_comp = computed.get(cid) orelse Computed{ .link_subtree = 0, .child_subtree = 0 };
+            const c_comp = computed.get(cid) orelse SubtreeComputed{ .link_subtree = 0, .child_subtree = 0 };
             sub_links += c_comp.link_subtree;
             sub_children += 1 + c_comp.child_subtree;
         }
         try computed.put(top.id, .{ .link_subtree = sub_links, .child_subtree = sub_children });
     }
+    return computed;
+}
+
+fn countSubtreeDrift(db: *Directory) !u64 {
+    const ops = @import("operations/operations.zig");
+
+    const top_id = try findTopId(db);
+    if (top_id == 0) return 0;
+
+    var direct_links = try tallyDirectLinks(db);
+    defer direct_links.deinit();
+
+    var computed = try computeSubtreeAggregates(db, top_id, &direct_links);
+    defer computed.deinit();
 
     var drift: u64 = 0;
     var it = computed.iterator();

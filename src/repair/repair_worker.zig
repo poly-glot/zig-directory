@@ -1,4 +1,5 @@
 const std = @import("std");
+const codec = @import("zigstore").codec;
 const Directory = @import("../directory.zig").Directory;
 const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
@@ -42,7 +43,7 @@ fn peekMin(db: *Directory) !?QueuedTask {
         if (entry.value.len < @sizeOf(schema.RepairTask)) return null;
         if (entry.key.len < 8) return null;
         const t = std.mem.bytesToValue(schema.RepairTask, entry.value[0..@sizeOf(schema.RepairTask)]);
-        const seq = std.mem.readInt(u64, entry.key[0..8], .big);
+        const seq = codec.decodeU64(entry.key[0..8]);
         return QueuedTask{ .seq = seq, .task = t };
     }
     return null;
@@ -90,6 +91,28 @@ pub fn processOneChunk(db: *Directory) !void {
     _ = try processChunk(db, qt, &stack, arena.allocator());
 }
 
+fn planSwap(
+    db: *Directory,
+    root_id: u64,
+    old_root_path: []const u8,
+    child: schema.Category,
+    sa: std.mem.Allocator,
+) !?changeset.SlugPathSwap {
+    var d_old_buf: [2048]u8 = undefined;
+    const d_old = (operations.composeOldDescendantPath(db, old_root_path, root_id, child.id, &d_old_buf) catch null) orelse
+        return null;
+    var d_new_buf: [2048]u8 = undefined;
+    const d_new = (try operations.buildCanonicalSlugPath(db, &child, &d_new_buf)) orelse return null;
+    if (std.mem.eql(u8, d_old, d_new)) return null;
+    var v_buf: [16]u8 = undefined;
+    if ((try db.categories_by_slug_path().search(d_old, &v_buf)) == null) return null;
+    return changeset.SlugPathSwap{
+        .old_path = try sa.dupe(u8, d_old),
+        .new_path = try sa.dupe(u8, d_new),
+        .cat_id = child.id,
+    };
+}
+
 fn processChunk(
     db: *Directory,
     qt: QueuedTask,
@@ -117,27 +140,10 @@ fn processChunk(
         }
 
         for (children, 0..) |child, i| {
-            var d_old_buf: [2048]u8 = undefined;
-            const d_old_opt = composeOldPath(db, old_root_path, qt.task.cat_id, child.id, &d_old_buf) catch null;
-            var d_new_buf: [2048]u8 = undefined;
-            const d_new_opt = try operations.buildCanonicalSlugPath(db, &child, &d_new_buf);
-
             try stack.append(stack_alloc, .{ .id = child.id, .child_offset = 0 });
 
-            if (d_old_opt) |d_old| {
-                if (d_new_opt) |d_new| {
-                    if (!std.mem.eql(u8, d_old, d_new)) {
-                        var v_buf: [16]u8 = undefined;
-                        const at_old = (try db.categories_by_slug_path().search(d_old, &v_buf)) != null;
-                        if (at_old) {
-                            try swaps.append(sa, .{
-                                .old_path = try sa.dupe(u8, d_old),
-                                .new_path = try sa.dupe(u8, d_new),
-                                .cat_id = child.id,
-                            });
-                        }
-                    }
-                }
+            if (try planSwap(db, qt.task.cat_id, old_root_path, child, sa)) |swap| {
+                try swaps.append(sa, swap);
             }
 
             if (swaps.items.len >= chunk_size) {
@@ -161,43 +167,6 @@ fn commitSwaps(db: *Directory, seq: u64, swaps: []const changeset.SlugPathSwap) 
         .swaps = swaps,
     } });
     _ = db.repair_worker_chunks_processed.fetchAdd(1, .monotonic);
-}
-
-fn composeOldPath(
-    db: *Directory,
-    old_root_path: []const u8,
-    root_id: u64,
-    descendant_id: u64,
-    buf: []u8,
-) ![]const u8 {
-    var chain: [64]u64 = undefined;
-    var depth: u32 = 0;
-    var cur = descendant_id;
-    while (cur != root_id and depth < chain.len) : (depth += 1) {
-        chain[depth] = cur;
-        const c = (try operations.getCategory(db, cur)) orelse return error.NotFound;
-        cur = c.parent_id;
-        if (cur == 0) return error.NotFound;
-    }
-    if (cur != root_id) return error.NotFound;
-
-    var pos: usize = 0;
-    if (old_root_path.len > buf.len) return error.NotFound;
-    @memcpy(buf[pos..][0..old_root_path.len], old_root_path);
-    pos += old_root_path.len;
-
-    var idx: i32 = @intCast(@as(i64, @intCast(depth)) - 1);
-    while (idx >= 0) : (idx -= 1) {
-        const c = (try operations.getCategory(db, chain[@intCast(idx)])) orelse return error.NotFound;
-        const slug = c.slug.slice();
-        if (slug.len == 0) continue;
-        if (pos + 1 + slug.len > buf.len) return error.NotFound;
-        buf[pos] = '/';
-        pos += 1;
-        @memcpy(buf[pos..][0..slug.len], slug);
-        pos += slug.len;
-    }
-    return buf[0..pos];
 }
 
 test "repair_worker: drains a single queued task end-to-end" {

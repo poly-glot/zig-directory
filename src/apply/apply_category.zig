@@ -8,7 +8,7 @@ const apply = @import("apply.zig");
 pub fn applyCategoryInserted(db: *Directory, e: changeset.CategoryInsertEffect) !void {
     const id_key = codec.encodeU64(e.cat.id);
 
-    const pc_key = schema.ParentChildKey.encode(e.cat.parent_id, e.cat.id);
+    const pc_key = schema.ParentChildKey.encode(.{ e.cat.parent_id, e.cat.id });
     try db.mt_cat_by_parent().put(&pc_key, &id_key);
 
     try db.categories_by_slug_path().insert(e.slug_path, &id_key);
@@ -17,15 +17,7 @@ pub fn applyCategoryInserted(db: *Directory, e: changeset.CategoryInsertEffect) 
         try db.categories_by_slug_only().insert(e.cat.slug.slice(), &id_key);
     }
 
-    for (e.tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const cat_id_be = codec.encodeU64(e.cat.id);
-        @memcpy(key_buf[t.text.len..][0..8], &cat_id_be);
-        try db.categories_index_tree().insert(key_buf[0..key_len], &.{});
-    }
+    try apply.writeTokens(db.categories_index_tree(), e.tokens, e.cat.id, .insert);
 
     try apply.cascadeAncestorCounts(db, e.ancestor_updates, e.cat.parent_id, .child_count, true);
 
@@ -37,7 +29,7 @@ pub fn applyCategoryInserted(db: *Directory, e: changeset.CategoryInsertEffect) 
 pub fn applyCategoryDeleted(db: *Directory, e: changeset.CategoryDeleteEffect) !void {
     const id_key = codec.encodeU64(e.cat.id);
 
-    const pc_key = schema.ParentChildKey.encode(e.cat.parent_id, e.cat.id);
+    const pc_key = schema.ParentChildKey.encode(.{ e.cat.parent_id, e.cat.id });
     try db.mt_cat_by_parent().delete(&pc_key);
 
     _ = try db.categories_by_slug_path().delete(e.slug_path);
@@ -49,15 +41,7 @@ pub fn applyCategoryDeleted(db: *Directory, e: changeset.CategoryDeleteEffect) !
         }
     }
 
-    for (e.tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const cat_id_be = codec.encodeU64(e.cat.id);
-        @memcpy(key_buf[t.text.len..][0..8], &cat_id_be);
-        _ = try db.categories_index_tree().delete(key_buf[0..key_len]);
-    }
+    try apply.writeTokens(db.categories_index_tree(), e.tokens, e.cat.id, .delete);
 
     try db.mt_categories_by_id().delete(&id_key);
 
@@ -71,24 +55,8 @@ pub fn applyCategoryTextUpdated(db: *Directory, e: changeset.CategoryTextUpdateE
 
     try db.mt_categories_by_id().put(&id_key, std.mem.asBytes(&e.new_cat));
 
-    for (e.old_tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const cat_id_be = codec.encodeU64(e.new_cat.id);
-        @memcpy(key_buf[t.text.len..][0..8], &cat_id_be);
-        _ = try db.categories_index_tree().delete(key_buf[0..key_len]);
-    }
-    for (e.new_tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const cat_id_be = codec.encodeU64(e.new_cat.id);
-        @memcpy(key_buf[t.text.len..][0..8], &cat_id_be);
-        try db.categories_index_tree().insert(key_buf[0..key_len], &.{});
-    }
+    try apply.writeTokens(db.categories_index_tree(), e.old_tokens, e.new_cat.id, .delete);
+    try apply.writeTokens(db.categories_index_tree(), e.new_tokens, e.new_cat.id, .insert);
 
     db.subtree_cache.invalidateAll();
 }
@@ -126,8 +94,7 @@ pub fn applyCategoryRenamed(db: *Directory, e: changeset.CategoryRenameEffect) !
             .created_at = e.enqueue.created_at,
             .old_slug_prefix = codec.FixedString(2048).fromSlice(e.enqueue.old_slug_prefix),
         };
-        var key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key, e.enqueue.seq, .big);
+        const key = codec.encodeU64(e.enqueue.seq);
         try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
     }
 
@@ -139,9 +106,9 @@ pub fn applyCategoryMoved(db: *Directory, e: changeset.CategoryMoveEffect) !void
 
     try db.mt_categories_by_id().put(&id_key, std.mem.asBytes(&e.cat));
 
-    const old_pc_key = schema.ParentChildKey.encode(e.old_parent_id, e.cat.id);
+    const old_pc_key = schema.ParentChildKey.encode(.{ e.old_parent_id, e.cat.id });
     try db.mt_cat_by_parent().delete(&old_pc_key);
-    const new_pc_key = schema.ParentChildKey.encode(e.new_parent_id, e.cat.id);
+    const new_pc_key = schema.ParentChildKey.encode(.{ e.new_parent_id, e.cat.id });
     try db.mt_cat_by_parent().put(&new_pc_key, &id_key);
 
     _ = try db.categories_by_slug_path().delete(e.old_slug_path);
@@ -160,8 +127,7 @@ pub fn applyCategoryMoved(db: *Directory, e: changeset.CategoryMoveEffect) !void
             .created_at = e.enqueue.created_at,
             .old_slug_prefix = codec.FixedString(2048).fromSlice(e.enqueue.old_slug_prefix),
         };
-        var key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &key, e.enqueue.seq, .big);
+        const key = codec.encodeU64(e.enqueue.seq);
         try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
     }
 
@@ -223,7 +189,7 @@ test "applyCategoryInserted: writes primary + secondaries + slug paths + tokens 
     try std.testing.expectEqualStrings("Test", got_child.name.slice());
     try std.testing.expectEqualStrings("test", got_child.slug.slice());
 
-    const pc_key = schema.ParentChildKey.encode(top_id, child_id);
+    const pc_key = schema.ParentChildKey.encode(.{ top_id, child_id });
     var v_buf: [64]u8 = undefined;
     const pc_in_mt = db.mt_cat_by_parent().get(&pc_key);
     const pc_present = switch (pc_in_mt) {
@@ -311,7 +277,7 @@ test "applyCategoryDeleted: reverses category_inserted (primary + secondaries + 
 
     try std.testing.expect((try ops.getCategory(db, child_id)) == null);
 
-    const pc_key = schema.ParentChildKey.encode(top_id, child_id);
+    const pc_key = schema.ParentChildKey.encode(.{ top_id, child_id });
     var v_buf: [64]u8 = undefined;
     const pc_in_mt = db.mt_cat_by_parent().get(&pc_key);
     const pc_present = switch (pc_in_mt) {
@@ -780,7 +746,7 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     const got_c = (try ops.getCategory(db, c_id)).?;
     try std.testing.expectEqual(b_id, got_c.parent_id);
 
-    const old_pc_key = schema.ParentChildKey.encode(a_id, c_id);
+    const old_pc_key = schema.ParentChildKey.encode(.{ a_id, c_id });
     const old_pc_in_mt = db.mt_cat_by_parent().get(&old_pc_key);
     const old_pc_present = switch (old_pc_in_mt) {
         .found => true,
@@ -789,7 +755,7 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     };
     try std.testing.expect(!old_pc_present);
 
-    const new_pc_key = schema.ParentChildKey.encode(b_id, c_id);
+    const new_pc_key = schema.ParentChildKey.encode(.{ b_id, c_id });
     const new_pc_in_mt = db.mt_cat_by_parent().get(&new_pc_key);
     const new_pc_present = switch (new_pc_in_mt) {
         .found => true,

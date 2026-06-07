@@ -100,61 +100,19 @@ comptime {
         @compileError("RepairTask size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(RepairTask)}) ++ ", expected 2080");
 }
 
-const ParentChildComposite = CompositeKey(&.{ "parent_id", "child_id" });
-const CategoryLinkComposite = CompositeKey(&.{ "category_id", "link_id" });
-const SubmitterLinkComposite = CompositeKey(&.{ "submitter_id", "link_id" });
-
-pub const ParentChildKey = extern struct {
-    parent_id: u64,
-    child_id: u64,
-
-    pub fn encode(parent_id: u64, child_id: u64) [16]u8 {
-        return ParentChildComposite.encode(.{ parent_id, child_id });
-    }
-
-    pub fn decode(bytes: []const u8) ParentChildKey {
-        const raw = ParentChildComposite.decode(bytes);
-        return .{ .parent_id = raw.parent_id, .child_id = raw.child_id };
-    }
-};
-
-pub const CategoryLinkKey = extern struct {
-    category_id: u64,
-    link_id: u64,
-
-    pub fn encode(category_id: u64, link_id: u64) [16]u8 {
-        return CategoryLinkComposite.encode(.{ category_id, link_id });
-    }
-
-    pub fn decode(bytes: []const u8) CategoryLinkKey {
-        const raw = CategoryLinkComposite.decode(bytes);
-        return .{ .category_id = raw.category_id, .link_id = raw.link_id };
-    }
-};
-
-pub const SubmitterLinkKey = extern struct {
-    submitter_id: u64,
-    link_id: u64,
-
-    pub fn encode(submitter_id: u64, link_id: u64) [16]u8 {
-        return SubmitterLinkComposite.encode(.{ submitter_id, link_id });
-    }
-
-    pub fn decode(bytes: []const u8) SubmitterLinkKey {
-        const raw = SubmitterLinkComposite.decode(bytes);
-        return .{ .submitter_id = raw.submitter_id, .link_id = raw.link_id };
-    }
-};
+pub const ParentChildKey = CompositeKey(&.{ "parent_id", "child_id" });
+pub const CategoryLinkKey = CompositeKey(&.{ "category_id", "link_id" });
+pub const SubmitterLinkKey = CompositeKey(&.{ "submitter_id", "link_id" });
 
 test "ParentChildKey encode / decode" {
-    const encoded = ParentChildKey.encode(10, 20);
+    const encoded = ParentChildKey.encode(.{ 10, 20 });
     const decoded = ParentChildKey.decode(&encoded);
     try std.testing.expectEqual(@as(u64, 10), decoded.parent_id);
     try std.testing.expectEqual(@as(u64, 20), decoded.child_id);
 }
 
 test "CategoryLinkKey encode / decode" {
-    const encoded = CategoryLinkKey.encode(5, 99);
+    const encoded = CategoryLinkKey.encode(.{ 5, 99 });
     const decoded = CategoryLinkKey.decode(&encoded);
     try std.testing.expectEqual(@as(u64, 5), decoded.category_id);
     try std.testing.expectEqual(@as(u64, 99), decoded.link_id);
@@ -255,12 +213,6 @@ test "Serializable asBytes matches std.mem.asBytes" {
     const via_mixin = cat.asBytes();
     const via_std = std.mem.asBytes(&cat);
     try std.testing.expectEqualSlices(u8, via_std, via_mixin);
-}
-
-test "CompositeKey produces identical bytes to ParentChildKey" {
-    const via_wrapper = ParentChildKey.encode(42, 99);
-    const via_generic = ParentChildComposite.encode(.{ 42, 99 });
-    try std.testing.expectEqualSlices(u8, &via_wrapper, &via_generic);
 }
 
 test "RepairTask: extern layout is exactly 2080 bytes" {

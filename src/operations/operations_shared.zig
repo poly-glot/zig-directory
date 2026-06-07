@@ -11,11 +11,9 @@ pub const OperationError = error{
     CircularHierarchy,
     CategoryHasChildren,
     InvalidSlug,
-    SlugConflict,
     BufferTooSmall,
     PathTooDeep,
     FieldTooLong,
-    IoError,
     DatabaseCorrupted,
 };
 

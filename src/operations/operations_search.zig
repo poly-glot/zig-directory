@@ -1,4 +1,5 @@
 const std = @import("std");
+const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const inverted = @import("zigstore").inverted_index;
@@ -68,7 +69,7 @@ fn searchTreeByToken(
     while (try iter.next()) |kv| {
         if (kv.key.len != token.len + 8) continue;
         if (!std.mem.eql(u8, kv.key[0..token.len], token)) break;
-        const id = std.mem.readInt(u64, kv.key[token.len..][0..8], .big);
+        const id = codec.decodeU64(kv.key[token.len..][0..8]);
         try ids.append(allocator, id);
     }
 

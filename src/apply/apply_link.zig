@@ -28,26 +28,18 @@ fn decrLinkStatus(db: *Directory, status: u8) void {
 pub fn applyLinkInserted(db: *Directory, e: changeset.LinkInsertEffect) !void {
     const id_key = codec.encodeU64(e.link.id);
 
-    const cl_key = schema.CategoryLinkKey.encode(e.link.category_id, e.link.id);
+    const cl_key = schema.CategoryLinkKey.encode(.{ e.link.category_id, e.link.id });
     try db.mt_link_by_category().put(&cl_key, &id_key);
 
     const hash_key = codec.encodeU64(codec.hash(e.link.url.slice()));
     try db.mt_link_by_url_hash().put(&hash_key, &id_key);
 
     if (e.link.submitter_id != 0) {
-        const sl_key = schema.SubmitterLinkKey.encode(e.link.submitter_id, e.link.id);
+        const sl_key = schema.SubmitterLinkKey.encode(.{ e.link.submitter_id, e.link.id });
         try db.mt_link_by_submitter().put(&sl_key, &id_key);
     }
 
-    for (e.tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = codec.encodeU64(e.link.id);
-        @memcpy(key_buf[t.text.len..][0..8], &id_be);
-        try db.links_index_tree().insert(key_buf[0..key_len], &.{});
-    }
+    try apply.writeTokens(db.links_index_tree(), e.tokens, e.link.id, .insert);
 
     try apply.cascadeAncestorCounts(db, e.ancestor_updates, e.link.category_id, .link_count, true);
 
@@ -61,26 +53,18 @@ pub fn applyLinkInserted(db: *Directory, e: changeset.LinkInsertEffect) !void {
 pub fn applyLinkDeleted(db: *Directory, e: changeset.LinkDeleteEffect) !void {
     const id_key = codec.encodeU64(e.link.id);
 
-    const cl_key = schema.CategoryLinkKey.encode(e.link.category_id, e.link.id);
+    const cl_key = schema.CategoryLinkKey.encode(.{ e.link.category_id, e.link.id });
     try db.mt_link_by_category().delete(&cl_key);
 
     const hash_key = codec.encodeU64(codec.hash(e.link.url.slice()));
     try db.mt_link_by_url_hash().delete(&hash_key);
 
     if (e.link.submitter_id != 0) {
-        const sl_key = schema.SubmitterLinkKey.encode(e.link.submitter_id, e.link.id);
+        const sl_key = schema.SubmitterLinkKey.encode(.{ e.link.submitter_id, e.link.id });
         try db.mt_link_by_submitter().delete(&sl_key);
     }
 
-    for (e.tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = codec.encodeU64(e.link.id);
-        @memcpy(key_buf[t.text.len..][0..8], &id_be);
-        _ = try db.links_index_tree().delete(key_buf[0..key_len]);
-    }
+    try apply.writeTokens(db.links_index_tree(), e.tokens, e.link.id, .delete);
 
     try db.mt_links_by_id().delete(&id_key);
 
@@ -96,24 +80,8 @@ pub fn applyLinkTextUpdated(db: *Directory, e: changeset.LinkTextUpdateEffect) !
 
     try db.mt_links_by_id().put(&id_key, std.mem.asBytes(&e.new_link));
 
-    for (e.old_tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = codec.encodeU64(e.new_link.id);
-        @memcpy(key_buf[t.text.len..][0..8], &id_be);
-        _ = try db.links_index_tree().delete(key_buf[0..key_len]);
-    }
-    for (e.new_tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
-        const id_be = codec.encodeU64(e.new_link.id);
-        @memcpy(key_buf[t.text.len..][0..8], &id_be);
-        try db.links_index_tree().insert(key_buf[0..key_len], &.{});
-    }
+    try apply.writeTokens(db.links_index_tree(), e.old_tokens, e.new_link.id, .delete);
+    try apply.writeTokens(db.links_index_tree(), e.new_tokens, e.new_link.id, .insert);
 
     if (!std.mem.eql(u8, e.old_link.url.slice(), e.new_link.url.slice())) {
         const old_hash_key = codec.encodeU64(codec.hash(e.old_link.url.slice()));
@@ -134,12 +102,12 @@ pub fn applyLinkTextUpdated(db: *Directory, e: changeset.LinkTextUpdateEffect) !
 pub fn applyLinkRecategorized(db: *Directory, e: changeset.LinkRecatEffect) !void {
     const id_key = codec.encodeU64(e.link.id);
 
-    const old_cl_key = schema.CategoryLinkKey.encode(e.old_category_id, e.link.id);
+    const old_cl_key = schema.CategoryLinkKey.encode(.{ e.old_category_id, e.link.id });
     try db.mt_link_by_category().delete(&old_cl_key);
 
     try db.mt_links_by_id().put(&id_key, std.mem.asBytes(&e.link));
 
-    const new_cl_key = schema.CategoryLinkKey.encode(e.link.category_id, e.link.id);
+    const new_cl_key = schema.CategoryLinkKey.encode(.{ e.link.category_id, e.link.id });
     try db.mt_link_by_category().put(&new_cl_key, &id_key);
 
     try apply.cascadeAncestorCounts(db, e.old_chain_updates, e.old_category_id, .link_count, false);
@@ -195,7 +163,7 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
     const got_link = (try ops.getLink(db, link_id)).?;
     try std.testing.expectEqual(link_id, got_link.id);
 
-    const cl_key = schema.CategoryLinkKey.encode(cat_id, link_id);
+    const cl_key = schema.CategoryLinkKey.encode(.{ cat_id, link_id });
     var v_buf: [64]u8 = undefined;
     const cl_in_mt = db.mt_link_by_category().get(&cl_key);
     const cl_present = switch (cl_in_mt) {
@@ -347,7 +315,7 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
 
     try std.testing.expect((try ops.getLink(db, link_id)) == null);
 
-    const cl_key = schema.CategoryLinkKey.encode(cat_id, link_id);
+    const cl_key = schema.CategoryLinkKey.encode(.{ cat_id, link_id });
     var v_buf: [64]u8 = undefined;
     const cl_in_mt = db.mt_link_by_category().get(&cl_key);
     const cl_present = switch (cl_in_mt) {
@@ -655,7 +623,7 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
 
     var v_buf: [64]u8 = undefined;
 
-    const old_cl_key = schema.CategoryLinkKey.encode(cat_a_id, link_id);
+    const old_cl_key = schema.CategoryLinkKey.encode(.{ cat_a_id, link_id });
     const old_cl_in_mt = db.mt_link_by_category().get(&old_cl_key);
     const old_cl_present = switch (old_cl_in_mt) {
         .found => true,
@@ -664,7 +632,7 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     };
     try std.testing.expect(!old_cl_present);
 
-    const new_cl_key = schema.CategoryLinkKey.encode(cat_b_id, link_id);
+    const new_cl_key = schema.CategoryLinkKey.encode(.{ cat_b_id, link_id });
     const new_cl_in_mt = db.mt_link_by_category().get(&new_cl_key);
     const new_cl_present = switch (new_cl_in_mt) {
         .found => true,

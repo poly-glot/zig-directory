@@ -13,8 +13,7 @@ pub fn applySlugPathRepairChunk(db: *Directory, e: changeset.SlugPathRepairChunk
 }
 
 pub fn applySlugPathRepairComplete(db: *Directory, e: changeset.RepairTaskCompleteEffect) !void {
-    var key: [8]u8 = undefined;
-    std.mem.writeInt(u64, &key, e.seq, .big);
+    const key = codec.encodeU64(e.seq);
     _ = try db.slug_path_repair_queue().delete(&key);
 }
 test "applySlugPathRepairChunk: applies swaps to categories_by_slug_path" {

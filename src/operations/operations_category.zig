@@ -177,8 +177,8 @@ pub fn listChildren(
 ) ![]schema.Category {
     db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
-    const start_key = schema.ParentChildKey.encode(parent_id, 0);
-    const end_key = schema.ParentChildKey.encode(parent_id, std.math.maxInt(u64));
+    const start_key = schema.ParentChildKey.encode(.{ parent_id, 0 });
+    const end_key = schema.ParentChildKey.encode(.{ parent_id, std.math.maxInt(u64) });
 
     var count: u32 = 0;
     var skipped: u32 = 0;
@@ -264,7 +264,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
         var iter = try db.link_by_category().rangeScan(&min_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 8) continue;
-            const cid = std.mem.readInt(u64, entry.key[0..8], .big);
+            const cid = codec.decodeU64(entry.key[0..8]);
             const gop = try direct_links.getOrPut(cid);
             if (!gop.found_existing) gop.value_ptr.* = 0;
             gop.value_ptr.* +|= 1;
@@ -282,8 +282,8 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
         var iter = try db.cat_by_parent().rangeScan(&min_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) continue;
-            const parent = std.mem.readInt(u64, entry.key[0..8], .big);
-            const child = std.mem.readInt(u64, entry.key[8..16], .big);
+            const parent = codec.decodeU64(entry.key[0..8]);
+            const child = codec.decodeU64(entry.key[8..16]);
             const gop = try children_of.getOrPut(parent);
             if (!gop.found_existing) gop.value_ptr.* = .{};
             try gop.value_ptr.append(allocator, child);
@@ -773,7 +773,7 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
 
     var v_buf: [64]u8 = undefined;
     {
-        const old_pc_key = schema.ParentChildKey.encode(a_id, c_id);
+        const old_pc_key = schema.ParentChildKey.encode(.{ a_id, c_id });
         const mt_old = db.mt_cat_by_parent().get(&old_pc_key);
         const old_present = switch (mt_old) {
             .found => true,
@@ -782,7 +782,7 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
         };
         try std.testing.expect(!old_present);
 
-        const new_pc_key = schema.ParentChildKey.encode(b_id, c_id);
+        const new_pc_key = schema.ParentChildKey.encode(.{ b_id, c_id });
         const mt_new = db.mt_cat_by_parent().get(&new_pc_key);
         const new_present = switch (mt_new) {
             .found => true,

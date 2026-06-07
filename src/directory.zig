@@ -38,7 +38,6 @@ pub const Stats = struct {
     category_count: u64 = 0,
     link_count: u64 = 0,
     page_count: u32 = 0,
-    free_page_count: u32 = 0,
     cache_hits: u64 = 0,
     cache_misses: u64 = 0,
     cache_hit_rate: f64 = 0.0,
@@ -79,12 +78,12 @@ pub const Directory = struct {
     const Self = @This();
 
     pub fn dispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
-        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        const dir = asDir(ctx);
         return binary_protocol.dispatch(dir, op_byte, payload, count, resp);
     }
 
     pub fn processFrames(ctx: *anyopaque, conn: *zigstore.connection.Connection) void {
-        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        const dir = asDir(ctx);
         zigstore.protocol.processFrames(ctx, conn, &Directory.dispatch, dir.op_latency, binary_protocol.RESPONSE_RESERVE);
     }
 
@@ -97,7 +96,7 @@ pub const Directory = struct {
     }
 
     fn flushHeaderOnShutdown(ctx: *anyopaque) void {
-        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        const dir = asDir(ctx);
         dir.flushHeader() catch |err| {
             log.err("Failed to flush database header on shutdown: {}", .{err});
         };
@@ -280,7 +279,7 @@ pub const Directory = struct {
     }
 
     fn applyChangeSet(ctx: *anyopaque, cs: changeset.ChangeSet) anyerror!void {
-        const dir: *Directory = @ptrCast(@alignCast(ctx));
+        const dir = asDir(ctx);
         return apply_mod.apply(dir, cs);
     }
 
@@ -481,7 +480,6 @@ pub const Directory = struct {
             .category_count = cat_count,
             .link_count = link_count,
             .page_count = pg_count,
-            .free_page_count = 0,
             .cache_hits = hits,
             .cache_misses = misses,
             .cache_hit_rate = hit_rate,

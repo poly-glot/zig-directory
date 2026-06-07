@@ -85,7 +85,7 @@ pub fn collectDescendants(
 
     while (queue.items.len > 0) {
         const cur = queue.pop().?;
-        const start_key = schema.ParentChildKey.encode(cur, 0);
+        const start_key = schema.ParentChildKey.encode(.{ cur, 0 });
         var iter = try cat_by_parent.rangeScan(&start_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
@@ -123,7 +123,7 @@ pub fn listSubtreeLinkIds(
     const offset_u64: u64 = offset;
 
     for (descendants) |cat_id| {
-        const start_key = schema.CategoryLinkKey.encode(cat_id, 0);
+        const start_key = schema.CategoryLinkKey.encode(.{ cat_id, 0 });
         var iter = try link_by_category.rangeScan(&start_key, null);
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
@@ -179,7 +179,7 @@ pub fn listSubtreeLinkIdsScan(
     var iter = try link_by_category.rangeScan(&min_key, null);
     while (try iter.next()) |entry| {
         if (entry.key.len < 16) return error.Corrupted;
-        const cat_id = std.mem.readInt(u64, entry.key[0..8], .big);
+        const cat_id = codec.decodeU64(entry.key[0..8]);
         if (!desc_set.contains(cat_id)) continue;
 
         total += 1;
@@ -188,7 +188,7 @@ pub fn listSubtreeLinkIdsScan(
             continue;
         }
         if (page_ids.items.len >= limit) continue;
-        const link_id = std.mem.readInt(u64, entry.key[8..16], .big);
+        const link_id = codec.decodeU64(entry.key[8..16]);
         try page_ids.append(allocator, link_id);
     }
 
@@ -212,7 +212,7 @@ pub fn countSubtreeLinks(
     var iter = try link_by_category.rangeScan(&min_key, null);
     while (try iter.next()) |entry| {
         if (entry.key.len < 16) continue;
-        const cat_id = std.mem.readInt(u64, entry.key[0..8], .big);
+        const cat_id = codec.decodeU64(entry.key[0..8]);
         if (desc_set.contains(cat_id)) total += 1;
     }
     return total;
@@ -227,7 +227,7 @@ test "collectDescendants returns inclusive sorted set on a tiny synthetic tree" 
     const cat_by_parent = db.cat_by_parent();
     const edges = [_][2]u64{ .{ 1, 2 }, .{ 1, 3 }, .{ 2, 4 }, .{ 2, 5 } };
     inline for (edges) |edge| {
-        const k = schema.ParentChildKey.encode(edge[0], edge[1]);
+        const k = schema.ParentChildKey.encode(.{ edge[0], edge[1] });
         const v = codec.encodeU64(edge[1]);
         try cat_by_parent.insert(&k, &v);
     }
@@ -247,7 +247,7 @@ test "collectDescendants tolerates cycles via the visited set" {
     const cat_by_parent = db.cat_by_parent();
     const edges = [_][2]u64{ .{ 1, 1 }, .{ 1, 2 }, .{ 2, 1 }, .{ 2, 3 } };
     inline for (edges) |edge| {
-        const k = schema.ParentChildKey.encode(edge[0], edge[1]);
+        const k = schema.ParentChildKey.encode(.{ edge[0], edge[1] });
         const v = codec.encodeU64(edge[1]);
         try cat_by_parent.insert(&k, &v);
     }
@@ -270,7 +270,7 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
         var lid: u64 = 1;
         while (lid <= 10) : (lid += 1) {
             const link_id = cid * 100 + lid;
-            const k = schema.CategoryLinkKey.encode(cid, link_id);
+            const k = schema.CategoryLinkKey.encode(.{ cid, link_id });
             const v = codec.encodeU64(link_id);
             try link_by_category.insert(&k, &v);
         }
