@@ -17,7 +17,7 @@ patches:
 images:
 - name: dmozdb-backend
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: ab4259325e6d9bea8ad0b6d2bb9b3cb073bcb283-backend
+  newTag: 540577ec4149f02d52851424420b10e77c664e67-backend
 - name: dmozdb-web
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: ab4259325e6d9bea8ad0b6d2bb9b3cb073bcb283-web
+  newTag: 540577ec4149f02d52851424420b10e77c664e67-web
