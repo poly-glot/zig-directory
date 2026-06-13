@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .zigstore = .{
-            .url = "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.1.0.tar.gz",
-            .hash = "zigstore-1.1.0-Lu5Gj7svBgBeQ4AZ9jPM27ao2zkeBWUNXFdrPTpYZ4VB",
+            .url = "https://github.com/poly-glot/zigstore/archive/refs/tags/v1.2.0.tar.gz",
+            .hash = "zigstore-1.2.0-Lu5Gj1f_BgAtiBNgKO7dLTVH6__7Xl7u1CdjWKt65bBD",
         },
     },
     .paths = .{
