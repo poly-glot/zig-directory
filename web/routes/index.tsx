@@ -6,6 +6,7 @@ import {
   getClient,
   type Link,
 } from "../lib/dmoz-client.ts";
+import { loadEntryCategories } from "../lib/entry-categories.ts";
 import HomeHero from "../components/home/HomeHero/HomeHero.tsx";
 import HomeCategoriesSection from "../components/home/HomeCategoriesSection/HomeCategoriesSection.tsx";
 import HomeRecentSection, {
@@ -19,23 +20,6 @@ interface Data {
   featuredLinks: LinkWithCategory[];
   dbStats: DbStats | null;
   error?: string;
-}
-
-async function loadEntryCategories(
-  client: ReturnType<typeof getClient>,
-): Promise<Category[]> {
-  let categories = await client.listRootCategories(0, 100);
-  // DMOZ data has exactly one root (Top); useful entry points are Top's
-  // children. Drill one level when the root set is a singleton.
-  if (categories.length === 1) {
-    try {
-      const children = await client.listChildren(categories[0].id, 0, 100);
-      if (children.length > 0) categories = children;
-    } catch {
-      // fall back to single root
-    }
-  }
-  return categories;
 }
 
 async function annotateLinks(
@@ -82,7 +66,7 @@ async function loadStatsSafe(
 
 async function loadHomepage(): Promise<Data> {
   const client = getClient();
-  const categories = await loadEntryCategories(client);
+  const { categories } = await loadEntryCategories(client);
   // HomeRecentSection renders the first 6. Pulling 24 was over-fetch.
   const { links: allLinks } = await client.listAllLinks({ limit: 6 });
   const featuredLinks = await annotateLinks(client, allLinks);
