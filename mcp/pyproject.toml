@@ -3,4 +3,7 @@ name = "dmozdb-mcp"
 version = "0.1.0"
 description = "MCP server projecting the dmozdb JSON API"
 requires-python = ">=3.12"
-dependencies = ["fastmcp>=4.0.3,<5"]
+dependencies = [
+    "fastmcp>=4.0.3,<5",
+    "prefab-ui>=0.20.2",
+]

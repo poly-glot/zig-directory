@@ -34,9 +34,10 @@ export const handler = define.handlers({
         limit: pageSize(searchParams.get("limit")),
         scope: parseScope(searchParams.get("scope")),
       });
-      const chains = await client.breadcrumbsByIds(
-        result.categories.map((c) => c.id),
-      );
+      const chains = await client.breadcrumbsByIds([
+        ...result.categories.map((c) => c.id),
+        ...result.links.map((l) => l.categoryId),
+      ]);
       return Response.json({
         query,
         categories: result.categories.map((c) =>
@@ -44,6 +45,7 @@ export const handler = define.handlers({
         ),
         links: result.links.map((l) => ({
           ...linkJson(l),
+          categoryPath: categoryPath(chains.get(l.categoryId) ?? []),
           matchedField: MATCHED_FIELD[l.matchField] ?? "title",
         })),
       });

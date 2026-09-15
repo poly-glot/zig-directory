@@ -4,6 +4,7 @@ import {
   type Link,
   Status,
 } from "../../../../lib/dmoz-client.ts";
+import { formatCategoryName } from "../../../../lib/format.ts";
 
 export const MAX_PAGE_SIZE = 50;
 const DEFAULT_PAGE_SIZE = 20;
@@ -36,7 +37,7 @@ export function categoryJson(c: Category, path: string) {
   return {
     id: c.id,
     path,
-    name: c.name,
+    name: formatCategoryName(c.name),
     slug: c.slug,
     description: c.description,
     linkCount: c.linkCount,

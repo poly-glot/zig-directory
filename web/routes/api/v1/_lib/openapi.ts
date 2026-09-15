@@ -221,8 +221,13 @@ export const openapi = {
                   items: {
                     allOf: [link],
                     type: "object",
-                    required: ["matchedField"],
+                    required: ["categoryPath", "matchedField"],
                     properties: {
+                      categoryPath: {
+                        type: "string",
+                        description:
+                          "Slug path of the category this link is filed in.",
+                      },
                       matchedField: {
                         type: "string",
                         enum: ["title", "url", "description"],
