@@ -145,6 +145,30 @@ Deno.test(
       scope: "mcp",
     });
     assertEquals(await verifyBearerToken(wrongAudience.accessToken), null);
+
+    // The resource advertises scopes_supported: ["mcp"] and challenges for it,
+    // so a token that never carried it must not be spendable here even though
+    // its signature, issuer, audience and role all check out.
+    const withoutScope = await signAccessToken({
+      userId: "user-1",
+      role: "admin",
+      clientId: "client-1",
+      resource: "https://resource.example.com/mcp",
+      scope: "",
+    });
+    assertEquals(await verifyBearerToken(withoutScope.accessToken), null);
+
+    const amongOtherScopes = await signAccessToken({
+      userId: "user-1",
+      role: "admin",
+      clientId: "client-1",
+      resource: "https://resource.example.com/mcp",
+      scope: "profile mcp offline_access",
+    });
+    assertEquals(await verifyBearerToken(amongOtherScopes.accessToken), {
+      userId: "user-1",
+      role: "admin",
+    });
   },
 );
 

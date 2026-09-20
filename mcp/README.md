@@ -110,9 +110,16 @@ anonymous call meets the sign-in challenge instead of an error.
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy .
+uv run python selfcheck.py
 ```
 
-The Stop hook runs this automatically when a `mcp/*.py` file changed.
+The Stop hook runs all four when any `mcp/**/*.py` changed.
+
+`selfcheck.py` asserts what the type-checker cannot: that every write tool is
+registered for the 401 challenge and every protected name still matches a
+tool, that the body probe and bearer parsing behave, and that no parameter
+ships without a description or an unbounded integer. It needs no running
+server and no test framework.
 
 ## Identity (`auth/`)
 

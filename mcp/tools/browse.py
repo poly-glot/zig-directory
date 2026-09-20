@@ -1,7 +1,10 @@
+from typing import Annotated
+
 from fastmcp import Context
 from fastmcp.apps import PrefabAppConfig
 from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
+from pydantic import Field
 
 from app import mcp
 from client import category_at
@@ -20,10 +23,23 @@ from views import build_view, category_card, result
     annotations=ToolAnnotations(
         title="Browse a category",
         read_only_hint=True,
-        open_world_hint=True,
+        idempotent_hint=True,
+        open_world_hint=False,
     ),
 )
-async def browse_category(ctx: Context, path: str = "") -> ToolResult:
+async def browse_category(
+    ctx: Context,
+    path: Annotated[
+        str,
+        Field(
+            description=(
+                'Slug path of the category, such as "arts/animation". Comes '
+                "from the path field of any category this tool or "
+                "search_directory returned. Empty string for the top level."
+            )
+        ),
+    ] = "",
+) -> ToolResult:
     category, ancestors, children = await category_at(path)
     breadcrumb = " / ".join(
         [ancestor["name"] for ancestor in ancestors] + [category["name"]]

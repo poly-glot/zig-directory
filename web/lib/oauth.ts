@@ -269,6 +269,15 @@ async function getVerificationKey(): Promise<
   return verificationKey;
 }
 
+// The scope the MCP resource advertises in scopes_supported and demands in its
+// WWW-Authenticate challenge. Verified here too: a token that never carried it
+// must not be spendable on a write just because its audience and role match.
+const MCP_SCOPE = "mcp";
+
+function grantsScope(claim: unknown, required: string): boolean {
+  return typeof claim === "string" && claim.split(" ").includes(required);
+}
+
 export async function verifyBearerToken(
   token: string,
 ): Promise<{ userId: string; role: string } | null> {
@@ -280,6 +289,9 @@ export async function verifyBearerToken(
     const key = await getVerificationKey();
     const { payload } = await jwtVerify(token, key, { issuer, audience });
     if (typeof payload.sub !== "string" || typeof payload.role !== "string") {
+      return null;
+    }
+    if (!grantsScope(payload.scope, MCP_SCOPE)) {
       return null;
     }
     return { userId: payload.sub, role: payload.role };

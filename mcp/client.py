@@ -17,13 +17,25 @@ UNKNOWN_PATH_HINT = (
 )
 
 
+def _error_detail(response: httpx2.Response) -> str:
+    """Relay the API's own 4xx wording, never a 5xx body.
+
+    A 4xx message is written by this project's routes and tells the model how
+    to correct the call. A 5xx body is whatever the failure produced, so it is
+    reported by status alone rather than handed to the model verbatim.
+    """
+    if response.status_code >= 500:
+        return f"the directory service failed ({response.status_code})"
+    try:
+        detail = response.json().get("error")
+    except ValueError:
+        detail = None
+    return str(detail) if detail else f"directory returned {response.status_code}"
+
+
 def _parse_response(response: httpx2.Response) -> JSON:
     if response.is_error:
-        try:
-            detail = response.json().get("error")
-        except ValueError:
-            detail = None
-        raise ToolError(detail or f"directory returned {response.status_code}")
+        raise ToolError(_error_detail(response))
     return cast(JSON, response.json())
 
 
@@ -49,7 +61,7 @@ async def category_at(path: str) -> tuple[JSON, list[JSON], list[JSON]]:
         browsed = await fetch("/api/v1/browse", path=path)
     except ToolError as unreachable:
         raise ToolError(
-            f'no category at path "{path}" ({unreachable}). {UNKNOWN_PATH_HINT}'
+            f'no category at path "{path}". {UNKNOWN_PATH_HINT}'
         ) from unreachable
     category = browsed["category"]
     if category is None:

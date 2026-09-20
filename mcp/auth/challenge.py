@@ -8,8 +8,9 @@ from starlette.authentication import AuthCredentials
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import RESOURCE_METADATA_URL, SCOPE, verifier
+from .roles import PROTECTED_TOOLS
 
-PROTECTED_TOOLS = frozenset({"review_submission"})
+MAX_PROBE_BYTES = 1 << 20
 
 logger = get_logger(__name__)
 
@@ -42,16 +43,32 @@ def _body_calls_protected_tool(body: bytes) -> bool:
 
 
 async def _drain(receive: Receive) -> tuple[bytes, Receive]:
+    """Buffer enough of the body to name the tool, then hand it back unchanged.
+
+    Stops at ``MAX_PROBE_BYTES`` so an unauthenticated caller cannot make the
+    server hold an arbitrary body before any authorization decision. A body
+    that large is not a tool call worth probing; ``capped`` leaves the rest of
+    it for the app to read from the real ``receive``.
+    """
     chunks: list[bytes] = []
+    size = 0
     more_body = True
+    capped = False
+
     while more_body:
         message = await receive()
         if message["type"] != "http.request":
+            more_body = False
             break
-        chunks.append(message.get("body", b""))
+        chunk: bytes = message.get("body", b"")
+        chunks.append(chunk)
+        size += len(chunk)
         more_body = message.get("more_body", False)
-    body = b"".join(chunks)
+        if size > MAX_PROBE_BYTES and more_body:
+            capped = True
+            break
 
+    body = b"".join(chunks)
     replayed = False
 
     async def replay() -> Message:
@@ -59,7 +76,7 @@ async def _drain(receive: Receive) -> tuple[bytes, Receive]:
         if replayed:
             return await receive()
         replayed = True
-        return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": capped}
 
     return body, replay
 
@@ -93,6 +110,12 @@ class OpportunisticAuth:
     bearer backend does, so a tool body's ``get_access_token()`` sees it, then
     answers an unauthenticated call to a protected tool with the RFC 6750
     challenge that drives a client's sign-in flow.
+
+    Opportunistic means no credentials are demanded, not that bad ones are
+    ignored: a token that fails to verify is answered with ``invalid_token``
+    whatever it was calling, so an expired token is a prompt to refresh rather
+    than a silent downgrade to anonymous results. Only a request carrying no
+    credentials at all reaches a public tool unauthenticated.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -110,15 +133,19 @@ class OpportunisticAuth:
             return
 
         access_token, token_was_supplied = await self._authenticate(scope)
+
         if access_token is not None:
             scope["user"] = AuthenticatedUser(access_token)
             scope["auth"] = AuthCredentials(access_token.scopes)
-
-        if access_token is None and scope["method"] == "POST":
+        elif token_was_supplied:
+            logger.info("rejecting a bearer token that did not verify")
+            await _send_challenge(send, token_was_supplied=True)
+            return
+        elif scope["method"] == "POST":
             body, receive = await _drain(receive)
             if _body_calls_protected_tool(body):
                 logger.info("challenging unauthenticated call to a protected tool")
-                await _send_challenge(send, token_was_supplied=token_was_supplied)
+                await _send_challenge(send, token_was_supplied=False)
                 return
 
         await self.app(scope, receive, send)

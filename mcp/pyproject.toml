@@ -26,6 +26,7 @@ select = ["B", "E", "F", "I", "RUF", "S", "SIM", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "server.py" = ["F401"]
+"selfcheck.py" = ["S101"]
 
 [tool.mypy]
 python_version = "3.12"

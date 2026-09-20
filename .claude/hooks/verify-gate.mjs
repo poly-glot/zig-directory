@@ -37,9 +37,12 @@ if (webTouched) ok = gate("deno task check", "deno", ["task", "check"], WEB_ROOT
 if (mcpTouched) {
   ok =
     gate(
-      "mcp check (ruff + mypy)",
+      "mcp check (ruff + mypy + selfcheck)",
       "sh",
-      ["-c", "uv run ruff format --check . && uv run ruff check . && uv run mypy ."],
+      [
+        "-c",
+        "uv run ruff format --check . && uv run ruff check . && uv run mypy . && uv run python selfcheck.py",
+      ],
       MCP_ROOT,
     ) && ok;
 }

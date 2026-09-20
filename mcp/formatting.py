@@ -6,10 +6,6 @@ DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 
 
-def clamped(limit: int) -> int:
-    return max(1, min(limit, MAX_LIMIT))
-
-
 def counted(count: int, singular: str, plural: str) -> str:
     return f"{count:,} {singular if count == 1 else plural}"
 

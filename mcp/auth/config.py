@@ -12,6 +12,7 @@ verifier = JWTVerifier(
     jwks_uri=f"{ISSUER_URL}/.well-known/jwks.json",
     issuer=ISSUER_URL,
     audience=RESOURCE_URL,
+    required_scopes=[SCOPE],
 )
 
 _resource = urlsplit(RESOURCE_URL)

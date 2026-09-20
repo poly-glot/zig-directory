@@ -1,21 +1,13 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastmcp import Context
-from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import get_access_token
 from mcp_types import ToolAnnotations
+from pydantic import Field
 
 from app import mcp
+from auth.roles import protect
 from client import post_authorized
 
-
-def _admin_token() -> str:
-    token = get_access_token()
-    if token is None:
-        raise ToolError("Sign in with an admin account to review submissions.")
-    if (token.claims or {}).get("role") != "admin":
-        raise ToolError("This tool requires an admin account.")
-    return token.token
+_admin_token = protect("review_submission", role="admin")
 
 
 @mcp.tool(
@@ -27,11 +19,31 @@ def _admin_token() -> str:
     annotations=ToolAnnotations(
         title="Review a submission",
         read_only_hint=False,
+        destructive_hint=False,
         idempotent_hint=True,
+        open_world_hint=False,
     ),
 )
 async def review_submission(
-    ctx: Context, link_id: int, decision: Literal["approve", "reject"]
+    link_id: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Numeric id of the link to rule on, as shown in the admin "
+                "queue. This is an id, not a slug path."
+            ),
+        ),
+    ],
+    decision: Annotated[
+        Literal["approve", "reject"],
+        Field(
+            description=(
+                "approve publishes the link into its category; reject hides "
+                "it. Either ruling can be changed later by another call."
+            )
+        ),
+    ],
 ) -> str:
     status = "approved" if decision == "approve" else "rejected"
     token = _admin_token()
