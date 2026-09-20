@@ -26,7 +26,7 @@ export default function AdminSearchBar(
   { placeholder, initialQuery, paramName = "q", rightSlot }: Props,
 ) {
   const value = useSignal(initialQuery);
-  const timer = useRef<number | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSubmitted = useRef(initialQuery);
 
   useEffect(() => () => {

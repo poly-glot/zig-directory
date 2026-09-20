@@ -33,7 +33,8 @@
   display: none;
   gap: 4px;
 }
-.wrap:hover .actions, .wrap:focus-within .actions {
+.wrap:hover .actions,
+.wrap:focus-within .actions {
   display: inline-flex;
 }
 .actions form {
