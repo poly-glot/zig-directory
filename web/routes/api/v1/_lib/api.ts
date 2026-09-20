@@ -6,7 +6,7 @@ import {
 } from "../../../../lib/dmoz-client.ts";
 import { formatCategoryName } from "../../../../lib/format.ts";
 
-export const MAX_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 50;
 const DEFAULT_PAGE_SIZE = 20;
 const ROOT_SLUG = "top";
 

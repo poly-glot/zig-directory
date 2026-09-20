@@ -1,3 +1,4 @@
+import { encodeBase64Url } from "jsr:@std/encoding@^1/base64url";
 import { importJWK, importPKCS8, jwtVerify, SignJWT } from "jose";
 import { getKv } from "./kv-users.ts";
 
@@ -141,15 +142,6 @@ export async function redeemRefreshToken(
   return { record: entry.value, nextToken };
 }
 
-function base64UrlEncode(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(
-    /=+$/,
-    "",
-  );
-}
-
 export async function verifyPkce(
   codeVerifier: string,
   codeChallenge: string,
@@ -158,7 +150,7 @@ export async function verifyPkce(
     "SHA-256",
     new TextEncoder().encode(codeVerifier),
   );
-  return base64UrlEncode(new Uint8Array(digest)) === codeChallenge;
+  return encodeBase64Url(digest) === codeChallenge;
 }
 
 let signingKey: Awaited<ReturnType<typeof importPKCS8>> | null = null;
