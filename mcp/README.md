@@ -88,3 +88,72 @@ uv run mypy .
 ```
 
 The Stop hook runs this automatically when a `mcp/*.py` file changed.
+
+## Identity (`auth.py`, built but not wired)
+
+The app's own accounts (`web/lib/kv-users.ts`) are the identity provider:
+Fresh is an OAuth 2.1 Authorization Server (`web/routes/oauth/*`,
+`web/routes/.well-known/*`) over its existing users, and `auth.py` builds a
+`RemoteAuthProvider` that verifies the JWTs Fresh issues. `server.py` does
+**not** pass `auth=` to `FastMCP` yet — `browse_category`, `list_links` and
+`search_directory` stay open with no login, exactly as today. Wiring it in
+for a future write tool is:
+
+```python
+from auth import remote_auth_provider
+mcp = FastMCP("dmozdb", auth=remote_auth_provider)
+
+from fastmcp.server.auth import require_roles
+
+@mcp.tool(auth=require_roles("editor", "admin", extract=lambda c: c["role"]))
+async def approve_submission(...): ...
+```
+
+### Verifying the AS/RS pair end to end
+
+1. Generate a keypair once and put it in `web/.env` (gitignored):
+   ```bash
+   cd web && deno run -A scripts/generate-jwt-keypair.ts
+   # paste the two printed lines into web/.env, plus:
+   #   OAUTH_ISSUER_URL="http://127.0.0.1:8000"
+   #   MCP_RESOURCE_URL="http://127.0.0.1:8765/mcp"
+   ```
+2. Register a client:
+   ```bash
+   curl -X POST http://127.0.0.1:8000/oauth/register \
+     -H 'Content-Type: application/json' \
+     -d '{"redirect_uris": ["http://127.0.0.1:9999/cb"]}'
+   ```
+3. Build a PKCE pair and open `/oauth/authorize` in a browser, logged in as
+   an existing account:
+   ```bash
+   python3 - <<'EOF'
+   import base64, hashlib, secrets
+   verifier = secrets.token_urlsafe(64)
+   challenge = base64.urlsafe_b64encode(
+       hashlib.sha256(verifier.encode()).digest()
+   ).rstrip(b"=").decode()
+   print("verifier:", verifier)
+   print("challenge:", challenge)
+   EOF
+   ```
+   `http://127.0.0.1:8000/oauth/authorize?response_type=code&client_id=<id>&redirect_uri=http://127.0.0.1:9999/cb&code_challenge=<challenge>&code_challenge_method=S256&resource=http://127.0.0.1:8765/mcp&state=xyz`
+   — approve, then copy the `code` from the (404, that's fine) redirect URL.
+4. Exchange it:
+   ```bash
+   curl -X POST http://127.0.0.1:8000/oauth/token \
+     -d grant_type=authorization_code -d code=<code> \
+     -d client_id=<id> -d redirect_uri=http://127.0.0.1:9999/cb \
+     -d code_verifier=<verifier>
+   ```
+5. Confirm the token verifies and carries the right role:
+   ```bash
+   cd mcp && OAUTH_ISSUER_URL=http://127.0.0.1:8000 \
+     MCP_RESOURCE_URL=http://127.0.0.1:8765/mcp \
+     uv run python -c "
+   import asyncio, auth
+   print(asyncio.run(auth.verifier.verify_token('<access_token>')))
+   "
+   ```
+6. Confirm `browse_category` etc. still work with **no** `Authorization`
+   header — the read tools must be unaffected by any of the above.

@@ -343,6 +343,7 @@ dependencies = [
     { name = "httpx2" },
     { name = "mcp-types" },
     { name = "prefab-ui" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -357,6 +358,7 @@ requires-dist = [
     { name = "httpx2", specifier = ">=2.13,<3" },
     { name = "mcp-types", specifier = ">=2.2,<3" },
     { name = "prefab-ui", specifier = ">=0.20.2" },
+    { name = "pydantic", specifier = ">=2.13,<3" },
 ]
 
 [package.metadata.requires-dev]

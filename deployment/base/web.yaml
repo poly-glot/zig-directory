@@ -47,6 +47,20 @@ spec:
                 secretKeyRef:
                   name: denokv-auth
                   key: token
+            - name: OAUTH_ISSUER_URL
+              value: "https://directory.junaid.guru"
+            - name: MCP_RESOURCE_URL
+              value: "https://mcp.directory.junaid.guru/mcp"
+            - name: MCP_JWT_PRIVATE_KEY_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-jwt-signing-key
+                  key: private-key-pem
+            - name: MCP_JWT_PUBLIC_KEY_JWK
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-jwt-signing-key
+                  key: public-key-jwk
           # /healthz returns 200 only when the backend is reachable, so it gates
           # startup and readiness (don't serve traffic without a backend). For
           # liveness we only check the web process itself — a backend blip must
