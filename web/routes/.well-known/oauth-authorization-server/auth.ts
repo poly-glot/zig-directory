@@ -1,9 +1,9 @@
-import { define } from "../../utils.ts";
+import { define } from "../../../utils.ts";
 
 export const handler = define.handlers({
   GET() {
     const issuer = Deno.env.get("OAUTH_ISSUER_URL") ??
-      "http://127.0.0.1:8000";
+      "http://127.0.0.1:8000/auth";
     return Response.json({
       issuer,
       authorization_endpoint: `${issuer}/oauth/authorize`,

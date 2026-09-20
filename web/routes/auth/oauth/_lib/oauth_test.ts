@@ -5,12 +5,14 @@ import {
   createAuthorizationCode,
   issueRefreshToken,
   redeemRefreshToken,
+  redirectUriMatches,
   registerClient,
   signAccessToken,
   validateRedirectUris,
   verifyBearerToken,
   verifyPkce,
-} from "../../../lib/oauth.ts";
+} from "../../../../lib/oauth.ts";
+import { isCimdClientId, resolveCimdClient } from "../../../../lib/cimd.ts";
 
 Deno.env.set("KV_PATH", ":memory:");
 
@@ -145,3 +147,71 @@ Deno.test(
     assertEquals(await verifyBearerToken(wrongAudience.accessToken), null);
   },
 );
+
+Deno.test("redirect matching is exact for plain patterns", () => {
+  assert(redirectUriMatches(
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.ai/api/mcp/auth_callback",
+  ));
+  assert(
+    !redirectUriMatches(
+      "https://evil.com/cb",
+      "https://claude.ai/api/mcp/auth_callback",
+    ),
+  );
+});
+
+Deno.test("loopback patterns accept any port (RFC 8252 §7.3)", () => {
+  assert(
+    redirectUriMatches("http://127.0.0.1:53121/cb", "http://127.0.0.1/cb"),
+  );
+  assert(
+    redirectUriMatches("http://localhost:9999/cb", "http://localhost:*/cb"),
+  );
+  assert(
+    !redirectUriMatches("http://example.com:9999/cb", "http://example.com/cb"),
+  );
+});
+
+Deno.test("redirect matching rejects userinfo and dot-segment bypasses", () => {
+  assert(
+    !redirectUriMatches(
+      "http://localhost@evil.com/cb",
+      "http://localhost:*/cb",
+    ),
+  );
+  assert(
+    !redirectUriMatches(
+      "https://claude.ai/api/../../steal",
+      "https://claude.ai/api/*",
+    ),
+  );
+});
+
+Deno.test("wildcard host patterns only match subdomains", () => {
+  assert(
+    redirectUriMatches(
+      "https://app.example.com/cb",
+      "https://*.example.com/cb",
+    ),
+  );
+  assert(
+    !redirectUriMatches(
+      "https://evil-example.com/cb",
+      "https://*.example.com/cb",
+    ),
+  );
+});
+
+Deno.test("CIMD client ids must be https URLs", () => {
+  assert(isCimdClientId("https://claude.ai/.well-known/oauth-client"));
+  assert(!isCimdClientId("6fdc54d5-d1e4-4259-a836-c391342b76e2"));
+  assert(!isCimdClientId("http://insecure.example.com/client"));
+});
+
+Deno.test("CIMD rejects non-https, root-path and private-host documents", async () => {
+  assertEquals(await resolveCimdClient("http://example.com/client"), null);
+  assertEquals(await resolveCimdClient("https://example.com/"), null);
+  assertEquals(await resolveCimdClient("https://localhost/client"), null);
+  assertEquals(await resolveCimdClient("https://127.0.0.1/client"), null);
+});

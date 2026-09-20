@@ -1,13 +1,13 @@
-import { define } from "../../utils.ts";
-import { getUserById } from "../../lib/kv-users.ts";
+import { define } from "../../../utils.ts";
+import { getUserById } from "../../../lib/kv-users.ts";
 import {
   consumeAuthorizationCode,
-  getClient,
   issueRefreshToken,
   redeemRefreshToken,
+  resolveClient,
   signAccessToken,
   verifyPkce,
-} from "../../lib/oauth.ts";
+} from "../../../lib/oauth.ts";
 import { oauthError } from "./_lib/errors.ts";
 
 async function authorizationCodeGrant(form: FormData): Promise<Response> {
@@ -92,7 +92,7 @@ export const handler = define.handlers({
     const grantType = form.get("grant_type")?.toString();
     const clientId = form.get("client_id")?.toString() ?? "";
 
-    if (!(await getClient(clientId))) {
+    if (!(await resolveClient(clientId))) {
       return oauthError("invalid_client", "Unknown client_id");
     }
 

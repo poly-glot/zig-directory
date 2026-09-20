@@ -1,5 +1,6 @@
 import { encodeBase64Url } from "jsr:@std/encoding@^1/base64url";
 import { importJWK, importPKCS8, jwtVerify, SignJWT } from "jose";
+import { isCimdClientId, resolveCimdClient } from "./cimd.ts";
 import { getKv } from "./kv-users.ts";
 
 export interface OAuthClient {
@@ -69,6 +70,68 @@ export async function getClient(clientId: string): Promise<OAuthClient | null> {
   const kv = await getKv();
   const entry = await kv.get<OAuthClient>(["oauth_clients", clientId]);
   return entry.value ?? null;
+}
+
+export async function resolveClient(
+  clientId: string,
+): Promise<OAuthClient | null> {
+  if (!isCimdClientId(clientId)) return getClient(clientId);
+
+  const client = await resolveCimdClient(clientId);
+  if (!client) return null;
+  return { ...client, createdAt: new Date(0).toISOString() };
+}
+
+function hostMatches(host: string, pattern: string): boolean {
+  if (pattern === "*") return true;
+  if (pattern.startsWith("*.")) return host.endsWith(pattern.slice(1));
+  return host === pattern;
+}
+
+function pathMatches(path: string, pattern: string): boolean {
+  if (!pattern.includes("*")) return path === pattern;
+  const expression = pattern
+    .split("*")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".*");
+  return new RegExp(`^${expression}$`).test(path);
+}
+
+export function redirectUriMatches(uri: string, pattern: string): boolean {
+  const parts = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)$/.exec(
+    pattern,
+  );
+  if (!parts) return uri === pattern;
+
+  let target: URL;
+  try {
+    target = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (target.username || target.password) return false;
+  if (target.pathname.split("/").some((s) => s === "." || s === "..")) {
+    return false;
+  }
+
+  const [, scheme, authority, path] = parts;
+  if (target.protocol !== `${scheme.toLowerCase()}:`) return false;
+
+  const portAt = authority.lastIndexOf(":");
+  const patternHost = portAt === -1 ? authority : authority.slice(0, portAt);
+  const patternPort = portAt === -1 ? null : authority.slice(portAt + 1);
+  if (!hostMatches(target.hostname, patternHost.toLowerCase())) return false;
+
+  const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(
+    patternHost.toLowerCase(),
+  );
+  if (patternPort !== null && patternPort !== "*") {
+    if (target.port !== patternPort) return false;
+  } else if (patternPort === null && !loopback) {
+    if (target.port !== "") return false;
+  }
+
+  return pathMatches(target.pathname, path || "/");
 }
 
 export async function createAuthorizationCode(
@@ -177,7 +240,8 @@ export async function signAccessToken(
     scope: string;
   },
 ): Promise<{ accessToken: string; expiresIn: number }> {
-  const issuer = Deno.env.get("OAUTH_ISSUER_URL") ?? "http://127.0.0.1:8000";
+  const issuer = Deno.env.get("OAUTH_ISSUER_URL") ??
+    "http://127.0.0.1:8000/auth";
   const publicKeyJwk = JSON.parse(
     Deno.env.get("MCP_JWT_PUBLIC_KEY_JWK") ?? "{}",
   );
@@ -208,7 +272,8 @@ async function getVerificationKey(): Promise<
 export async function verifyBearerToken(
   token: string,
 ): Promise<{ userId: string; role: string } | null> {
-  const issuer = Deno.env.get("OAUTH_ISSUER_URL") ?? "http://127.0.0.1:8000";
+  const issuer = Deno.env.get("OAUTH_ISSUER_URL") ??
+    "http://127.0.0.1:8000/auth";
   const audience = Deno.env.get("MCP_RESOURCE_URL") ??
     "http://127.0.0.1:8765/mcp";
   try {

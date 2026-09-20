@@ -1,10 +1,11 @@
 import { page } from "fresh";
-import { define } from "../../utils.ts";
+import { define } from "../../../utils.ts";
 import {
   createAuthorizationCode,
-  getClient,
   type OAuthClient,
-} from "../../lib/oauth.ts";
+  redirectUriMatches,
+  resolveClient,
+} from "../../../lib/oauth.ts";
 import { oauthError } from "./_lib/errors.ts";
 
 interface Data {
@@ -41,14 +42,14 @@ async function resolveClientAndRedirect(
 ): Promise<
   { ok: true; client: OAuthClient } | { ok: false; response: Response }
 > {
-  const client = clientId ? await getClient(clientId) : null;
+  const client = clientId ? await resolveClient(clientId) : null;
   if (!client) {
     return {
       ok: false,
       response: oauthError("invalid_client", "Unknown client_id"),
     };
   }
-  if (!client.redirectUris.includes(redirectUri)) {
+  if (!client.redirectUris.some((p) => redirectUriMatches(redirectUri, p))) {
     return {
       ok: false,
       response: oauthError(

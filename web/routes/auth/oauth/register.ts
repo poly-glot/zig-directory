@@ -1,5 +1,5 @@
-import { define } from "../../utils.ts";
-import { registerClient, validateRedirectUris } from "../../lib/oauth.ts";
+import { define } from "../../../utils.ts";
+import { registerClient, validateRedirectUris } from "../../../lib/oauth.ts";
 import { oauthError } from "./_lib/errors.ts";
 
 export const handler = define.handlers({
