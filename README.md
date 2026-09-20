@@ -434,20 +434,67 @@ Subcommands: `seed`, `create_link`, `get_link`, `browse {path|children|subtree-l
 
 ## Kubernetes Deployment
 
-Manifests are provided in `k8s/`:
+The live deployment is `deployment/`, applied with kustomize. `k8s/` holds the
+earlier single-workload manifests and is not what runs.
 
 ```bash
-kubectl apply -f k8s/namespace.yaml
-kubectl create secret generic dmozdb-secrets -n dmozdb \
-  --from-literal=admin-api-key=your-secret-key
-kubectl apply -f k8s/service.yaml
-kubectl apply -f k8s/statefulset.yaml
+kubectl apply -k deployment/overlays/main
 ```
 
-The StatefulSet provides:
+`.github/workflows/cd.yaml` does this on every push to `main`, rewriting each
+image tag to the built commit SHA first. Three workloads come out of it: the
+Zig backend (StatefulSet), the Deno/Fresh frontend (Deployment + HPA) and the
+MCP server (Deployment), behind one Traefik Ingress on
+`directory.junaid.guru`, with `/mcp` and `/.well-known/oauth-protected-resource`
+routed to the MCP service and everything else to the frontend.
 
-- **10Gi persistent volume** at `/var/lib/dmozdb`
-- **Resource limits**: 512Mi-2Gi RAM, 500m-2000m CPU
+### Secrets, which must exist before the first apply
+
+Two Secrets are referenced by the manifests and created by nobody — not by
+kustomize, not by CD. A missing one does not fail the deploy: `kubectl apply`
+succeeds, the workflow goes green, and the pod sits in
+`CreateContainerConfigError` until someone looks. Create both in the namespace
+before the first rollout.
+
+```bash
+kubectl create namespace dmozdb
+
+# Deno KV access token, shared by the denokv StatefulSet and the frontend.
+kubectl create secret generic denokv-auth -n dmozdb \
+  --from-literal=token="$(openssl rand -hex 32)"
+
+# RS256 keypair the frontend signs MCP access tokens with, and verifies them
+# against. The MCP server never sees it: it fetches the public half from the
+# frontend's JWKS endpoint. Generate a keypair that is not the one in web/.env.
+cd web && deno run -A scripts/generate-jwt-keypair.ts
+```
+
+That script prints the two values in `.env` form. For the cluster, write each
+to a file and load it as a key — `private-key-pem` tolerates real newlines, and
+`public-key-jwk` is the JSON object:
+
+```bash
+kubectl create secret generic mcp-jwt-signing-key -n dmozdb \
+  --from-file=private-key-pem=./private-key-pem \
+  --from-file=public-key-jwk=./public-key-jwk
+```
+
+Rotating the keypair invalidates every access token already issued, which is
+usually what you want and never silent: clients get a `401 invalid_token` and
+re-run their sign-in.
+
+The image-pull Secret (`ocirsecret`) is the exception — CD copies it into the
+namespace itself on every run.
+
+### What the manifests provide
+
+- **StatefulSet** — 10Gi persistent volume at `/var/lib/dmozdb`, 512Mi-2Gi RAM,
+  500m-2000m CPU
+- **Frontend** — 2-4 replicas via HPA at 70% CPU, readiness gated on backend
+  reachability
+- **MCP** — one replica deliberately; the transport is session-oriented with no
+  shared session store, so a second would strand sessions that do not land back
+  on their own pod
 
 ---
 

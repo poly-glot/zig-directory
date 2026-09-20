@@ -126,6 +126,19 @@ matches a tool, that the body probe and bearer parsing behave, and that no
 parameter ships without a description or as an unbounded integer. It needs no
 running server.
 
+## Deploying it
+
+`deployment/base/mcp.yaml`, rolled out by `.github/workflows/cd.yaml` on push
+to `main`. It serves `directory.junaid.guru/mcp`, sharing the site's hostname
+through two ingress path rules that mirror `isMcpPath()` in the devcontainer
+proxy.
+
+The pod holds no secret: tools call the web tier's `/api/v1` over the
+in-cluster Service, and tokens are verified against that tier's JWKS. The
+frontend does need the `mcp-jwt-signing-key` Secret to sign them, and nothing
+creates it automatically — see the Secrets section of the root
+[README](../README.md#secrets-which-must-exist-before-the-first-apply).
+
 ## Identity (`dmozdb_mcp/auth/`)
 
 The app's own accounts (`web/lib/kv-users.ts`) are the identity provider:

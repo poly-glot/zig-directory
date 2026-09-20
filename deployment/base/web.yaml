@@ -51,6 +51,11 @@ spec:
               value: "https://directory.junaid.guru/auth"
             - name: MCP_RESOURCE_URL
               value: "https://directory.junaid.guru/mcp"
+            # Neither kustomize nor CD creates this Secret. If it is
+            # absent the apply still succeeds and the workflow still goes
+            # green, but the pod never starts —
+            # CreateContainerConfigError, "secret not found". See the
+            # Secrets section of the root README before a first rollout.
             - name: MCP_JWT_PRIVATE_KEY_PEM
               valueFrom:
                 secretKeyRef:
