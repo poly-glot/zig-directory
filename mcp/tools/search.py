@@ -1,6 +1,7 @@
 from typing import Literal
 
 from fastmcp import Context
+from fastmcp.apps import PrefabAppConfig
 from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 
@@ -11,7 +12,7 @@ from views import build_view, category_card, link_card, result
 
 
 @mcp.tool(
-    app=True,
+    app=PrefabAppConfig(),
     description=(
         "Search the directory for categories and approved links, matching on "
         "category names and on link titles, URLs and descriptions. Use it to "

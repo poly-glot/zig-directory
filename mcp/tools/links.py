@@ -1,4 +1,5 @@
 from fastmcp import Context
+from fastmcp.apps import PrefabAppConfig
 from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 
@@ -9,7 +10,7 @@ from views import build_view, link_card, result
 
 
 @mcp.tool(
-    app=True,
+    app=PrefabAppConfig(),
     description=(
         "List approved links filed in a category and in every category beneath "
         "it. Takes the same slug path as browse_category. Pass the after_id from "

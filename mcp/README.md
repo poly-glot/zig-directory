@@ -14,9 +14,9 @@ speaks the binary protocol or touches Deno KV.
 
 Categories are addressed by slug path only, the same `path` the website uses.
 `list_links` resolves that path itself, so no numeric ids cross the tool
-boundary. `review_submission` is invisible to non-admin callers — FastMCP
-hides `auth=`-gated tools from `tools/list` for anyone who fails the check,
-so it isn't just denied, it doesn't appear.
+boundary. `review_submission` always appears in `tools/list` — unlike the
+website's own `/admin` pages, the MCP server can't hide it per caller — but
+calling it without a valid admin bearer token fails.
 
 ## Two replies per call
 
@@ -39,21 +39,25 @@ uv sync
 DMOZ_API_URL=http://127.0.0.1:8000 uv run python server.py   # :8765/mcp
 ```
 
-Every tool call now needs a bearer token minted by Fresh's OAuth server (see
-below) — there is no anonymous mode. Register with Claude Code:
+The three reads are anonymous, same as the website. Only `review_submission`
+needs a bearer token, minted by Fresh's OAuth server (see below), from an
+admin account. Register with Claude Code:
 
 ```bash
-claude mcp add --transport http dmozdb http://127.0.0.1:8765/mcp \
-  --header "Authorization: Bearer <access_token>"
-claude mcp list
+claude mcp add --transport http dmozdb http://127.0.0.1:8765/mcp
 ```
+
+Add `--header "Authorization: Bearer <access_token>"` only if you also want
+to call `review_submission`.
 
 Inspect or call a tool without a host:
 
 ```bash
-uv run fastmcp list http://127.0.0.1:8765/mcp --auth <access_token>
+uv run fastmcp list http://127.0.0.1:8765/mcp
 uv run fastmcp call http://127.0.0.1:8765/mcp browse_category \
-  --input-json '{"path":"arts"}' --auth <access_token>
+  --input-json '{"path":"arts"}'
+uv run fastmcp call http://127.0.0.1:8765/mcp review_submission \
+  --input-json '{"link_id":1,"decision":"approve"}' --auth <access_token>
 ```
 
 ## Layout
@@ -62,8 +66,8 @@ Each tool is its own module under `tools/`; nothing there imports `server.py`.
 
 | File | Holds |
 |---|---|
-| `app.py` | the shared `FastMCP` instance, wired with `auth=remote_auth_provider` |
-| `auth.py` | builds the `RemoteAuthProvider`/`JWTVerifier` that verifies Fresh's tokens |
+| `app.py` | the shared `FastMCP` instance — no server-wide `auth=`, so reads stay anonymous |
+| `auth.py` | builds the `JWTVerifier` that verifies Fresh's tokens; `review_submission` calls it directly |
 | `client.py` | the httpx2 client, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
 | `formatting.py` | text-summary helpers and the paging constants |
 | `views.py` | Prefab cards and `build_view`/`result` |
@@ -77,23 +81,22 @@ what lets `views.py` stay free of `tools/`.
 
 ## Adding a tool
 
-Add the data it needs to `web/routes/api/v1/`, document that route in
-`web/routes/api/v1/_lib/openapi.ts`, then add a module under `tools/` with
-one `@mcp.tool` function and import it from `tools/__init__.py`. Keep the
-text summary short, and reuse `link_card` or `category_card` for the view.
-Pin `prefab-ui` to an exact version when this goes to production; it is
-pre-1.0.
-
-The OpenAPI document is documentation for API consumers, not the tool
-contract. `cd web && deno task test` fails if a documented path has no route.
+Add the data it needs to `web/routes/api/v1/`, then add a module under
+`tools/` with one `@mcp.tool` function and import it from
+`tools/__init__.py`. Keep the text summary short, and reuse `link_card` or
+`category_card` for the view. Pin `prefab-ui` to an exact version when this
+goes to production; it is pre-1.0.
 
 A write tool's route additionally needs to verify the bearer token itself
 (`verifyBearerToken` in `web/lib/oauth.ts`) rather than trust the session
 cookie the human-facing `/admin` routes use — see
-`web/routes/api/v1/links/[id]/status.ts` for the pattern — and the tool
-needs its own `auth=require_roles(...)` matching whatever the real
-authorization rule for that action already is on the website, not a
-convenient guess.
+`web/routes/api/v1/links/[id]/status.ts` for the pattern. The MCP tool needs
+the same check on its own side, matching whatever the real authorization
+rule for that action already is on the website, not a convenient guess — see
+`admin_bearer_token` in `tools/review_submission.py`. There's no server-wide
+`auth=` to lean on (see [Identity](#identity-authpy)), so every write tool
+verifies its own token; promote that check into a shared module once a
+second write tool needs it.
 
 ## Checks
 
@@ -110,29 +113,47 @@ The Stop hook runs this automatically when a `mcp/*.py` file changed.
 The app's own accounts (`web/lib/kv-users.ts`) are the identity provider:
 Fresh is an OAuth 2.1 Authorization Server (`web/routes/oauth/*`,
 `web/routes/.well-known/*`) over its existing users, and `auth.py` builds the
-`RemoteAuthProvider`/`JWTVerifier` that verifies the JWTs Fresh issues.
-`app.py` passes `auth=remote_auth_provider` to `FastMCP`, which gates the
-*entire* server at the transport layer — there is no way to require login for
-one tool while leaving others anonymous, so every tool call now needs a
-bearer token, including the three reads.
+`JWTVerifier` that verifies the JWTs Fresh issues.
 
-A tool that should be admin-only also needs its own `auth=`, since the
-server-wide provider only authenticates (proves who you are), it doesn't
-authorize (what you're allowed to do):
+`app.py` does *not* pass `auth=` to `FastMCP` — that option gates the entire
+server at the transport layer with no way to require login for one tool
+while leaving others anonymous, and `browse_category`, `list_links` and
+`search_directory` mirror the website's own public reads, so the server
+stays anonymous by default, same as `/api/v1/browse` et al.
+
+`review_submission` is the one tool that needs a caller's identity, so it
+verifies the bearer token itself instead of relying on a server-wide gate:
 
 ```python
-from fastmcp.server.auth import require_roles
+from auth import verifier
 
-@mcp.tool(auth=require_roles("admin", extract=lambda claims: claims["role"]))
-async def review_submission(...): ...
+
+async def admin_bearer_token() -> str:
+    header = get_http_headers(include={"authorization"}).get("authorization", "")
+    scheme, _, token = header.partition(" ")
+
+    access_token = None
+    if scheme.lower() == "bearer" and token:
+        access_token = await verifier.verify_token(token)
+    if access_token is None:
+        raise ToolError("Missing or invalid bearer token.")
+    if (access_token.claims or {}).get("role") != "admin":
+        raise ToolError("This tool requires an admin account.")
+    return access_token.token
 ```
 
-`extract=lambda claims: claims["role"]` reads the flat, site-wide `role`
-already on every user (`user`/`editor`/`admin` — see `kv-users.ts`). There is
-no per-category editor stewardship yet (`EditorRolePanel.tsx` says so
+`access_token.claims["role"]` reads the flat, site-wide `role` already on
+every user (`user`/`editor`/`admin` — see `kv-users.ts`). There is no
+per-category editor stewardship yet (`EditorRolePanel.tsx` says so
 explicitly), so `review_submission` requires `"admin"`, not `"editor"` —
 granting editors a write capability the website itself doesn't would be a
 real authorization bug, not a shortcut.
+
+The trade-off: FastMCP's `auth=` would have hidden `review_submission` from
+`tools/list` for non-admins for free. Hand-verifying means it always lists,
+and only fails on call for a caller without the right token — worth it here
+to keep the three reads genuinely public, since it's one tool, not the whole
+server.
 
 ### Verifying the AS/RS pair end to end
 
@@ -180,9 +201,12 @@ real authorization bug, not a shortcut.
    print(asyncio.run(auth.verifier.verify_token('<access_token>')))
    "
    ```
-6. Confirm every tool now requires that header — `fastmcp list
-   http://127.0.0.1:8765/mcp` with no `--auth` gets a 401; with `--auth
-   <access_token>` from a `role=user` account it lists 3 tools;
-   with a `role=admin` token it lists 4, `review_submission` included.
-7. Call `review_submission` with the admin token and confirm the link's
-   status actually changes (`GET /api/v1/browse` or the `/admin/links` page).
+6. Confirm the reads stay public — `fastmcp list http://127.0.0.1:8765/mcp`
+   with no `--auth` lists all 4 tools (`review_submission` included, since it
+   is never hidden), and `fastmcp call ... browse_category ...` with no
+   `--auth` succeeds.
+7. Confirm `review_submission` is still gated — calling it with no `--auth`,
+   or with a `role=user` token, fails with "Missing or invalid bearer token"
+   or "This tool requires an admin account." Calling it with a `role=admin`
+   token succeeds and the link's status actually changes (`GET
+   /api/v1/browse` or the `/admin/links` page).
