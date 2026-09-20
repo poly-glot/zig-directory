@@ -13,11 +13,9 @@ from collections.abc import Sequence
 import pytest
 from fastmcp.tools import Tool
 
-import auth  # noqa: F401  (registers the protected-resource route)
-import tools  # noqa: F401  (registers the tools, and their protect() calls)
-from app import mcp_app
-from auth.challenge import _bearer_token, _body_calls_protected_tool
-from auth.roles import PROTECTED_TOOLS
+from dmozdb_mcp import auth, tools  # noqa: F401  (registers routes and tools)
+from dmozdb_mcp.app import mcp_app
+from dmozdb_mcp.auth import challenge, roles
 
 
 @pytest.fixture(scope="module")
@@ -37,12 +35,12 @@ def write_tool_names(listed_tools: Sequence[Tool]) -> set[str]:
 
 
 def test_every_protected_name_is_a_real_tool(listed_tools: Sequence[Tool]) -> None:
-    unknown = PROTECTED_TOOLS - {tool.name for tool in listed_tools}
+    unknown = roles.PROTECTED_TOOLS - {tool.name for tool in listed_tools}
     assert not unknown, f"PROTECTED_TOOLS names no such tool: {sorted(unknown)}"
 
 
 def test_every_write_tool_is_protected(write_tool_names: set[str]) -> None:
-    unguarded = write_tool_names - PROTECTED_TOOLS
+    unguarded = write_tool_names - roles.PROTECTED_TOOLS
     assert not unguarded, (
         f"write tools missing from PROTECTED_TOOLS: {sorted(unguarded)}. "
         "Declare them with auth.roles.protect() so an anonymous call is "
@@ -58,9 +56,9 @@ def _tools_call(name: str) -> bytes:
 
 
 def test_body_probe_detects_a_protected_call() -> None:
-    protected = next(iter(PROTECTED_TOOLS))
-    assert _body_calls_protected_tool(_tools_call(protected))
-    assert _body_calls_protected_tool(b"[" + _tools_call(protected) + b"]")
+    protected = next(iter(roles.PROTECTED_TOOLS))
+    assert challenge._body_calls_protected_tool(_tools_call(protected))
+    assert challenge._body_calls_protected_tool(b"[" + _tools_call(protected) + b"]")
 
 
 @pytest.mark.parametrize(
@@ -73,11 +71,11 @@ def test_body_probe_detects_a_protected_call() -> None:
     ],
 )
 def test_body_probe_ignores_everything_else(body: bytes) -> None:
-    assert not _body_calls_protected_tool(body)
+    assert not challenge._body_calls_protected_tool(body)
 
 
 def test_body_probe_ignores_a_public_tool() -> None:
-    assert not _body_calls_protected_tool(_tools_call("browse_category"))
+    assert not challenge._body_calls_protected_tool(_tools_call("browse_category"))
 
 
 def _scope(header: bytes | None) -> dict[str, object]:
@@ -96,7 +94,7 @@ def _scope(header: bytes | None) -> dict[str, object]:
     ],
 )
 def test_bearer_parsing(header: bytes | None, expected: str | None) -> None:
-    assert _bearer_token(_scope(header)) == expected
+    assert challenge._bearer_token(_scope(header)) == expected
 
 
 def test_every_parameter_is_described(listed_tools: Sequence[Tool]) -> None:

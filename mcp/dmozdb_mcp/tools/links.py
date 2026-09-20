@@ -8,16 +8,10 @@ from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp_app
-from client import JSON, category_at, fetch
-from formatting import (
-    DEFAULT_LIMIT,
-    MAX_LIMIT,
-    counted,
-    cursor_summary,
-    link_summary,
-)
-from views import NextPage, Section, build_view, link_card, result
+from dmozdb_mcp import client, formatting, views
+from dmozdb_mcp.app import mcp_app
+from dmozdb_mcp.client import JSON
+from dmozdb_mcp.formatting import DEFAULT_LIMIT, MAX_LIMIT
 
 
 def _summarize(page: JSON, category_name: str) -> tuple[str, list[str]]:
@@ -33,11 +27,11 @@ def _summarize(page: JSON, category_name: str) -> tuple[str, list[str]]:
         and the complete summary lines including the cursor hint.
     """
     headline = (
-        f"{len(page['links'])} of {counted(page['total'], 'link', 'links')} "
+        f"{len(page['links'])} of {formatting.counted(page['total'], 'link', 'links')} "
         f"under {category_name}"
     )
-    lines = [headline] + [link_summary(link) for link in page["links"]]
-    lines.append(cursor_summary(page["nextAfterId"]))
+    lines = [headline] + [formatting.link_summary(link) for link in page["links"]]
+    lines.append(formatting.cursor_summary(page["nextAfterId"]))
     return headline, lines
 
 
@@ -103,8 +97,8 @@ async def list_links(
     Raises:
         ToolError: If no category sits at ``path``.
     """
-    browsed = await category_at(path)
-    page = await fetch(
+    browsed = await client.category_at(path)
+    page = await client.fetch(
         f"/api/v1/categories/{browsed.category['id']}/links",
         after_id=after_id,
         limit=limit,
@@ -112,7 +106,7 @@ async def list_links(
     headline, lines = _summarize(page, browsed.category["name"])
 
     next_page = (
-        NextPage(
+        views.NextPage(
             "list_links",
             {"path": path, "after_id": page["nextAfterId"], "limit": limit},
         )
@@ -120,13 +114,13 @@ async def list_links(
         else None
     )
 
-    return result(
+    return views.result(
         ctx,
         lines,
-        lambda: build_view(
+        lambda: views.build_view(
             f"Links under {browsed.category['name']}",
             headline,
-            [Section("", page["links"], link_card)],
+            [views.Section("", page["links"], views.link_card)],
             next_page=next_page,
         ),
     )

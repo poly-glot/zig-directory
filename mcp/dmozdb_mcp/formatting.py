@@ -11,7 +11,7 @@ model to look for them.
 
 from urllib.parse import urlsplit
 
-from client import JSON
+from dmozdb_mcp.client import JSON
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50

@@ -9,12 +9,11 @@ This serves it where the spec puts it.
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from app import mcp_app
+from dmozdb_mcp.app import mcp_app
+from dmozdb_mcp.auth import config
 
-from .config import ISSUER_URL, RESOURCE_METADATA_PATH, RESOURCE_URL, SCOPE
 
-
-@mcp_app.custom_route(RESOURCE_METADATA_PATH, methods=["GET"])
+@mcp_app.custom_route(config.RESOURCE_METADATA_PATH, methods=["GET"])
 async def protected_resource_metadata(request: Request) -> JSONResponse:
     """Name this resource and the authorization server that speaks for it.
 
@@ -27,9 +26,9 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
     """
     return JSONResponse(
         {
-            "resource": RESOURCE_URL,
-            "authorization_servers": [ISSUER_URL],
+            "resource": config.RESOURCE_URL,
+            "authorization_servers": [config.ISSUER_URL],
             "bearer_methods_supported": ["header"],
-            "scopes_supported": [SCOPE],
+            "scopes_supported": [config.SCOPE],
         }
     )

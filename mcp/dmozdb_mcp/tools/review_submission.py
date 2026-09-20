@@ -5,11 +5,11 @@ from typing import Annotated, Literal
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp_app
-from auth.roles import protect
-from client import post_authorized
+from dmozdb_mcp import client
+from dmozdb_mcp.app import mcp_app
+from dmozdb_mcp.auth import roles
 
-_admin_token = protect("review_submission", role="admin")
+_admin_token = roles.protect("review_submission", role="admin")
 
 
 @mcp_app.tool(
@@ -63,7 +63,7 @@ async def review_submission(
     status = "approved" if decision == "approve" else "rejected"
     token = _admin_token()
 
-    link = await post_authorized(
+    link = await client.post_authorized(
         f"/api/v1/links/{link_id}/status",
         token=token,
         json_body={"status": status},

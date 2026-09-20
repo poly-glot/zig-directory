@@ -30,8 +30,8 @@ from prefab_ui.components import (
 )
 from prefab_ui.rx import RESULT
 
-from client import JSON
-from formatting import counted, domain_of
+from dmozdb_mcp import formatting
+from dmozdb_mcp.client import JSON
 
 CARD_MIN_WIDTH = "20rem"
 CARD_GAP = 3
@@ -97,7 +97,7 @@ def link_card(link: JSON) -> None:
             target="_blank",
             css_class="font-medium leading-snug",
         )
-        Small(domain_of(link["url"]), css_class="text-muted-foreground")
+        Small(formatting.domain_of(link["url"]), css_class="text-muted-foreground")
         if link["description"]:
             Muted(link["description"], css_class="text-sm")
         if link.get("categoryPath"):
@@ -115,11 +115,11 @@ def category_card(category: JSON) -> None:
     """Render one category as a card, with Open and Links buttons."""
     with Card(css_class="p-4 flex flex-col gap-2"):
         CardTitle(category["name"], css_class="text-base")
-        Muted(
-            f"{counted(category['linkCountSubtree'], 'link', 'links')} · "
-            f"{counted(category['childCount'], 'subcategory', 'subcategories')}",
-            css_class="text-sm",
+        links = formatting.counted(category["linkCountSubtree"], "link", "links")
+        children = formatting.counted(
+            category["childCount"], "subcategory", "subcategories"
         )
+        Muted(f"{links} · {children}", css_class="text-sm")
         with Row(gap=2):
             Button(
                 "Open",

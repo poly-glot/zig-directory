@@ -1,8 +1,8 @@
 """Serve the tool layer over MCP's streamable HTTP transport.
 
-Run from this directory, since the modules here are imported by bare name:
+Run it as a module from the project root:
 
-    DMOZ_API_URL=http://127.0.0.1:8000 uv run python server.py
+    DMOZ_API_URL=http://127.0.0.1:8000 uv run python -m dmozdb_mcp.server
 
 ``auth`` and ``tools`` are imported for their registration side effects — the
 protected-resource route and the tools themselves — not for any name.
@@ -13,9 +13,8 @@ import os
 import uvicorn
 from starlette.middleware import Middleware
 
-import auth
-import tools
-from app import mcp_app
+from dmozdb_mcp import auth, tools
+from dmozdb_mcp.app import mcp_app
 
 if __name__ == "__main__":
     uvicorn.run(

@@ -15,8 +15,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from starlette.authentication import AuthCredentials
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .config import RESOURCE_METADATA_URL, SCOPE, verifier
-from .roles import PROTECTED_TOOLS
+from dmozdb_mcp.auth import config, roles
 
 MAX_PROBE_BYTES = 1 << 20
 
@@ -53,7 +52,7 @@ def _calls_protected_tool(message: Any) -> bool:
     if not isinstance(message, dict) or message.get("method") != "tools/call":
         return False
     params = message.get("params")
-    return isinstance(params, dict) and params.get("name") in PROTECTED_TOOLS
+    return isinstance(params, dict) and params.get("name") in roles.PROTECTED_TOOLS
 
 
 def _body_calls_protected_tool(body: bytes) -> bool:
@@ -134,8 +133,8 @@ async def _send_challenge(send: Send, *, token_was_supplied: bool) -> None:
             ``invalid_token`` when one was and it failed.
     """
     parts = [
-        f'resource_metadata="{RESOURCE_METADATA_URL}"',
-        f'scope="{SCOPE}"',
+        f'resource_metadata="{config.RESOURCE_METADATA_URL}"',
+        f'scope="{config.SCOPE}"',
     ]
     if token_was_supplied:
         parts.insert(0, 'error="invalid_token"')
@@ -175,7 +174,9 @@ class OpportunisticAuth:
         token = _bearer_token(scope)
         if token is None:
             return Authentication(None, was_supplied=False)
-        return Authentication(await verifier.verify_token(token), was_supplied=True)
+        return Authentication(
+            await config.verifier.verify_token(token), was_supplied=True
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":

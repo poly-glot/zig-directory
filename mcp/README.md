@@ -44,7 +44,7 @@ Needs the stack up first (`dmozdb` on :8080, Fresh on :8000 — see
 ```bash
 cd mcp
 uv sync
-DMOZ_API_URL=http://127.0.0.1:8000 uv run python server.py   # :8765/mcp
+DMOZ_API_URL=http://127.0.0.1:8000 uv run python -m dmozdb_mcp.server   # :8765/mcp
 ```
 
 Register with Claude Code — no token to paste, because the reads are open
@@ -67,33 +67,35 @@ uv run fastmcp call http://127.0.0.1:8765/mcp review_submission \
 
 ## Layout
 
-Each tool is its own module under `tools/`; nothing there imports `server.py`.
+Everything importable lives in the `dmozdb_mcp` package; the project root
+holds only configuration and the tests. Each tool is its own module under
+`dmozdb_mcp/tools/`, and nothing there imports `dmozdb_mcp/server.py`.
 
 | File | Holds |
 |---|---|
-| `app.py` | the shared `FastMCP` instance `mcp_app`, deliberately without a server-wide `auth=` |
-| `auth/config.py` | the `JWTVerifier` for Fresh's tokens, the scope, and this resource's own metadata URL |
-| `auth/challenge.py` | ASGI layer: verifies a token when offered, challenges for protected tools |
-| `auth/metadata.py` | the RFC 9728 protected-resource document the challenge points at |
-| `auth/roles.py` | `protect()`, which registers a tool for the challenge *and* returns its role check |
-| `auth/__init__.py` | imports the three above, registering the metadata route on import |
-| `client.py` | the httpx2 client `_api`, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
-| `formatting.py` | text-summary helpers and the paging constants |
-| `views.py` | Prefab cards and `build_view`/`result` |
-| `tools/browse.py`, `tools/links.py`, `tools/search.py`, `tools/review_submission.py` | one `@mcp_app.tool` each |
-| `tools/__init__.py` | imports the four above, registering them on import |
-| `server.py` | imports `auth`/`tools` and serves the app behind `auth.OpportunisticAuth` |
+| `dmozdb_mcp/app.py` | the shared `FastMCP` instance `mcp_app`, deliberately without a server-wide `auth=` |
+| `dmozdb_mcp/auth/config.py` | the `JWTVerifier` for Fresh's tokens, the scope, and this resource's own metadata URL |
+| `dmozdb_mcp/auth/challenge.py` | ASGI layer: verifies a token when offered, challenges for protected tools |
+| `dmozdb_mcp/auth/metadata.py` | the RFC 9728 protected-resource document the challenge points at |
+| `dmozdb_mcp/auth/roles.py` | `protect()`, which registers a tool for the challenge *and* returns its role check |
+| `dmozdb_mcp/auth/__init__.py` | imports the three above, registering the metadata route on import |
+| `dmozdb_mcp/client.py` | the httpx2 client `_api`, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
+| `dmozdb_mcp/formatting.py` | text-summary helpers and the paging constants |
+| `dmozdb_mcp/views.py` | Prefab cards and `build_view`/`result` |
+| `dmozdb_mcp/tools/*.py` | one `@mcp_app.tool` each |
+| `dmozdb_mcp/tools/__init__.py` | imports the four above, registering them on import |
+| `dmozdb_mcp/server.py` | imports `auth`/`tools` and serves the app behind `auth.OpportunisticAuth` |
 | `test_invariants.py` | the pytest cases that keep auth registration and tool schemas honest |
 
 A card's "Open"/"Browse"/"Next page" buttons call other tools by name
 (`CallTool("browse_category", ...)`), not by importing the function — that's
-what lets `views.py` stay free of `tools/`.
+what lets `dmozdb_mcp/views.py` stay free of `dmozdb_mcp/tools/`.
 
 ## Adding a tool
 
 Add the data it needs to `web/routes/api/v1/`, then add a module under
-`tools/` with one `@mcp_app.tool` function and import it from
-`tools/__init__.py`. Keep the text summary short, and reuse `link_card` or
+`dmozdb_mcp/tools/` with one `@mcp_app.tool` function and import it from
+`dmozdb_mcp/tools/__init__.py`. Keep the text summary short, and reuse `link_card` or
 `category_card` for the view. Pin `prefab-ui` to an exact version when this
 goes to production; it is pre-1.0.
 
@@ -104,7 +106,7 @@ cookie the human-facing `/admin` routes use — see
 needs its own role check in its body, matching whatever the real
 authorization rule for that action already is on the website, not a
 convenient guess. Declare it with `protect("name", role=...)` from
-`auth/roles.py`, which registers it for the sign-in challenge and returns the
+`dmozdb_mcp/auth/roles.py`, which registers it for the sign-in challenge and returns the
 role check in one call, so the two cannot drift apart.
 
 ## Checks
@@ -124,26 +126,26 @@ matches a tool, that the body probe and bearer parsing behave, and that no
 parameter ships without a description or as an unbounded integer. It needs no
 running server.
 
-## Identity (`auth/`)
+## Identity (`dmozdb_mcp/auth/`)
 
 The app's own accounts (`web/lib/kv-users.ts`) are the identity provider:
 Fresh is an OAuth 2.1 Authorization Server (`web/routes/auth/oauth/*`,
-`web/routes/auth/.well-known/*`) over its existing users, and `auth/config.py`
+`web/routes/auth/.well-known/*`) over its existing users, and `dmozdb_mcp/auth/config.py`
 builds the `JWTVerifier` that verifies the JWTs Fresh issues. Users are never
 expected to mint a token by hand: a client detects the `401` +
 `WWW-Authenticate` challenge and drives the login itself.
 
-`app.py` deliberately does **not** pass `auth=` to `FastMCP`. That option
+`dmozdb_mcp/app.py` deliberately does **not** pass `auth=` to `FastMCP`. That option
 installs `RequireAuthMiddleware`, which answers *every* request lacking a
 bearer token with a 401 — including `initialize` — so no client could read a
 public directory without an account first. There is no anonymous or optional
-mode on it. `auth/challenge.py` supplies the missing middle instead:
+mode on it. `dmozdb_mcp/auth/challenge.py` supplies the missing middle instead:
 
 - When a request carries a bearer token it is verified and published as
   `scope["user"]`/`scope["auth"]`, exactly as the SDK's own bearer backend
   does. `get_access_token()` reads identity from there, so a tool body can
   ask who is calling without any transport-wide gate.
-- When a request carries none *and* names a tool in `PROTECTED_TOOLS`, it is
+- When a request carries none *and* names a tool registered by `protect()`, it is
   answered with `401` + `WWW-Authenticate: Bearer resource_metadata="…"`
   (RFC 6750 §3.1: no `error` attribute when no credentials were offered, an
   `error="invalid_token"` when a bad one was). Everything else passes
@@ -168,7 +170,7 @@ value in that document, with no fixed placement rule, so those stay under
 `/auth` where they're easy to find.
 
 Authenticating (who you are) and authorizing (what you may do) stay
-separate: `auth/challenge.py` only establishes identity, so an admin-only tool
+separate: `dmozdb_mcp/auth/challenge.py` only establishes identity, so an admin-only tool
 enforces its own rule:
 
 ```python

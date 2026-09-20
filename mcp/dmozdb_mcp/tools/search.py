@@ -8,16 +8,10 @@ from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp_app
-from client import JSON, fetch
-from formatting import (
-    DEFAULT_LIMIT,
-    MAX_LIMIT,
-    category_summary,
-    counted,
-    link_summary,
-)
-from views import Section, build_view, category_card, link_card, result
+from dmozdb_mcp import client, formatting, views
+from dmozdb_mcp.app import mcp_app
+from dmozdb_mcp.client import JSON
+from dmozdb_mcp.formatting import DEFAULT_LIMIT, MAX_LIMIT
 
 
 def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[str]:
@@ -32,15 +26,15 @@ def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[st
         The summary lines, ending in "No matches." when both are empty.
     """
     lines = [
-        f'"{query}": {counted(len(categories), "category", "categories")}, '
-        f"{counted(len(links), 'link', 'links')}"
+        f'"{query}": {formatting.counted(len(categories), "category", "categories")}, '
+        f"{formatting.counted(len(links), 'link', 'links')}"
     ]
     if categories:
         lines.append("Categories:")
-        lines += [category_summary(category) for category in categories]
+        lines += [formatting.category_summary(category) for category in categories]
     if links:
         lines.append("Links:")
-        lines += [link_summary(link) for link in links]
+        lines += [formatting.link_summary(link) for link in links]
     if not categories and not links:
         lines.append("No matches.")
     return lines
@@ -107,19 +101,19 @@ async def search_directory(
     Raises:
         ToolError: If the directory service cannot be reached.
     """
-    found = await fetch("/api/v1/search", q=q, scope=search_in, limit=limit)
+    found = await client.fetch("/api/v1/search", q=q, scope=search_in, limit=limit)
     categories = found["categories"]
     links = found["links"]
 
-    return result(
+    return views.result(
         ctx,
         _summarize(q, categories, links),
-        lambda: build_view(
+        lambda: views.build_view(
             f'Search: "{q}"',
             f"{len(categories)} categories · {len(links)} links",
             [
-                Section("Categories", categories, category_card),
-                Section("Links", links, link_card),
+                views.Section("Categories", categories, views.category_card),
+                views.Section("Links", links, views.link_card),
             ],
         ),
     )

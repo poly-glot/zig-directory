@@ -69,7 +69,7 @@ Two independent checks, both mandatory. Neither is a substitute for the other.
   401 challenge never fires and the server reads as needing no sign-in.
   Visible-then-challenged is the only arrangement where deferred sign-in
   works.
-- DO: **Declare a new write tool with `protect()` from `auth/roles.py`.**
+- DO: **Declare a new write tool with `protect()` from `dmozdb_mcp/auth/roles.py`.**
   One call registers the name for the 401 challenge and returns the getter
   that enforces the role, so a tool cannot be challenged without being
   checked or checked without being challenged. `test_invariants.py` fails if
@@ -101,7 +101,7 @@ changed, and `.github/workflows/ci.yaml` runs them again on push and PR.
   without a server, so a check that a tool is registered, a header parses, or
   a schema carries its bound costs nothing to keep.
 
-For anything touching `auth/`, confirm on a running server, not by reading:
+For anything touching `dmozdb_mcp/auth/`, confirm on a running server, not by reading:
 
 1. anonymous `tools/list` lists every tool, write tools included;
 2. anonymous call to a protected tool returns `401` with

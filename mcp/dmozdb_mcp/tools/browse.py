@@ -8,10 +8,8 @@ from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp_app
-from client import category_at
-from formatting import category_summary, counted
-from views import Section, build_view, category_card, result
+from dmozdb_mcp import client, formatting, views
+from dmozdb_mcp.app import mcp_app
 
 
 @mcp_app.tool(
@@ -55,26 +53,28 @@ async def browse_category(
     Raises:
         ToolError: If no category sits at ``path``.
     """
-    browsed = await category_at(path)
+    browsed = await client.category_at(path)
     breadcrumb = " / ".join(
         [ancestor["name"] for ancestor in browsed.ancestors]
         + [browsed.category["name"]]
     )
 
-    lines = [category_summary(browsed.category), breadcrumb]
+    lines = [formatting.category_summary(browsed.category), breadcrumb]
     if browsed.children:
-        count = counted(len(browsed.children), "subcategory", "subcategories")
+        count = formatting.counted(
+            len(browsed.children), "subcategory", "subcategories"
+        )
         lines.append(f"{count}:")
-        lines += [category_summary(child) for child in browsed.children]
+        lines += [formatting.category_summary(child) for child in browsed.children]
     else:
         lines.append("No subcategories. Use list_links for its links.")
 
-    return result(
+    return views.result(
         ctx,
         lines,
-        lambda: build_view(
+        lambda: views.build_view(
             browsed.category["name"],
             breadcrumb,
-            [Section("", browsed.children, category_card)],
+            [views.Section("", browsed.children, views.category_card)],
         ),
     )

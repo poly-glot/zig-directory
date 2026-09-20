@@ -7,7 +7,7 @@ and the derived URLs stay behind ``auth.config`` because nothing outside the
 package reads them.
 """
 
-from . import metadata
-from .challenge import OpportunisticAuth
+from dmozdb_mcp.auth import metadata
+from dmozdb_mcp.auth.challenge import OpportunisticAuth
 
 __all__ = ["OpportunisticAuth", "metadata"]
