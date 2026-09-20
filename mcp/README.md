@@ -14,9 +14,15 @@ speaks the binary protocol or touches Deno KV.
 
 Categories are addressed by slug path only, the same `path` the website uses.
 `list_links` resolves that path itself, so no numeric ids cross the tool
-boundary. `review_submission` always appears in `tools/list` — unlike the
-website's own `/admin` pages, the MCP server can't hide it per caller — but
-calling it without a valid admin bearer token fails.
+boundary. `review_submission` is invisible to non-admin callers — FastMCP
+hides `auth=`-gated tools from `tools/list` for anyone who fails the check,
+so it isn't just denied, it doesn't appear.
+
+The three reads need no account, exactly like the website they mirror, and
+calling `review_submission` without one answers with an RFC 6750 challenge
+rather than an error — so a client signs its user in at the moment the
+directory is actually asked to change. That is the "sign in when needed"
+shape in Claude's connector dialog; see [Identity](#identity-authpy).
 
 ## Two replies per call
 
@@ -39,16 +45,13 @@ uv sync
 DMOZ_API_URL=http://127.0.0.1:8000 uv run python server.py   # :8765/mcp
 ```
 
-The three reads are anonymous, same as the website. Only `review_submission`
-needs a bearer token, minted by Fresh's OAuth server (see below), from an
-admin account. Register with Claude Code:
+Register with Claude Code — no token to paste, because the reads are open
+and the one write asks for a sign-in when it is called:
 
 ```bash
 claude mcp add --transport http dmozdb http://127.0.0.1:8765/mcp
+claude mcp list
 ```
-
-Add `--header "Authorization: Bearer <access_token>"` only if you also want
-to call `review_submission`.
 
 Inspect or call a tool without a host:
 
@@ -66,14 +69,16 @@ Each tool is its own module under `tools/`; nothing there imports `server.py`.
 
 | File | Holds |
 |---|---|
-| `app.py` | the shared `FastMCP` instance — no server-wide `auth=`, so reads stay anonymous |
-| `auth.py` | builds the `JWTVerifier` that verifies Fresh's tokens; `review_submission` calls it directly |
+| `app.py` | the shared `FastMCP` instance, deliberately without a server-wide `auth=` |
+| `auth.py` | the `JWTVerifier` for Fresh's tokens, and this resource's own metadata URL |
+| `challenge.py` | ASGI layer: verifies a token when offered, challenges for protected tools |
+| `metadata.py` | the RFC 9728 protected-resource document the challenge points at |
 | `client.py` | the httpx2 client, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
 | `formatting.py` | text-summary helpers and the paging constants |
 | `views.py` | Prefab cards and `build_view`/`result` |
 | `tools/browse.py`, `tools/links.py`, `tools/search.py`, `tools/review_submission.py` | one `@mcp.tool` each |
 | `tools/__init__.py` | imports the four above, registering them on import |
-| `server.py` | imports `tools` and runs the HTTP transport |
+| `server.py` | imports `tools`/`metadata` and serves the app behind `challenge.py` |
 
 A card's "Open"/"Browse"/"Next page" buttons call other tools by name
 (`CallTool("browse_category", ...)`), not by importing the function — that's
@@ -90,13 +95,10 @@ goes to production; it is pre-1.0.
 A write tool's route additionally needs to verify the bearer token itself
 (`verifyBearerToken` in `web/lib/oauth.ts`) rather than trust the session
 cookie the human-facing `/admin` routes use — see
-`web/routes/api/v1/links/[id]/status.ts` for the pattern. The MCP tool needs
-the same check on its own side, matching whatever the real authorization
-rule for that action already is on the website, not a convenient guess — see
-`admin_bearer_token` in `tools/review_submission.py`. There's no server-wide
-`auth=` to lean on (see [Identity](#identity-authpy)), so every write tool
-verifies its own token; promote that check into a shared module once a
-second write tool needs it.
+`web/routes/api/v1/links/[id]/status.ts` for the pattern — and the tool
+needs its own `auth=require_roles(...)` matching whatever the real
+authorization rule for that action already is on the website, not a
+convenient guess.
 
 ## Checks
 
@@ -111,49 +113,89 @@ The Stop hook runs this automatically when a `mcp/*.py` file changed.
 ## Identity (`auth.py`)
 
 The app's own accounts (`web/lib/kv-users.ts`) are the identity provider:
-Fresh is an OAuth 2.1 Authorization Server (`web/routes/oauth/*`,
-`web/routes/.well-known/*`) over its existing users, and `auth.py` builds the
-`JWTVerifier` that verifies the JWTs Fresh issues.
+Fresh is an OAuth 2.1 Authorization Server (`web/routes/auth/oauth/*`,
+`web/routes/auth/.well-known/*`) over its existing users, and `auth.py`
+builds the `JWTVerifier` that verifies the JWTs Fresh issues. Users are never
+expected to mint a token by hand: a client detects the `401` +
+`WWW-Authenticate` challenge and drives the login itself.
 
-`app.py` does *not* pass `auth=` to `FastMCP` — that option gates the entire
-server at the transport layer with no way to require login for one tool
-while leaving others anonymous, and `browse_category`, `list_links` and
-`search_directory` mirror the website's own public reads, so the server
-stays anonymous by default, same as `/api/v1/browse` et al.
+`app.py` deliberately does **not** pass `auth=` to `FastMCP`. That option
+installs `RequireAuthMiddleware`, which answers *every* request lacking a
+bearer token with a 401 — including `initialize` — so no client could read a
+public directory without an account first. There is no anonymous or optional
+mode on it. `challenge.py` supplies the missing middle instead:
 
-`review_submission` is the one tool that needs a caller's identity, so it
-verifies the bearer token itself instead of relying on a server-wide gate:
+- When a request carries a bearer token it is verified and published as
+  `scope["user"]`/`scope["auth"]`, exactly as the SDK's own bearer backend
+  does. `get_access_token()` reads identity from there, so per-tool
+  `auth=require_roles(...)` and `tools/list` filtering keep working untouched.
+- When a request carries none *and* names a tool in `PROTECTED_TOOLS`, it is
+  answered with `401` + `WWW-Authenticate: Bearer resource_metadata="…"`
+  (RFC 6750 §3.1: no `error` attribute when no credentials were offered, an
+  `error="invalid_token"` when a bad one was). Everything else passes
+  through anonymously.
+
+A JSON-RPC `ToolError` is *not* a substitute here. It travels inside a 200
+response, so a client sees an ordinary tool failure and has nothing to
+trigger a sign-in from; the challenge has to be at the HTTP layer.
+
+Fresh's OAuth surface lives under `/auth` (`OAUTH_ISSUER_URL` ends in
+`/auth`) so that a single public hostname can front both the MCP transport
+(`/mcp`) and the Authorization Server (`/auth/*`) via path-based routing —
+needed when tunnelling a local devcontainer through one hostname, and the
+same shape production uses (`OAUTH_ISSUER_URL=https://directory.junaid.guru/auth`
+in `deployment/base/web.yaml`). The one exception is RFC 8414's own
+discovery document: a well-known metadata URI inserts the issuer's path
+*after* `/.well-known/oauth-authorization-server`, not before, so it's
+served from `web/routes/.well-known/oauth-authorization-server/auth.ts` —
+outside `/auth`, not inside it. Everything `/auth/*` returns
+(`authorization_endpoint`, `token_endpoint`, `jwks_uri`) is just a field
+value in that document, with no fixed placement rule, so those stay under
+`/auth` where they're easy to find.
+
+Authenticating (who you are) and authorizing (what you may do) stay
+separate: `challenge.py` only establishes identity, so an admin-only tool
+still declares its own `auth=`:
 
 ```python
-from auth import verifier
+from fastmcp.server.auth import require_roles
 
-
-async def admin_bearer_token() -> str:
-    header = get_http_headers(include={"authorization"}).get("authorization", "")
-    scheme, _, token = header.partition(" ")
-
-    access_token = None
-    if scheme.lower() == "bearer" and token:
-        access_token = await verifier.verify_token(token)
-    if access_token is None:
-        raise ToolError("Missing or invalid bearer token.")
-    if (access_token.claims or {}).get("role") != "admin":
-        raise ToolError("This tool requires an admin account.")
-    return access_token.token
+@mcp.tool(auth=require_roles("admin", extract=lambda claims: claims["role"]))
+async def review_submission(...): ...
 ```
 
-`access_token.claims["role"]` reads the flat, site-wide `role` already on
-every user (`user`/`editor`/`admin` — see `kv-users.ts`). There is no
-per-category editor stewardship yet (`EditorRolePanel.tsx` says so
+`extract=lambda claims: claims["role"]` reads the flat, site-wide `role`
+already on every user (`user`/`editor`/`admin` — see `kv-users.ts`). There is
+no per-category editor stewardship yet (`EditorRolePanel.tsx` says so
 explicitly), so `review_submission` requires `"admin"`, not `"editor"` —
 granting editors a write capability the website itself doesn't would be a
 real authorization bug, not a shortcut.
 
-The trade-off: FastMCP's `auth=` would have hidden `review_submission` from
-`tools/list` for non-admins for free. Hand-verifying means it always lists,
-and only fails on call for a caller without the right token — worth it here
-to keep the three reads genuinely public, since it's one tool, not the whole
-server.
+### Client identity: CIMD and dynamic registration
+
+A client may identify itself two ways, and `resolveClient()` in
+`web/lib/oauth.ts` accepts both:
+
+- **CIMD** (`draft-parecki-oauth-client-id-metadata-document`) — the
+  `client_id` *is* an HTTPS URL hosting the client's metadata, so nothing is
+  registered up front. This is what Claude's connector picks by default
+  ("Use Claude's published identity"). `web/lib/cimd.ts` fetches the
+  document and rejects it unless the URL is HTTPS with a non-root path,
+  resolves to a public address (no loopback, private, link-local, CGNAT or
+  multicast range — an unauthenticated caller naming a URL we fetch is an
+  SSRF vector), declares a `client_id` identical to its own URL, carries at
+  least one syntactically valid `redirect_uri`, and uses no shared-secret
+  `token_endpoint_auth_method`. Successful lookups are cached for ten
+  minutes so `authorize` and `token` don't refetch per request.
+- **Dynamic registration** (RFC 7591, `/auth/oauth/register`) — unchanged,
+  and still what a client gets when it picks "Register automatically".
+
+CIMD documents may use wildcard redirect patterns, so redirect validation
+goes through `redirectUriMatches()` rather than an exact-string check: the
+scheme must match, `*.example.com` matches subdomains only, a loopback
+pattern matches any port (RFC 8252 §7.3), and URIs carrying userinfo or
+dot-segments are refused outright — both are classic ways to smuggle a
+redirect past naive matching.
 
 ### Verifying the AS/RS pair end to end
 
@@ -161,17 +203,17 @@ server.
    ```bash
    cd web && deno run -A scripts/generate-jwt-keypair.ts
    # paste the two printed lines into web/.env, plus:
-   #   OAUTH_ISSUER_URL="http://127.0.0.1:8000"
+   #   OAUTH_ISSUER_URL="http://127.0.0.1:8000/auth"
    #   MCP_RESOURCE_URL="http://127.0.0.1:8765/mcp"
    ```
 2. Register a client:
    ```bash
-   curl -X POST http://127.0.0.1:8000/oauth/register \
+   curl -X POST http://127.0.0.1:8000/auth/oauth/register \
      -H 'Content-Type: application/json' \
      -d '{"redirect_uris": ["http://127.0.0.1:9999/cb"]}'
    ```
-3. Build a PKCE pair and open `/oauth/authorize` in a browser, logged in as
-   an existing account:
+3. Build a PKCE pair and open `/auth/oauth/authorize` in a browser, logged in
+   as an existing account:
    ```bash
    python3 - <<'EOF'
    import base64, hashlib, secrets
@@ -183,30 +225,36 @@ server.
    print("challenge:", challenge)
    EOF
    ```
-   `http://127.0.0.1:8000/oauth/authorize?response_type=code&client_id=<id>&redirect_uri=http://127.0.0.1:9999/cb&code_challenge=<challenge>&code_challenge_method=S256&resource=http://127.0.0.1:8765/mcp&state=xyz`
+   `http://127.0.0.1:8000/auth/oauth/authorize?response_type=code&client_id=<id>&redirect_uri=http://127.0.0.1:9999/cb&code_challenge=<challenge>&code_challenge_method=S256&resource=http://127.0.0.1:8765/mcp&state=xyz`
    — approve, then copy the `code` from the (404, that's fine) redirect URL.
 4. Exchange it:
    ```bash
-   curl -X POST http://127.0.0.1:8000/oauth/token \
+   curl -X POST http://127.0.0.1:8000/auth/oauth/token \
      -d grant_type=authorization_code -d code=<code> \
      -d client_id=<id> -d redirect_uri=http://127.0.0.1:9999/cb \
      -d code_verifier=<verifier>
    ```
 5. Confirm the token verifies and carries the right role:
    ```bash
-   cd mcp && OAUTH_ISSUER_URL=http://127.0.0.1:8000 \
+   cd mcp && OAUTH_ISSUER_URL=http://127.0.0.1:8000/auth \
      MCP_RESOURCE_URL=http://127.0.0.1:8765/mcp \
      uv run python -c "
    import asyncio, auth
    print(asyncio.run(auth.verifier.verify_token('<access_token>')))
    "
    ```
-6. Confirm the reads stay public — `fastmcp list http://127.0.0.1:8765/mcp`
-   with no `--auth` lists all 4 tools (`review_submission` included, since it
-   is never hidden), and `fastmcp call ... browse_category ...` with no
-   `--auth` succeeds.
-7. Confirm `review_submission` is still gated — calling it with no `--auth`,
-   or with a `role=user` token, fails with "Missing or invalid bearer token"
-   or "This tool requires an admin account." Calling it with a `role=admin`
-   token succeeds and the link's status actually changes (`GET
-   /api/v1/browse` or the `/admin/links` page).
+6. Confirm the reads are open — `fastmcp list http://127.0.0.1:8765/mcp`
+   with no `--auth` lists 3 tools and `browse_category` returns data. A
+   `role=user` token still lists 3; a `role=admin` token lists 4.
+7. Confirm the write asks for a sign-in rather than failing. Posting a
+   `tools/call` for `review_submission` with no token must answer `401`
+   with a `WWW-Authenticate: Bearer resource_metadata="…"` header, and that
+   URL must serve the protected-resource document naming the issuer:
+   ```bash
+   curl -s http://127.0.0.1:8765/.well-known/oauth-protected-resource/mcp
+   ```
+8. Call `review_submission` with the admin token and confirm the link's
+   status actually changes (`GET /api/v1/browse` or the `/admin/links` page).
+9. For CIMD, skip step 2 entirely: pass an HTTPS URL serving a client
+   document as `client_id` and confirm a token is issued whose `client_id`
+   claim is that URL.
