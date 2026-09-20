@@ -2,13 +2,16 @@ import json
 from typing import Any
 
 from fastmcp.server.auth import AccessToken
+from fastmcp.utilities.logging import get_logger
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from starlette.authentication import AuthCredentials
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from auth import RESOURCE_METADATA_URL, verifier
+from auth import RESOURCE_METADATA_URL, SCOPES, verifier
 
 PROTECTED_TOOLS = frozenset({"review_submission"})
+
+logger = get_logger(__name__)
 
 
 def _bearer_token(scope: Scope) -> str | None:
@@ -20,23 +23,29 @@ def _bearer_token(scope: Scope) -> str | None:
     return None
 
 
-def _calls_protected_tool(message: Any) -> bool:
+def _protected_tool_called(message: Any) -> str | None:
     if not isinstance(message, dict) or message.get("method") != "tools/call":
-        return False
+        return None
     params = message.get("params")
-    return isinstance(params, dict) and params.get("name") in PROTECTED_TOOLS
+    if not isinstance(params, dict):
+        return None
+    name = params.get("name")
+    return name if name in PROTECTED_TOOLS else None
 
 
-def _body_calls_protected_tool(body: bytes) -> bool:
+def _body_protected_tool(body: bytes) -> str | None:
     if not body:
-        return False
+        return None
     try:
         payload = json.loads(body)
     except ValueError:
-        return False
-    if isinstance(payload, list):
-        return any(_calls_protected_tool(message) for message in payload)
-    return _calls_protected_tool(payload)
+        return None
+    messages = payload if isinstance(payload, list) else [payload]
+    for message in messages:
+        name = _protected_tool_called(message)
+        if name is not None:
+            return name
+    return None
 
 
 async def _drain(receive: Receive) -> tuple[bytes, Receive]:
@@ -63,7 +72,10 @@ async def _drain(receive: Receive) -> tuple[bytes, Receive]:
 
 
 async def _send_challenge(send: Send, *, token_was_supplied: bool) -> None:
-    parts = [f'resource_metadata="{RESOURCE_METADATA_URL}"']
+    parts = [
+        f'resource_metadata="{RESOURCE_METADATA_URL}"',
+        f'scope="{" ".join(SCOPES)}"',
+    ]
     if token_was_supplied:
         parts.insert(0, 'error="invalid_token"')
     await send(
@@ -85,9 +97,9 @@ class OpportunisticAuth:
     FastMCP's own ``auth=`` gates the whole transport, which would force a
     sign-in before anyone could read a public directory. This verifies a bearer
     token when one is offered and publishes the identity the way the SDK's own
-    bearer backend does, so ``require_roles`` and ``tools/list`` filtering keep
-    working, then answers an unauthenticated call to a protected tool with the
-    RFC 6750 challenge that drives a client's sign-in flow.
+    bearer backend does, so a tool body's ``get_access_token()`` sees it, then
+    answers an unauthenticated call to a protected tool with the RFC 6750
+    challenge that drives a client's sign-in flow.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -111,7 +123,9 @@ class OpportunisticAuth:
 
         if access_token is None and scope["method"] == "POST":
             body, receive = await _drain(receive)
-            if _body_calls_protected_tool(body):
+            tool = _body_protected_tool(body)
+            if tool is not None:
+                logger.info("challenging unauthenticated call to %s", tool)
                 await _send_challenge(send, token_was_supplied=token_was_supplied)
                 return
 

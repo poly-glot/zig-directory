@@ -1,12 +1,21 @@
-from typing import Literal, cast
+from typing import Literal
 
 from fastmcp import Context
-from fastmcp.server.auth import AccessToken, require_roles
+from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 from mcp_types import ToolAnnotations
 
 from app import mcp
 from client import post_authorized
+
+
+def _admin_token() -> str:
+    token = get_access_token()
+    if token is None:
+        raise ToolError("Sign in with an admin account to review submissions.")
+    if (token.claims or {}).get("role") != "admin":
+        raise ToolError("This tool requires an admin account.")
+    return token.token
 
 
 @mcp.tool(
@@ -20,17 +29,16 @@ from client import post_authorized
         read_only_hint=False,
         idempotent_hint=True,
     ),
-    auth=require_roles("admin", extract=lambda claims: claims["role"]),
 )
 async def review_submission(
     ctx: Context, link_id: int, decision: Literal["approve", "reject"]
 ) -> str:
     status = "approved" if decision == "approve" else "rejected"
-    token = cast(AccessToken, get_access_token())
+    token = _admin_token()
 
     link = await post_authorized(
         f"/api/v1/links/{link_id}/status",
-        token=token.token,
+        token=token,
         json_body={"status": status},
     )
     return f"{link['title']} — {link['url']} is now {status}."

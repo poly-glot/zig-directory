@@ -6,6 +6,8 @@ from fastmcp.server.auth.providers.jwt import JWTVerifier
 ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "http://127.0.0.1:8000/auth")
 RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "http://127.0.0.1:8765/mcp")
 
+SCOPES = ("mcp",)
+
 verifier = JWTVerifier(
     jwks_uri=f"{ISSUER_URL}/.well-known/jwks.json",
     issuer=ISSUER_URL,

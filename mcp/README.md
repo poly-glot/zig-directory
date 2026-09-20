@@ -14,15 +14,22 @@ speaks the binary protocol or touches Deno KV.
 
 Categories are addressed by slug path only, the same `path` the website uses.
 `list_links` resolves that path itself, so no numeric ids cross the tool
-boundary. `review_submission` is invisible to non-admin callers — FastMCP
-hides `auth=`-gated tools from `tools/list` for anyone who fails the check,
-so it isn't just denied, it doesn't appear.
+boundary.
 
 The three reads need no account, exactly like the website they mirror, and
 calling `review_submission` without one answers with an RFC 6750 challenge
 rather than an error — so a client signs its user in at the moment the
 directory is actually asked to change. That is the "sign in when needed"
 shape in Claude's connector dialog; see [Identity](#identity-authpy).
+
+`review_submission` is therefore listed to *everyone*, anonymous callers
+included. FastMCP's `auth=require_roles(...)` would hide it from `tools/list`
+for anyone failing the check, and hiding it defeats the whole shape: a client
+that cannot see a tool never calls it, so it never meets the challenge and
+reads the server as "no sign-in needed" — which is exactly what Claude's
+connector picked while the tool was hidden. Visible-then-challenged is the
+only arrangement in which deferred sign-in can fire, so the role check lives
+in the tool body instead.
 
 ## Two replies per call
 
@@ -96,9 +103,10 @@ A write tool's route additionally needs to verify the bearer token itself
 (`verifyBearerToken` in `web/lib/oauth.ts`) rather than trust the session
 cookie the human-facing `/admin` routes use — see
 `web/routes/api/v1/links/[id]/status.ts` for the pattern — and the tool
-needs its own `auth=require_roles(...)` matching whatever the real
+needs its own role check in its body, matching whatever the real
 authorization rule for that action already is on the website, not a
-convenient guess.
+convenient guess. Add its name to `PROTECTED_TOOLS` in `challenge.py` so an
+anonymous call meets the sign-in challenge instead of an error.
 
 ## Checks
 
@@ -127,8 +135,8 @@ mode on it. `challenge.py` supplies the missing middle instead:
 
 - When a request carries a bearer token it is verified and published as
   `scope["user"]`/`scope["auth"]`, exactly as the SDK's own bearer backend
-  does. `get_access_token()` reads identity from there, so per-tool
-  `auth=require_roles(...)` and `tools/list` filtering keep working untouched.
+  does. `get_access_token()` reads identity from there, so a tool body can
+  ask who is calling without any transport-wide gate.
 - When a request carries none *and* names a tool in `PROTECTED_TOOLS`, it is
   answered with `401` + `WWW-Authenticate: Bearer resource_metadata="…"`
   (RFC 6750 §3.1: no `error` attribute when no credentials were offered, an
@@ -155,21 +163,26 @@ value in that document, with no fixed placement rule, so those stay under
 
 Authenticating (who you are) and authorizing (what you may do) stay
 separate: `challenge.py` only establishes identity, so an admin-only tool
-still declares its own `auth=`:
+enforces its own rule:
 
 ```python
-from fastmcp.server.auth import require_roles
-
-@mcp.tool(auth=require_roles("admin", extract=lambda claims: claims["role"]))
-async def review_submission(...): ...
+def _admin_token() -> str:
+    token = get_access_token()
+    if token is None:
+        raise ToolError("Sign in with an admin account to review submissions.")
+    if (token.claims or {}).get("role") != "admin":
+        raise ToolError("This tool requires an admin account.")
+    return token.token
 ```
 
-`extract=lambda claims: claims["role"]` reads the flat, site-wide `role`
-already on every user (`user`/`editor`/`admin` — see `kv-users.ts`). There is
-no per-category editor stewardship yet (`EditorRolePanel.tsx` says so
-explicitly), so `review_submission` requires `"admin"`, not `"editor"` —
-granting editors a write capability the website itself doesn't would be a
-real authorization bug, not a shortcut.
+`claims["role"]` is the flat, site-wide `role` already on every user
+(`user`/`editor`/`admin` — see `kv-users.ts`). There is no per-category
+editor stewardship yet (`EditorRolePanel.tsx` says so explicitly), so
+`review_submission` requires `"admin"`, not `"editor"` — granting editors a
+write capability the website itself doesn't would be a real authorization
+bug, not a shortcut. The `token is None` branch is unreachable through the
+challenge and stays anyway, so the tool's authorization never depends on its
+name being listed in `PROTECTED_TOOLS`.
 
 ### Client identity: CIMD and dynamic registration
 
@@ -243,9 +256,11 @@ redirect past naive matching.
    print(asyncio.run(auth.verifier.verify_token('<access_token>')))
    "
    ```
-6. Confirm the reads are open — `fastmcp list http://127.0.0.1:8765/mcp`
-   with no `--auth` lists 3 tools and `browse_category` returns data. A
-   `role=user` token still lists 3; a `role=admin` token lists 4.
+6. Confirm the reads are open and the write is *visible* —
+   `fastmcp list http://127.0.0.1:8765/mcp` with no `--auth` lists all 4
+   tools and `browse_category` returns data. The count is 4 for every
+   caller — anonymous, `role=user` and `role=admin` alike — and a
+   `role=user` token must still be refused by `review_submission` itself.
 7. Confirm the write asks for a sign-in rather than failing. Posting a
    `tools/call` for `review_submission` with no token must answer `401`
    with a `WWW-Authenticate: Bearer resource_metadata="…"` header, and that
