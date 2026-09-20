@@ -17,11 +17,7 @@ UNKNOWN_PATH_HINT = (
 )
 
 
-async def fetch(endpoint: str, **params: str | int) -> JSON:
-    response = await api.get(
-        endpoint,
-        params={k: v for k, v in params.items() if v is not None and v != ""},
-    )
+def _parse_response(response: httpx2.Response) -> JSON:
     if response.is_error:
         try:
             detail = response.json().get("error")
@@ -29,6 +25,23 @@ async def fetch(endpoint: str, **params: str | int) -> JSON:
             detail = None
         raise ToolError(detail or f"directory returned {response.status_code}")
     return cast(JSON, response.json())
+
+
+async def fetch(endpoint: str, **params: str | int) -> JSON:
+    response = await api.get(
+        endpoint,
+        params={k: v for k, v in params.items() if v is not None and v != ""},
+    )
+    return _parse_response(response)
+
+
+async def post_authorized(endpoint: str, *, token: str, json_body: JSON) -> JSON:
+    response = await api.post(
+        endpoint,
+        json=json_body,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    return _parse_response(response)
 
 
 async def category_at(path: str) -> tuple[JSON, list[JSON], list[JSON]]:

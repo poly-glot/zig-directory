@@ -94,7 +94,18 @@ export const openapi = {
     title: "dmozdb directory",
     version: "1.0.0",
     description:
-      "Read access to a hand-curated web directory of approved links organised as a category tree.",
+      "Read access to a hand-curated web directory of approved links organised as a category tree, plus one bearer-authenticated moderation write path.",
+  },
+  components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: "http",
+        scheme: "bearer",
+        bearerFormat: "JWT",
+        description:
+          "A JWT issued by this app's own OAuth 2.1 Authorization Server (see web/routes/oauth/). Requires role=admin.",
+      },
+    },
   },
   paths: {
     "/api/v1/browse": {
@@ -237,6 +248,46 @@ export const openapi = {
                 },
               },
             }),
+          },
+          ...errorResponses,
+        },
+      },
+    },
+    "/api/v1/links/{id}/status": {
+      post: {
+        operationId: "review_submission",
+        summary: "Approve or reject a link — requires an admin bearer token",
+        description:
+          "Flips a link's editorial status to approved or rejected. The only write path in this API; every other operation here is a public GET. Requires `Authorization: Bearer <jwt>` from this app's own OAuth server, with an admin role claim.",
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          {
+            name: "id",
+            in: "path",
+            required: true,
+            description: "Link id, from the `id` field of a link object.",
+            schema: { type: "integer" },
+          },
+        ],
+        requestBody: {
+          required: true,
+          ...jsonContent({
+            type: "object",
+            required: ["status"],
+            properties: {
+              status: { type: "string", enum: ["approved", "rejected"] },
+            },
+          }),
+        },
+        responses: {
+          "200": { description: "The updated link", ...jsonContent(link) },
+          "401": {
+            description: "Missing or invalid bearer token",
+            ...jsonContent(errorSchema),
+          },
+          "403": {
+            description: "Authenticated, but not an admin",
+            ...jsonContent(errorSchema),
           },
           ...errorResponses,
         },

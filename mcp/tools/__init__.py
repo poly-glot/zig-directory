@@ -1,3 +1,3 @@
-from . import browse, links, search
+from . import browse, links, review_submission, search
 
-__all__ = ["browse", "links", "search"]
+__all__ = ["browse", "links", "review_submission", "search"]

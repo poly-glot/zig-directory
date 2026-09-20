@@ -1,3 +1,5 @@
 from fastmcp import FastMCP
 
-mcp = FastMCP("dmozdb")
+from auth import remote_auth_provider
+
+mcp = FastMCP("dmozdb", auth=remote_auth_provider)

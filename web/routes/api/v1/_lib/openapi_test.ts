@@ -15,6 +15,8 @@ Deno.test("every documented path has a route file", async () => {
 });
 
 Deno.test("operation ids are unique so tool names cannot collide", () => {
-  const ids = Object.values(openapi.paths).map((p) => p.get.operationId);
+  const ids = Object.values(openapi.paths).map((p) =>
+    "get" in p ? p.get.operationId : p.post.operationId
+  );
   assertEquals(new Set(ids).size, ids.length);
 });

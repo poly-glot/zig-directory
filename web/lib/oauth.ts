@@ -1,4 +1,4 @@
-import { importPKCS8, SignJWT } from "jose";
+import { importJWK, importPKCS8, jwtVerify, SignJWT } from "jose";
 import { getKv } from "./kv-users.ts";
 
 export interface OAuthClient {
@@ -199,4 +199,34 @@ export async function signAccessToken(
     .setExpirationTime(`${ACCESS_TOKEN_TTL_SECONDS}s`)
     .sign(privateKey);
   return { accessToken, expiresIn: ACCESS_TOKEN_TTL_SECONDS };
+}
+
+let verificationKey: Awaited<ReturnType<typeof importJWK>> | null = null;
+
+async function getVerificationKey(): Promise<
+  Awaited<ReturnType<typeof importJWK>>
+> {
+  if (!verificationKey) {
+    const jwk = JSON.parse(Deno.env.get("MCP_JWT_PUBLIC_KEY_JWK") ?? "{}");
+    verificationKey = await importJWK(jwk, "RS256");
+  }
+  return verificationKey;
+}
+
+export async function verifyBearerToken(
+  token: string,
+): Promise<{ userId: string; role: string } | null> {
+  const issuer = Deno.env.get("OAUTH_ISSUER_URL") ?? "http://127.0.0.1:8000";
+  const audience = Deno.env.get("MCP_RESOURCE_URL") ??
+    "http://127.0.0.1:8765/mcp";
+  try {
+    const key = await getVerificationKey();
+    const { payload } = await jwtVerify(token, key, { issuer, audience });
+    if (typeof payload.sub !== "string" || typeof payload.role !== "string") {
+      return null;
+    }
+    return { userId: payload.sub, role: payload.role };
+  } catch {
+    return null;
+  }
 }

@@ -1,11 +1,14 @@
 import { assert, assertEquals, assertNotEquals } from "jsr:@std/assert@^1";
+import { exportJWK, exportPKCS8, generateKeyPair } from "jose";
 import {
   consumeAuthorizationCode,
   createAuthorizationCode,
   issueRefreshToken,
   redeemRefreshToken,
   registerClient,
+  signAccessToken,
   validateRedirectUris,
+  verifyBearerToken,
   verifyPkce,
 } from "../../../lib/oauth.ts";
 
@@ -95,3 +98,50 @@ Deno.test({
     assertEquals(reuseOldToken, null);
   },
 });
+
+Deno.test(
+  "verifyBearerToken accepts a validly signed token and rejects tampering",
+  async () => {
+    const { privateKey, publicKey } = await generateKeyPair("RS256", {
+      modulusLength: 2048,
+      extractable: true,
+    });
+    const publicJwk = await exportJWK(publicKey);
+    publicJwk.alg = "RS256";
+
+    Deno.env.set("OAUTH_ISSUER_URL", "https://issuer.example.com");
+    Deno.env.set("MCP_RESOURCE_URL", "https://resource.example.com/mcp");
+    Deno.env.set(
+      "MCP_JWT_PRIVATE_KEY_PEM",
+      (await exportPKCS8(privateKey)).trim().replaceAll("\n", "\\n"),
+    );
+    Deno.env.set("MCP_JWT_PUBLIC_KEY_JWK", JSON.stringify(publicJwk));
+
+    const { accessToken } = await signAccessToken({
+      userId: "user-1",
+      role: "admin",
+      clientId: "client-1",
+      resource: "https://resource.example.com/mcp",
+      scope: "mcp",
+    });
+
+    assertEquals(await verifyBearerToken(accessToken), {
+      userId: "user-1",
+      role: "admin",
+    });
+    assertEquals(
+      await verifyBearerToken(accessToken.slice(0, -2) + "xx"),
+      null,
+    );
+    assertEquals(await verifyBearerToken("not-a-jwt"), null);
+
+    const wrongAudience = await signAccessToken({
+      userId: "user-1",
+      role: "admin",
+      clientId: "client-1",
+      resource: "https://someone-elses-resource.example.com/mcp",
+      scope: "mcp",
+    });
+    assertEquals(await verifyBearerToken(wrongAudience.accessToken), null);
+  },
+);
