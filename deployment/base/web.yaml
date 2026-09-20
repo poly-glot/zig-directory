@@ -50,7 +50,7 @@ spec:
             - name: OAUTH_ISSUER_URL
               value: "https://directory.junaid.guru/auth"
             - name: MCP_RESOURCE_URL
-              value: "https://mcp.directory.junaid.guru/mcp"
+              value: "https://directory.junaid.guru/mcp"
             - name: MCP_JWT_PRIVATE_KEY_PEM
               valueFrom:
                 secretKeyRef:

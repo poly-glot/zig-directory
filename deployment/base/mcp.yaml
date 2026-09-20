@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp
+spec:
+  # One replica. The transport is session-oriented (Mcp-Session-Id), and there
+  # is no shared session store, so a second replica would strand every session
+  # that did not land back on its own pod. Give it an HPA only alongside a
+  # shared session backend.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp
+  template:
+    metadata:
+      labels:
+        app: mcp
+    spec:
+      # A Service named "mcp" would inject MCP_PORT=tcp://<ip>:8765. Nothing
+      # here reads that name today, but the server does read PORT, so keep the
+      # legacy links off rather than depend on which spelling wins.
+      enableServiceLinks: false
+      containers:
+        - name: mcp
+          image: dmozdb-mcp:latest
+          ports:
+            - containerPort: 8765
+              name: http
+          env:
+            # Tools call the web tier's /api/v1 in-cluster; nothing here
+            # reaches the Zig backend or Deno KV directly.
+            - name: DMOZ_API_URL
+              value: "http://web.dmozdb.svc.cluster.local:8000"
+            # Must match the web tier's own OAUTH_ISSUER_URL and
+            # MCP_RESOURCE_URL exactly: the first is compared against the iss
+            # claim, the second against aud. A mismatch fails every token with
+            # no clue why.
+            - name: OAUTH_ISSUER_URL
+              value: "https://directory.junaid.guru/auth"
+            - name: MCP_RESOURCE_URL
+              value: "https://directory.junaid.guru/mcp"
+            # Signing keys over the internal Service, so verification does not
+            # depend on the load balancer routing a pod back to itself. The
+            # issuer claim is still checked against the public URL above.
+            - name: MCP_JWKS_URI
+              value: "http://web.dmozdb.svc.cluster.local:8000/auth/.well-known/jwks.json"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8765"
+          # The protected-resource document is the only route that answers
+          # unauthenticated with a plain GET, so it is what a probe can use.
+          # /mcp itself needs a POST and a session.
+          startupProbe:
+            httpGet:
+              path: /.well-known/oauth-protected-resource/mcp
+              port: 8765
+            periodSeconds: 3
+            failureThreshold: 20
+          readinessProbe:
+            httpGet:
+              path: /.well-known/oauth-protected-resource/mcp
+              port: 8765
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 8765
+            periodSeconds: 15
+            failureThreshold: 3
+          # Modest: an idle ASGI app that forwards HTTP. The cluster is close
+          # to committed once the web HPA is at 4, so this must stay small.
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "384Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp
+  labels:
+    app: mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: mcp
+  ports:
+    - port: 8765
+      targetPort: 8765
+      protocol: TCP
+      name: http

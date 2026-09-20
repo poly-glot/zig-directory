@@ -6,6 +6,7 @@ resources:
   - statefulset.yaml
   - denokv.yaml
   - web.yaml
+  - mcp.yaml
   - service.yaml
   - ingress.yaml
   - networkpolicy.yaml

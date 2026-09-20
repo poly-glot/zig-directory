@@ -1,0 +1,61 @@
+# ============================================================
+# dmozdb MCP server — FastMCP over streamable HTTP
+# ============================================================
+# Runs as its own OKE Deployment, reached at directory.junaid.guru/mcp via two
+# ingress path rules. It holds no data: every tool calls the web tier's
+# /api/v1 over the in-cluster Service, so this image never speaks the binary
+# protocol or opens Deno KV.
+#
+# It is an OAuth 2.1 resource server. It verifies the JWTs the web tier issues
+# against that tier's JWKS and never sees the signing key, which is why no
+# secret is mounted here — only URLs, injected by deployment/base/mcp.yaml.
+#
+# Built and deployed by .github/workflows/cd.yaml on push to main.
+# Build locally: docker build -f Dockerfile.mcp --platform linux/arm64 -t dmozdb-mcp .
+# ============================================================
+
+# ── Stage 1: resolve dependencies into a venv ──────────────
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS mcp-builder
+
+WORKDIR /app
+
+# Bytecode up front so the runtime stage never pays first-import compilation;
+# copy mode because the cache mount and /app are different filesystems.
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+
+# Manifests first so the dependency layer caches across source edits.
+# --locked fails rather than silently resolving something newer than uv.lock,
+# so the image gets the versions the gates ran against.
+COPY mcp/pyproject.toml mcp/uv.lock ./
+RUN uv sync --locked --no-dev
+
+COPY mcp/dmozdb_mcp ./dmozdb_mcp
+
+# ── Stage 2: runtime ───────────────────────────────────────
+# Same Python minor as the builder: the venv holds compiled extensions and
+# bytecode built against that interpreter.
+FROM python:3.13-slim-bookworm
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    ca-certificates tini && \
+    rm -rf /var/lib/apt/lists/*
+
+# Unprivileged: the process only listens and makes outbound HTTP.
+RUN useradd --create-home --uid 10001 mcp
+USER mcp
+
+WORKDIR /app
+COPY --from=mcp-builder --chown=mcp:mcp /app /app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOST=0.0.0.0 \
+    PORT=8765
+
+EXPOSE 8765
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "dmozdb_mcp.server"]

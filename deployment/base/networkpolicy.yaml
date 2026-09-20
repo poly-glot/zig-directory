@@ -23,6 +23,30 @@ spec:
         - protocol: TCP
           port: 8080
 ---
+# The web tier serves /api/v1 and the JWKS document to the MCP tier, so mcp
+# must be allowed alongside whatever reaches web from the ingress. This policy
+# only names the MCP pods; it does not restrict the ingress controller, which
+# has no pod label to select on a Traefik install of this shape.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-allow-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: mcp
+        - ipBlock:
+            cidr: 10.0.1.0/24
+      ports:
+        - protocol: TCP
+          port: 8000
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
