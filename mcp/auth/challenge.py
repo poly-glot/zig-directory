@@ -7,7 +7,7 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from starlette.authentication import AuthCredentials
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from auth import RESOURCE_METADATA_URL, SCOPES, verifier
+from .config import RESOURCE_METADATA_URL, SCOPE, verifier
 
 PROTECTED_TOOLS = frozenset({"review_submission"})
 
@@ -23,29 +23,22 @@ def _bearer_token(scope: Scope) -> str | None:
     return None
 
 
-def _protected_tool_called(message: Any) -> str | None:
+def _calls_protected_tool(message: Any) -> bool:
     if not isinstance(message, dict) or message.get("method") != "tools/call":
-        return None
+        return False
     params = message.get("params")
-    if not isinstance(params, dict):
-        return None
-    name = params.get("name")
-    return name if name in PROTECTED_TOOLS else None
+    return isinstance(params, dict) and params.get("name") in PROTECTED_TOOLS
 
 
-def _body_protected_tool(body: bytes) -> str | None:
+def _body_calls_protected_tool(body: bytes) -> bool:
     if not body:
-        return None
+        return False
     try:
         payload = json.loads(body)
     except ValueError:
-        return None
+        return False
     messages = payload if isinstance(payload, list) else [payload]
-    for message in messages:
-        name = _protected_tool_called(message)
-        if name is not None:
-            return name
-    return None
+    return any(_calls_protected_tool(message) for message in messages)
 
 
 async def _drain(receive: Receive) -> tuple[bytes, Receive]:
@@ -74,7 +67,7 @@ async def _drain(receive: Receive) -> tuple[bytes, Receive]:
 async def _send_challenge(send: Send, *, token_was_supplied: bool) -> None:
     parts = [
         f'resource_metadata="{RESOURCE_METADATA_URL}"',
-        f'scope="{" ".join(SCOPES)}"',
+        f'scope="{SCOPE}"',
     ]
     if token_was_supplied:
         parts.insert(0, 'error="invalid_token"')
@@ -123,9 +116,8 @@ class OpportunisticAuth:
 
         if access_token is None and scope["method"] == "POST":
             body, receive = await _drain(receive)
-            tool = _body_protected_tool(body)
-            if tool is not None:
-                logger.info("challenging unauthenticated call to %s", tool)
+            if _body_calls_protected_tool(body):
+                logger.info("challenging unauthenticated call to a protected tool")
                 await _send_challenge(send, token_was_supplied=token_was_supplied)
                 return
 

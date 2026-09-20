@@ -20,16 +20,11 @@ The three reads need no account, exactly like the website they mirror, and
 calling `review_submission` without one answers with an RFC 6750 challenge
 rather than an error — so a client signs its user in at the moment the
 directory is actually asked to change. That is the "sign in when needed"
-shape in Claude's connector dialog; see [Identity](#identity-authpy).
+shape in Claude's connector dialog; see [Identity](#identity-auth).
 
-`review_submission` is therefore listed to *everyone*, anonymous callers
-included. FastMCP's `auth=require_roles(...)` would hide it from `tools/list`
-for anyone failing the check, and hiding it defeats the whole shape: a client
-that cannot see a tool never calls it, so it never meets the challenge and
-reads the server as "no sign-in needed" — which is exactly what Claude's
-connector picked while the tool was hidden. Visible-then-challenged is the
-only arrangement in which deferred sign-in can fire, so the role check lives
-in the tool body instead.
+`review_submission` is therefore listed to *everyone*: `auth=require_roles(...)`
+would hide it from `tools/list`, and a tool a client cannot see is never
+called, so the challenge never fires. The role check lives in the tool body.
 
 ## Two replies per call
 
@@ -44,7 +39,7 @@ extension get the text alone and never pay for the component tree.
 
 Needs the stack up first (`dmozdb` on :8080, Fresh on :8000 — see
 `.devcontainer/run.sh`) and the JWT keypair from `web/.env` set (see
-[Identity](#identity-authpy) below), then:
+[Identity](#identity-auth) below), then:
 
 ```bash
 cd mcp
@@ -77,15 +72,16 @@ Each tool is its own module under `tools/`; nothing there imports `server.py`.
 | File | Holds |
 |---|---|
 | `app.py` | the shared `FastMCP` instance, deliberately without a server-wide `auth=` |
-| `auth.py` | the `JWTVerifier` for Fresh's tokens, and this resource's own metadata URL |
-| `challenge.py` | ASGI layer: verifies a token when offered, challenges for protected tools |
-| `metadata.py` | the RFC 9728 protected-resource document the challenge points at |
+| `auth/config.py` | the `JWTVerifier` for Fresh's tokens, the scope, and this resource's own metadata URL |
+| `auth/challenge.py` | ASGI layer: verifies a token when offered, challenges for protected tools |
+| `auth/metadata.py` | the RFC 9728 protected-resource document the challenge points at |
+| `auth/__init__.py` | imports the three above, registering the metadata route on import |
 | `client.py` | the httpx2 client, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
 | `formatting.py` | text-summary helpers and the paging constants |
 | `views.py` | Prefab cards and `build_view`/`result` |
 | `tools/browse.py`, `tools/links.py`, `tools/search.py`, `tools/review_submission.py` | one `@mcp.tool` each |
 | `tools/__init__.py` | imports the four above, registering them on import |
-| `server.py` | imports `tools`/`metadata` and serves the app behind `challenge.py` |
+| `server.py` | imports `auth`/`tools` and serves the app behind `auth.OpportunisticAuth` |
 
 A card's "Open"/"Browse"/"Next page" buttons call other tools by name
 (`CallTool("browse_category", ...)`), not by importing the function — that's
@@ -105,7 +101,7 @@ cookie the human-facing `/admin` routes use — see
 `web/routes/api/v1/links/[id]/status.ts` for the pattern — and the tool
 needs its own role check in its body, matching whatever the real
 authorization rule for that action already is on the website, not a
-convenient guess. Add its name to `PROTECTED_TOOLS` in `challenge.py` so an
+convenient guess. Add its name to `PROTECTED_TOOLS` in `auth/challenge.py` so an
 anonymous call meets the sign-in challenge instead of an error.
 
 ## Checks
@@ -118,11 +114,11 @@ uv run mypy .
 
 The Stop hook runs this automatically when a `mcp/*.py` file changed.
 
-## Identity (`auth.py`)
+## Identity (`auth/`)
 
 The app's own accounts (`web/lib/kv-users.ts`) are the identity provider:
 Fresh is an OAuth 2.1 Authorization Server (`web/routes/auth/oauth/*`,
-`web/routes/auth/.well-known/*`) over its existing users, and `auth.py`
+`web/routes/auth/.well-known/*`) over its existing users, and `auth/config.py`
 builds the `JWTVerifier` that verifies the JWTs Fresh issues. Users are never
 expected to mint a token by hand: a client detects the `401` +
 `WWW-Authenticate` challenge and drives the login itself.
@@ -131,7 +127,7 @@ expected to mint a token by hand: a client detects the `401` +
 installs `RequireAuthMiddleware`, which answers *every* request lacking a
 bearer token with a 401 — including `initialize` — so no client could read a
 public directory without an account first. There is no anonymous or optional
-mode on it. `challenge.py` supplies the missing middle instead:
+mode on it. `auth/challenge.py` supplies the missing middle instead:
 
 - When a request carries a bearer token it is verified and published as
   `scope["user"]`/`scope["auth"]`, exactly as the SDK's own bearer backend
@@ -162,7 +158,7 @@ value in that document, with no fixed placement rule, so those stay under
 `/auth` where they're easy to find.
 
 Authenticating (who you are) and authorizing (what you may do) stay
-separate: `challenge.py` only establishes identity, so an admin-only tool
+separate: `auth/challenge.py` only establishes identity, so an admin-only tool
 enforces its own rule:
 
 ```python
@@ -180,9 +176,7 @@ def _admin_token() -> str:
 editor stewardship yet (`EditorRolePanel.tsx` says so explicitly), so
 `review_submission` requires `"admin"`, not `"editor"` — granting editors a
 write capability the website itself doesn't would be a real authorization
-bug, not a shortcut. The `token is None` branch is unreachable through the
-challenge and stays anyway, so the tool's authorization never depends on its
-name being listed in `PROTECTED_TOOLS`.
+bug, not a shortcut.
 
 ### Client identity: CIMD and dynamic registration
 
@@ -252,8 +246,9 @@ redirect past naive matching.
    cd mcp && OAUTH_ISSUER_URL=http://127.0.0.1:8000/auth \
      MCP_RESOURCE_URL=http://127.0.0.1:8765/mcp \
      uv run python -c "
-   import asyncio, auth
-   print(asyncio.run(auth.verifier.verify_token('<access_token>')))
+   import asyncio
+   from auth.config import verifier
+   print(asyncio.run(verifier.verify_token('<access_token>')))
    "
    ```
 6. Confirm the reads are open and the write is *visible* —
