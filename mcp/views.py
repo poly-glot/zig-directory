@@ -4,27 +4,39 @@ from fastmcp import Context
 from fastmcp.apps import UI_EXTENSION_ID
 from fastmcp.tools import ToolResult
 from prefab_ui import PrefabApp
-from prefab_ui.actions import CallTool
+from prefab_ui.actions import CallTool, SetState
 from prefab_ui.components import (
     H3,
     Badge,
     Button,
     Card,
     CardTitle,
+    Div,
     Grid,
     Link,
     Muted,
     Row,
+    Slot,
     Small,
 )
+from prefab_ui.rx import RESULT
 
 from client import JSON
 from formatting import counted, domain_of
 
 CARD_MIN_WIDTH = "20rem"
 CARD_GAP = 3
+VIEW_SLOT = "view"
 
 Section = tuple[str, list[JSON], Callable[[JSON], None]]
+
+
+def navigate(tool_name: str, arguments: JSON) -> CallTool:
+    return CallTool(
+        tool_name,
+        arguments=arguments,
+        on_success=SetState(VIEW_SLOT, RESULT.view.children[0].children[0]),
+    )
 
 
 def link_card(link: JSON) -> None:
@@ -45,9 +57,7 @@ def link_card(link: JSON) -> None:
                     "Browse",
                     variant="ghost",
                     size="xs",
-                    onClick=CallTool(
-                        "browse_category", arguments={"path": link["categoryPath"]}
-                    ),
+                    onClick=navigate("browse_category", {"path": link["categoryPath"]}),
                 )
 
 
@@ -63,15 +73,13 @@ def category_card(category: JSON) -> None:
             Button(
                 "Open",
                 size="xs",
-                onClick=CallTool(
-                    "browse_category", arguments={"path": category["path"]}
-                ),
+                onClick=navigate("browse_category", {"path": category["path"]}),
             )
             Button(
                 "Links",
                 variant="outline",
                 size="xs",
-                onClick=CallTool("list_links", arguments={"path": category["path"]}),
+                onClick=navigate("list_links", {"path": category["path"]}),
             )
 
 
@@ -81,7 +89,11 @@ def build_view(
     sections: list[Section],
     next_page: tuple[str, JSON] | None = None,
 ) -> PrefabApp:
-    with PrefabApp(title=heading, css_class="p-4 flex flex-col gap-4") as app:
+    with (
+        PrefabApp(title=heading, css_class="p-4 flex flex-col gap-4") as app,
+        Slot(VIEW_SLOT),
+        Div(css_class="flex flex-col gap-4"),
+    ):
         H3(heading)
         if subheading:
             Muted(subheading, css_class="text-sm")
@@ -102,7 +114,7 @@ def build_view(
                 variant="outline",
                 size="sm",
                 css_class="self-start",
-                onClick=CallTool(tool_name, arguments=arguments),
+                onClick=navigate(tool_name, arguments),
             )
     return app
 
