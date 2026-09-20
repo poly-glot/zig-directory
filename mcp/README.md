@@ -71,17 +71,19 @@ Each tool is its own module under `tools/`; nothing there imports `server.py`.
 
 | File | Holds |
 |---|---|
-| `app.py` | the shared `FastMCP` instance, deliberately without a server-wide `auth=` |
+| `app.py` | the shared `FastMCP` instance `mcp_app`, deliberately without a server-wide `auth=` |
 | `auth/config.py` | the `JWTVerifier` for Fresh's tokens, the scope, and this resource's own metadata URL |
 | `auth/challenge.py` | ASGI layer: verifies a token when offered, challenges for protected tools |
 | `auth/metadata.py` | the RFC 9728 protected-resource document the challenge points at |
+| `auth/roles.py` | `protect()`, which registers a tool for the challenge *and* returns its role check |
 | `auth/__init__.py` | imports the three above, registering the metadata route on import |
-| `client.py` | the httpx2 client, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
+| `client.py` | the httpx2 client `_api`, `fetch` (GET), `post_authorized` (POST + bearer), `category_at`, the `JSON` type alias |
 | `formatting.py` | text-summary helpers and the paging constants |
 | `views.py` | Prefab cards and `build_view`/`result` |
-| `tools/browse.py`, `tools/links.py`, `tools/search.py`, `tools/review_submission.py` | one `@mcp.tool` each |
+| `tools/browse.py`, `tools/links.py`, `tools/search.py`, `tools/review_submission.py` | one `@mcp_app.tool` each |
 | `tools/__init__.py` | imports the four above, registering them on import |
 | `server.py` | imports `auth`/`tools` and serves the app behind `auth.OpportunisticAuth` |
+| `test_invariants.py` | the pytest cases that keep auth registration and tool schemas honest |
 
 A card's "Open"/"Browse"/"Next page" buttons call other tools by name
 (`CallTool("browse_category", ...)`), not by importing the function — that's
@@ -90,7 +92,7 @@ what lets `views.py` stay free of `tools/`.
 ## Adding a tool
 
 Add the data it needs to `web/routes/api/v1/`, then add a module under
-`tools/` with one `@mcp.tool` function and import it from
+`tools/` with one `@mcp_app.tool` function and import it from
 `tools/__init__.py`. Keep the text summary short, and reuse `link_card` or
 `category_card` for the view. Pin `prefab-ui` to an exact version when this
 goes to production; it is pre-1.0.
@@ -101,8 +103,9 @@ cookie the human-facing `/admin` routes use — see
 `web/routes/api/v1/links/[id]/status.ts` for the pattern — and the tool
 needs its own role check in its body, matching whatever the real
 authorization rule for that action already is on the website, not a
-convenient guess. Add its name to `PROTECTED_TOOLS` in `auth/challenge.py` so an
-anonymous call meets the sign-in challenge instead of an error.
+convenient guess. Declare it with `protect("name", role=...)` from
+`auth/roles.py`, which registers it for the sign-in challenge and returns the
+role check in one call, so the two cannot drift apart.
 
 ## Checks
 
@@ -110,16 +113,16 @@ anonymous call meets the sign-in challenge instead of an error.
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy .
-uv run python selfcheck.py
+uv run pytest
 ```
 
 The Stop hook runs all four when any `mcp/**/*.py` changed.
 
-`selfcheck.py` asserts what the type-checker cannot: that every write tool is
-registered for the 401 challenge and every protected name still matches a
-tool, that the body probe and bearer parsing behave, and that no parameter
-ships without a description or an unbounded integer. It needs no running
-server and no test framework.
+`test_invariants.py` asserts what the type-checker cannot: that every write
+tool is registered for the 401 challenge and every protected name still
+matches a tool, that the body probe and bearer parsing behave, and that no
+parameter ships without a description or as an unbounded integer. It needs no
+running server.
 
 ## Identity (`auth/`)
 

@@ -1,3 +1,5 @@
+"""The entry point into the category tree."""
+
 from typing import Annotated
 
 from fastmcp import Context
@@ -6,13 +8,13 @@ from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp
+from app import mcp_app
 from client import category_at
 from formatting import category_summary, counted
-from views import build_view, category_card, result
+from views import Section, build_view, category_card, result
 
 
-@mcp.tool(
+@mcp_app.tool(
     app=PrefabAppConfig(),
     description=(
         "Browse one category of a hand-curated web directory: its breadcrumb, "
@@ -40,15 +42,30 @@ async def browse_category(
         ),
     ] = "",
 ) -> ToolResult:
-    category, ancestors, children = await category_at(path)
+    """Describe one category and the categories directly beneath it.
+
+    Args:
+        ctx: Tool context, used to decide whether to build a view.
+        path: Slug path to browse; empty means the top level.
+
+    Returns:
+        A summary of the category, its breadcrumb and its children, with
+        category cards for a client that can render them.
+
+    Raises:
+        ToolError: If no category sits at ``path``.
+    """
+    browsed = await category_at(path)
     breadcrumb = " / ".join(
-        [ancestor["name"] for ancestor in ancestors] + [category["name"]]
+        [ancestor["name"] for ancestor in browsed.ancestors]
+        + [browsed.category["name"]]
     )
 
-    lines = [category_summary(category), breadcrumb]
-    if children:
-        lines.append(f"{counted(len(children), 'subcategory', 'subcategories')}:")
-        lines += [category_summary(child) for child in children]
+    lines = [category_summary(browsed.category), breadcrumb]
+    if browsed.children:
+        count = counted(len(browsed.children), "subcategory", "subcategories")
+        lines.append(f"{count}:")
+        lines += [category_summary(child) for child in browsed.children]
     else:
         lines.append("No subcategories. Use list_links for its links.")
 
@@ -56,6 +73,8 @@ async def browse_category(
         ctx,
         lines,
         lambda: build_view(
-            category["name"], breadcrumb, [("", children, category_card)]
+            browsed.category["name"],
+            breadcrumb,
+            [Section("", browsed.children, category_card)],
         ),
     )

@@ -1,5 +1,13 @@
+"""The ASGI layer that lets one server be public and protected at once.
+
+FastMCP's ``auth=`` gates the whole transport, 401-ing even ``initialize``,
+and has no anonymous or optional mode. This supplies the missing middle: a
+token is verified when offered, and only a call to a registered write tool is
+challenged.
+"""
+
 import json
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastmcp.server.auth import AccessToken
 from fastmcp.utilities.logging import get_logger
@@ -15,7 +23,23 @@ MAX_PROBE_BYTES = 1 << 20
 logger = get_logger(__name__)
 
 
+class Authentication(NamedTuple):
+    """What a request's ``Authorization`` header turned out to be worth."""
+
+    token: AccessToken | None
+    was_supplied: bool
+
+
 def _bearer_token(scope: Scope) -> str | None:
+    """Pull the bearer credential out of an ASGI scope's headers.
+
+    Args:
+        scope: The ASGI connection scope.
+
+    Returns:
+        The token, or None if no ``Authorization`` header is present, it uses
+        another scheme, or it carries no value.
+    """
     for name, value in scope.get("headers", []):
         if name.lower() != b"authorization":
             continue
@@ -25,6 +49,7 @@ def _bearer_token(scope: Scope) -> str | None:
 
 
 def _calls_protected_tool(message: Any) -> bool:
+    """Report whether one JSON-RPC message invokes a registered write tool."""
     if not isinstance(message, dict) or message.get("method") != "tools/call":
         return False
     params = message.get("params")
@@ -32,6 +57,16 @@ def _calls_protected_tool(message: Any) -> bool:
 
 
 def _body_calls_protected_tool(body: bytes) -> bool:
+    """Report whether a request body invokes a registered write tool.
+
+    Args:
+        body: The buffered request body, which may be a single JSON-RPC
+            message or a batch, and may not be JSON at all.
+
+    Returns:
+        True if any message in it names a tool in ``PROTECTED_TOOLS``. A body
+        that will not parse is not a tool call, so it is left to the app.
+    """
     if not body:
         return False
     try:
@@ -47,8 +82,16 @@ async def _drain(receive: Receive) -> tuple[bytes, Receive]:
 
     Stops at ``MAX_PROBE_BYTES`` so an unauthenticated caller cannot make the
     server hold an arbitrary body before any authorization decision. A body
-    that large is not a tool call worth probing; ``capped`` leaves the rest of
-    it for the app to read from the real ``receive``.
+    that large is not a tool call worth probing.
+
+    Args:
+        receive: The ASGI receive channel, which is consumed here.
+
+    Returns:
+        The buffered bytes, and a replacement receive channel that replays
+        them once before delegating to the real one. When the cap was hit the
+        replay reports ``more_body``, leaving the remainder for the app to
+        read rather than truncating the request.
     """
     chunks: list[bytes] = []
     size = 0
@@ -82,6 +125,14 @@ async def _drain(receive: Receive) -> tuple[bytes, Receive]:
 
 
 async def _send_challenge(send: Send, *, token_was_supplied: bool) -> None:
+    """Answer with the RFC 6750 challenge that starts a client's sign-in.
+
+    Args:
+        send: The ASGI send channel.
+        token_was_supplied: Whether the caller offered a credential. RFC 6750
+            section 3.1 omits ``error`` when none was offered, and reports
+            ``invalid_token`` when one was and it failed.
+    """
     parts = [
         f'resource_metadata="{RESOURCE_METADATA_URL}"',
         f'scope="{SCOPE}"',
@@ -102,14 +153,12 @@ async def _send_challenge(send: Send, *, token_was_supplied: bool) -> None:
 
 
 class OpportunisticAuth:
-    """Authenticate when a token is present, challenge only for protected tools.
+    """Authenticate when a token is present, challenge only for write tools.
 
-    FastMCP's own ``auth=`` gates the whole transport, which would force a
-    sign-in before anyone could read a public directory. This verifies a bearer
-    token when one is offered and publishes the identity the way the SDK's own
-    bearer backend does, so a tool body's ``get_access_token()`` sees it, then
-    answers an unauthenticated call to a protected tool with the RFC 6750
-    challenge that drives a client's sign-in flow.
+    A bearer token, when offered, is verified and published the way the SDK's
+    own bearer backend does, so a tool body's ``get_access_token()`` sees it.
+    An unauthenticated call to a registered write tool is answered with the
+    RFC 6750 challenge that drives a client's sign-in flow.
 
     Opportunistic means no credentials are demanded, not that bad ones are
     ignored: a token that fails to verify is answered with ``invalid_token``
@@ -121,23 +170,24 @@ class OpportunisticAuth:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def _authenticate(self, scope: Scope) -> tuple[AccessToken | None, bool]:
+    async def _authenticate(self, scope: Scope) -> Authentication:
+        """Verify the request's bearer token, if it offered one."""
         token = _bearer_token(scope)
         if token is None:
-            return None, False
-        return await verifier.verify_token(token), True
+            return Authentication(None, was_supplied=False)
+        return Authentication(await verifier.verify_token(token), was_supplied=True)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        access_token, token_was_supplied = await self._authenticate(scope)
+        authentication = await self._authenticate(scope)
 
-        if access_token is not None:
-            scope["user"] = AuthenticatedUser(access_token)
-            scope["auth"] = AuthCredentials(access_token.scopes)
-        elif token_was_supplied:
+        if authentication.token is not None:
+            scope["user"] = AuthenticatedUser(authentication.token)
+            scope["auth"] = AuthCredentials(authentication.token.scopes)
+        elif authentication.was_supplied:
             logger.info("rejecting a bearer token that did not verify")
             await _send_challenge(send, token_was_supplied=True)
             return

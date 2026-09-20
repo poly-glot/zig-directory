@@ -18,8 +18,9 @@ any argument, so it is the weakest place to put a rule about one.
   handler silently clamps, the schema carries `ge=`/`le=` with the same
   bounds. A caller that cannot see a limit cannot respect it, and silent
   clamping makes a truncated page look like the end of the data.
-- NEVER: **Let a clamp be invisible.** `clamped(limit)` capping 200 to 50
-  without the schema saying `le=50` produces a wrong answer with no signal.
+- NEVER: **Clamp where the schema is silent.** Capping 200 to 50 in the body
+  while the schema says only `integer` produces a wrong answer with no
+  signal; `le=50` makes pydantic refuse at the boundary and say why.
 - DO: **Name the next tool in the description.** These tools are a
   traversal (`search_directory` → `browse_category` → `list_links`); say
   which one follows and on what argument.
@@ -68,10 +69,11 @@ Two independent checks, both mandatory. Neither is a substitute for the other.
   401 challenge never fires and the server reads as needing no sign-in.
   Visible-then-challenged is the only arrangement where deferred sign-in
   works.
-- DO: **Add a new write tool's name to `PROTECTED_TOOLS` in
-  `auth/challenge.py`.** Forgetting it is not a hole — the body check still
-  refuses — but the caller gets a `ToolError` inside a 200 instead of a 401
-  that drives sign-in. Forgetting the *body* check is a real hole.
+- DO: **Declare a new write tool with `protect()` from `auth/roles.py`.**
+  One call registers the name for the 401 challenge and returns the getter
+  that enforces the role, so a tool cannot be challenged without being
+  checked or checked without being challenged. `test_invariants.py` fails if
+  a write tool is missing, or if a registered name matches no tool.
 
 ## Tokens
 
@@ -91,9 +93,13 @@ Two independent checks, both mandatory. Neither is a substitute for the other.
 
 ## Verify
 
-`cd mcp && uv run ruff format --check . && uv run ruff check . && uv run mypy .`
-The Stop hook runs this when any `mcp/**/*.py` changed. There is no CI gate
-for this package, so a security-relevant change carries its own test.
+`cd mcp && uv run ruff format --check . && uv run ruff check . && uv run mypy .
+&& uv run pytest`. The Stop hook runs all four when any `mcp/**/*.py`
+changed, and `.github/workflows/ci.yaml` runs them again on push and PR.
+
+- DO: **Put a security-relevant invariant in `test_invariants.py`.** It runs
+  without a server, so a check that a tool is registered, a header parses, or
+  a schema carries its bound costs nothing to keep.
 
 For anything touching `auth/`, confirm on a running server, not by reading:
 

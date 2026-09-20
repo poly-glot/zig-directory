@@ -1,3 +1,5 @@
+"""Finding an entry point when no category path is known yet."""
+
 from typing import Annotated, Literal
 
 from fastmcp import Context
@@ -6,8 +8,8 @@ from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp
-from client import fetch
+from app import mcp_app
+from client import JSON, fetch
 from formatting import (
     DEFAULT_LIMIT,
     MAX_LIMIT,
@@ -15,10 +17,36 @@ from formatting import (
     counted,
     link_summary,
 )
-from views import build_view, category_card, link_card, result
+from views import Section, build_view, category_card, link_card, result
 
 
-@mcp.tool(
+def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[str]:
+    """Turn a result set into its text summary, grouped by kind.
+
+    Args:
+        query: What was searched for, echoed back so a reply stands alone.
+        categories: Matching categories.
+        links: Matching links.
+
+    Returns:
+        The summary lines, ending in "No matches." when both are empty.
+    """
+    lines = [
+        f'"{query}": {counted(len(categories), "category", "categories")}, '
+        f"{counted(len(links), 'link', 'links')}"
+    ]
+    if categories:
+        lines.append("Categories:")
+        lines += [category_summary(category) for category in categories]
+    if links:
+        lines.append("Links:")
+        lines += [link_summary(link) for link in links]
+    if not categories and not links:
+        lines.append("No matches.")
+    return lines
+
+
+@mcp_app.tool(
     app=PrefabAppConfig(),
     description=(
         "Search the directory for categories and approved links, matching on "
@@ -64,29 +92,34 @@ async def search_directory(
         ),
     ] = DEFAULT_LIMIT,
 ) -> ToolResult:
+    """Search categories and links, each link carrying its category path.
+
+    Args:
+        ctx: Tool context, used to decide whether to build a view.
+        q: The query, at least two characters.
+        search_in: Which kinds of entry to return.
+        limit: How many of each kind to return.
+
+    Returns:
+        The matches grouped by kind, with cards for a client that can render
+        them.
+
+    Raises:
+        ToolError: If the directory service cannot be reached.
+    """
     found = await fetch("/api/v1/search", q=q, scope=search_in, limit=limit)
     categories = found["categories"]
     links = found["links"]
 
-    lines = [
-        f'"{q}": {counted(len(categories), "category", "categories")}, '
-        f"{counted(len(links), 'link', 'links')}"
-    ]
-    if categories:
-        lines.append("Categories:")
-        lines += [category_summary(category) for category in categories]
-    if links:
-        lines.append("Links:")
-        lines += [link_summary(link) for link in links]
-    if not categories and not links:
-        lines.append("No matches.")
-
     return result(
         ctx,
-        lines,
+        _summarize(q, categories, links),
         lambda: build_view(
             f'Search: "{q}"',
             f"{len(categories)} categories · {len(links)} links",
-            [("Categories", categories, category_card), ("Links", links, link_card)],
+            [
+                Section("Categories", categories, category_card),
+                Section("Links", links, link_card),
+            ],
         ),
     )

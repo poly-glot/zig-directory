@@ -18,7 +18,8 @@
       "Bash(bash -n .devcontainer/post-create.sh)",
       "WebFetch(domain:man7.org)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(devcontainer exec *)"
+      "Bash(devcontainer exec *)",
+      "WebSearch"
     ]
   }
 }

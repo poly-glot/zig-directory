@@ -1,16 +1,18 @@
+"""The one tool that changes the directory, and the only one requiring a role."""
+
 from typing import Annotated, Literal
 
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from app import mcp
+from app import mcp_app
 from auth.roles import protect
 from client import post_authorized
 
 _admin_token = protect("review_submission", role="admin")
 
 
-@mcp.tool(
+@mcp_app.tool(
     description=(
         "Approve or reject a pending link submission. The caller's role "
         "comes from their MCP sign-in, not from an argument — only an "
@@ -45,6 +47,19 @@ async def review_submission(
         ),
     ],
 ) -> str:
+    """Rule on a pending submission, as the signed-in admin.
+
+    Args:
+        link_id: The link to rule on.
+        decision: Whether to publish or hide it.
+
+    Returns:
+        A line naming the link and the status it now holds.
+
+    Raises:
+        ToolError: If the caller is not signed in, does not hold the admin
+            role, or the API refuses the change.
+    """
     status = "approved" if decision == "approve" else "rejected"
     token = _admin_token()
 

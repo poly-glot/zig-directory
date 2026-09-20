@@ -1,3 +1,11 @@
+"""Where this resource server sits in the OAuth topology.
+
+Every value is derived from two environment variables so a devcontainer
+behind a tunnel and the deployed service differ only in configuration. The
+metadata path follows RFC 9728 section 3.1, which inserts the well-known
+segment *before* the resource's own path rather than appending to it.
+"""
+
 import os
 from urllib.parse import urlsplit
 
@@ -8,6 +16,9 @@ RESOURCE_URL = os.environ.get("MCP_RESOURCE_URL", "http://127.0.0.1:8765/mcp")
 
 SCOPE = "mcp"
 
+# audience pins tokens to this resource, so one minted for another server
+# cannot be replayed here; required_scopes makes the scope we advertise in
+# scopes_supported and demand in the challenge an actual condition of entry.
 verifier = JWTVerifier(
     jwks_uri=f"{ISSUER_URL}/.well-known/jwks.json",
     issuer=ISSUER_URL,

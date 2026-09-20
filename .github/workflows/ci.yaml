@@ -86,7 +86,7 @@ jobs:
         run: deno task test
 
   mcp:
-    name: ruff + mypy + selfcheck
+    name: ruff + mypy + pytest
     runs-on: ubuntu-24.04-arm
     defaults:
       run:
@@ -117,5 +117,5 @@ jobs:
 
       # Asserts what the type-checker cannot: no protected-tool drift, no
       # undescribed parameter, no unbounded integer. Needs no running server.
-      - name: selfcheck
-        run: uv run python selfcheck.py
+      - name: pytest
+        run: uv run pytest -q
