@@ -4,21 +4,21 @@
       {
         "matcher": "Edit|Write",
         "hooks": [
-          { "type": "command", "command": "node .claude/hooks/auto-format.mjs" },
-          { "type": "command", "command": "node .claude/hooks/web-guard.mjs" }
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/auto-format.mjs\"" },
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/web-guard.mjs\"" }
         ]
       },
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "node .claude/hooks/post-build.mjs" }
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/post-build.mjs\"" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "node .claude/hooks/verify-gate.mjs" }
+          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/verify-gate.mjs\"" }
         ]
       }
     ]
