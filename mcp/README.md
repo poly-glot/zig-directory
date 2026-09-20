@@ -49,12 +49,42 @@ uv run fastmcp list http://127.0.0.1:8765/mcp
 uv run fastmcp call http://127.0.0.1:8765/mcp browse_category '{"path":"arts"}'
 ```
 
+## Layout
+
+Each tool is its own module under `tools/`; nothing there imports `server.py`.
+
+| File | Holds |
+|---|---|
+| `app.py` | the shared `FastMCP` instance the tool modules register against |
+| `client.py` | the httpx2 client, `fetch`, `category_at`, the `JSON` type alias |
+| `formatting.py` | text-summary helpers and the paging constants |
+| `views.py` | Prefab cards and `build_view`/`result` |
+| `tools/browse.py`, `tools/links.py`, `tools/search.py` | one `@mcp.tool` each |
+| `tools/__init__.py` | imports the three above, registering them on import |
+| `server.py` | imports `tools` and runs the HTTP transport |
+
+A card's "Open"/"Browse"/"Next page" buttons call other tools by name
+(`CallTool("browse_category", ...)`), not by importing the function — that's
+what lets `views.py` stay free of `tools/`.
+
 ## Adding a tool
 
 Add the data it needs to `web/routes/api/v1/`, document that route in
-`web/routes/api/v1/_lib/openapi.ts`, then write the tool here. Keep the text
-summary short, and reuse `link_card` or `category_card` for the view. Pin
-`prefab-ui` to an exact version when this goes to production; it is pre-1.0.
+`web/routes/api/v1/_lib/openapi.ts`, then add a module under `tools/` with
+one `@mcp.tool` function and import it from `tools/__init__.py`. Keep the
+text summary short, and reuse `link_card` or `category_card` for the view.
+Pin `prefab-ui` to an exact version when this goes to production; it is
+pre-1.0.
 
 The OpenAPI document is documentation for API consumers, not the tool
 contract. `cd web && deno task test` fails if a documented path has no route.
+
+## Checks
+
+```bash
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy .
+```
+
+The Stop hook runs this automatically when a `mcp/*.py` file changed.

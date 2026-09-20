@@ -4,6 +4,7 @@ import path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const WEB_ROOT = path.join(REPO_ROOT, "web");
+const MCP_ROOT = path.join(REPO_ROOT, "mcp");
 
 let raw = "";
 for await (const chunk of process.stdin) raw += chunk;
@@ -20,6 +21,7 @@ const files = (status.stdout || "")
 
 const webTouched = files.some((f) => f.startsWith("web/") && /\.(ts|tsx|js|json|css|md)$/.test(f));
 const zigTouched = files.some((f) => f.endsWith(".zig"));
+const mcpTouched = files.some((f) => f.startsWith("mcp/") && f.endsWith(".py"));
 
 function gate(label, cmd, args, cwd) {
   const res = spawnSync(cmd, args, { cwd, encoding: "utf8" });
@@ -32,5 +34,14 @@ function gate(label, cmd, args, cwd) {
 let ok = true;
 if (zigTouched) ok = gate("zig build test", "zig", ["build", "test"], REPO_ROOT) && ok;
 if (webTouched) ok = gate("deno task check", "deno", ["task", "check"], WEB_ROOT) && ok;
+if (mcpTouched) {
+  ok =
+    gate(
+      "mcp check (ruff + mypy)",
+      "sh",
+      ["-c", "uv run ruff format --check . && uv run ruff check . && uv run mypy ."],
+      MCP_ROOT,
+    ) && ok;
+}
 
 process.exit(ok ? 0 : 2);
