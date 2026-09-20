@@ -45,4 +45,5 @@ When debugging stalls past two or three cycles, stop narrating ruled-out hypothe
 - [`zig.md`](.claude/rules/zig.md): Zig backend (cleanup, allocators, errors, comptime, comment carve-out).
 - [`web.md`](.claude/rules/web.md): Fresh/Preact (islands, no inline styles, `.bleed-rule`, tokens).
 - [`protocol.md`](.claude/rules/protocol.md): binary protocol and generated client.
+- [`mcp.md`](.claude/rules/mcp.md): FastMCP tool schemas, annotations, and where authorization lives.
 - [`architecture.md`](.claude/rules/architecture.md): server owns hierarchy, smallest-change and migration discipline.

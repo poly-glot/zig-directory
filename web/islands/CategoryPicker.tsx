@@ -52,7 +52,7 @@ export default function CategoryPicker({
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  let debounce = 0;
+  let debounce: ReturnType<typeof setTimeout> | undefined;
   const onInput = (e: Event) => {
     const v = (e.target as HTMLInputElement).value;
     query.value = v;

@@ -38,7 +38,8 @@
   color: var(--muted);
   text-decoration: none;
 }
-.shell aside a:hover, .shell aside a:global(.active) {
+.shell aside a:hover,
+.shell aside a:global(.active) {
   color: var(--ink);
 }
 

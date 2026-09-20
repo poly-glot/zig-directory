@@ -15,6 +15,20 @@ spec:
       http:
         paths:
           - pathType: Prefix
+            path: /mcp
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8765
+          - pathType: Prefix
+            path: /.well-known/oauth-protected-resource
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8765
+          - pathType: Prefix
             path: /
             backend:
               service:

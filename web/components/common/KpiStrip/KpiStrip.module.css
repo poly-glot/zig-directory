@@ -60,7 +60,8 @@
   .cell:nth-child(2) {
     border-right: 0;
   }
-  .cell:nth-child(1), .cell:nth-child(2) {
+  .cell:nth-child(1),
+  .cell:nth-child(2) {
     border-bottom: 1px solid var(--rule);
   }
 }

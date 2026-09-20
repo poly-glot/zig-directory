@@ -35,3 +35,7 @@ data/snapshot.meta
 # Web Deno KV (admin users + sessions). Dev-only path; prod uses KV_PATH on a
 # mounted volume.
 web/data/
+
+# MCP server virtualenv
+mcp/.venv/
+__pycache__/

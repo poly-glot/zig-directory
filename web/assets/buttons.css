@@ -110,7 +110,9 @@
   color: var(--error);
 }
 
-.input, .select, .textarea {
+.input,
+.select,
+.textarea {
   font-family: inherit;
   font-size: 15px;
   padding: 14px 16px;
@@ -122,7 +124,9 @@
   outline: none;
   transition: border-color 0.15s ease;
 }
-.input:focus, .select:focus, .textarea:focus {
+.input:focus,
+.select:focus,
+.textarea:focus {
   border-color: var(--ink);
 }
 /* Selects replace the native OS control with a flat monochrome chevron to match
@@ -141,7 +145,8 @@
   padding-inline-end: 38px;
   cursor: pointer;
 }
-.input::placeholder, .textarea::placeholder {
+.input::placeholder,
+.textarea::placeholder {
   color: var(--muted-2);
 }
 .textarea {
@@ -292,7 +297,8 @@
   justify-content: center;
   flex-wrap: wrap;
 }
-.pager a, .pager span {
+.pager a,
+.pager span {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -318,13 +324,15 @@
   background: transparent;
   color: var(--muted);
 }
-.pager .prev, .pager .next {
+.pager .prev,
+.pager .next {
   width: auto;
   padding: 0 14px;
 }
 
 @media (max-width: 767px) {
-  .pager a, .pager span {
+  .pager a,
+  .pager span {
     width: 32px;
     height: 32px;
     font-size: 11px;

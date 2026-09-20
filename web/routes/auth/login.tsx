@@ -8,38 +8,50 @@ import styles from "./login.module.css";
 interface Data {
   error?: string;
   email?: string;
+  redirect: string;
+}
+
+function safeRedirect(raw: string | null): string {
+  return raw && /^\/(?!\/)/.test(raw) ? raw : "/";
 }
 
 export const handler = define.handlers<Data>({
   GET(ctx) {
     ctx.state.title = "Sign in";
-    return page({});
+    return page({
+      redirect: safeRedirect(ctx.url.searchParams.get("redirect")),
+    });
   },
 
   async POST(ctx) {
     const form = await ctx.req.formData();
     const email = form.get("email")?.toString() ?? "";
     const password = form.get("password")?.toString() ?? "";
+    const redirect = safeRedirect(form.get("redirect")?.toString() ?? null);
 
     if (!email || !password) {
-      return page({ error: "Email and password are required", email });
+      return page({
+        error: "Email and password are required",
+        email,
+        redirect,
+      });
     }
 
     const user = await authenticateUser(email, password);
     if (!user) {
-      return page({ error: "Invalid email or password", email });
+      return page({ error: "Invalid email or password", email, redirect });
     }
 
     const { cookie } = await createSession(user.id);
     return new Response(null, {
       status: 303,
-      headers: { Location: "/", "Set-Cookie": cookie },
+      headers: { Location: redirect, "Set-Cookie": cookie },
     });
   },
 });
 
 export default define.page<typeof handler>(function LoginPage(props) {
-  const { error, email } = props.data;
+  const { error, email, redirect } = props.data;
   return (
     <div class="container">
       <div class={styles.card}>
@@ -62,6 +74,7 @@ export default define.page<typeof handler>(function LoginPage(props) {
           <p class="lede mt-16">Public browsing doesn't require an account.</p>
           {error ? <div class="banner error mt-24">{error}</div> : null}
           <form method="POST" class={styles.form}>
+            <input type="hidden" name="redirect" value={redirect} />
             <div class="field">
               <label for="email">Email</label>
               <input

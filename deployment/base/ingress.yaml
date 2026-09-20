@@ -7,6 +7,31 @@ spec:
     - host: directory.local.junaid.guru
       http:
         paths:
+          # The MCP server owns exactly two prefixes on this host: the
+          # transport, and the RFC 9728 document its 401 points at. That is
+          # the same split isMcpPath() makes in
+          # .devcontainer/dev-tunnel-proxy.ts, so local development and the
+          # cluster route identically.
+          #
+          # No explicit priority is needed: Traefik sorts routers by rule
+          # length descending, so both of these outrank the site's "/".
+          # The AS metadata document is a different prefix
+          # (/.well-known/oauth-authorization-server/auth) and correctly
+          # falls through to web.
+          - pathType: Prefix
+            path: /mcp
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8765
+          - pathType: Prefix
+            path: /.well-known/oauth-protected-resource
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8765
           - pathType: Prefix
             path: /
             backend:

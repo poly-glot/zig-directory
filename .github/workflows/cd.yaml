@@ -50,10 +50,10 @@ jobs:
         with:
           auth_token: ${{ secrets.OCI_AUTH_TOKEN }}
 
-      # Two images sharing one OCIR repo, distinguished by tag suffix: the Zig
-      # backend and the Deno/Fresh frontend now run as separate OKE workloads.
-      # Both target linux/arm64 (the OKE Ampere A1 nodes); separate gha cache
-      # scopes keep the two builds from evicting each other.
+      # Three images sharing one OCIR repo, distinguished by tag suffix: the
+      # Zig backend, the Deno/Fresh frontend and the FastMCP server, each its
+      # own OKE workload. All target linux/arm64 (the OKE Ampere A1 nodes);
+      # separate gha cache scopes keep the builds from evicting each other.
       - name: Build and push backend
         uses: docker/build-push-action@v6
         with:
@@ -75,6 +75,17 @@ jobs:
           tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-web"
           cache-from: type=gha,scope=web
           cache-to: type=gha,mode=max,scope=web
+
+      - name: Build and push mcp
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.mcp
+          platforms: linux/arm64
+          push: true
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-mcp"
+          cache-from: type=gha,scope=mcp
+          cache-to: type=gha,mode=max,scope=mcp
 
   cd:
     needs: ci
@@ -119,7 +130,8 @@ jobs:
 
           kustomize edit set image \
             dmozdb-backend=$REPO_PATH:$SHA-backend \
-            dmozdb-web=$REPO_PATH:$SHA-web
+            dmozdb-web=$REPO_PATH:$SHA-web \
+            dmozdb-mcp=$REPO_PATH:$SHA-mcp
 
           # Record the resolved tag back to the branch — best-effort only. A
           # re-run of an already-deployed SHA produces no diff (empty commit

@@ -1,0 +1,121 @@
+name: "CI"
+
+# The three tier gates, the same ones the local Stop hook runs. cd.yaml builds
+# and deploys; this only ever reads. Triggers mirror cd.yaml so a change is
+# gated on the same events that would ship it.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A second push to the same ref makes the first run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zig:
+    name: zig build test
+    # Native arm64, as cd.yaml uses: the OKE nodes are Ampere A1 and the Zig
+    # build crawls under QEMU emulation.
+    runs-on: ubuntu-24.04-arm
+    env:
+      ZIG_VERSION: "0.15.2"
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Installed the same way Dockerfile.backend does it, rather than through
+      # a third-party action, so both paths drift together.
+      - name: Install Zig
+        run: |
+          ZIG_ARCH="$(uname -m)"
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C "$HOME"
+          echo "$HOME/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Cache the Zig package and build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig.zon', 'build.zig') }}
+          restore-keys: zig-${{ env.ZIG_VERSION }}-
+
+      - name: zig build test
+        run: zig build test
+
+  web:
+    name: deno check + test
+    runs-on: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: web
+    env:
+      # Without it, IPv6 resolution gives "Directory service unavailable".
+      DMOZDB_HOST: 127.0.0.1
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Pinned to the version the gate was verified against. Dockerfile.web
+      # pins its own (2.8.1) for the shipped binary; cd.yaml exercises that.
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.7"
+          cache: true
+
+      # deno.json sets "nodeModulesDir": "manual", so npm packages are not
+      # resolved on demand — without this, `deno check` fails to find preact.
+      - name: Install dependencies
+        run: deno install
+
+      - name: deno task check
+        run: deno task check
+
+      - name: deno task test
+        run: deno task test
+
+  mcp:
+    name: ruff + mypy + pytest
+    runs-on: ubuntu-24.04-arm
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: mcp/uv.lock
+
+      # --locked fails rather than silently resolving something newer, so the
+      # ruff and mypy that gate here are the ones pinned in uv.lock.
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: ruff format
+        run: uv run ruff format --check .
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: mypy
+        run: uv run mypy .
+
+      # Asserts what the type-checker cannot: no protected-tool drift, no
+      # undescribed parameter, no unbounded integer. Needs no running server.
+      - name: pytest
+        run: uv run pytest -q
