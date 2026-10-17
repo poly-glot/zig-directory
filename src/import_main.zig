@@ -14,14 +14,14 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
-fn dirIsEmpty(path: []const u8) !bool {
-    var d = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| switch (err) {
+fn dirIsEmpty(io: std.Io, path: []const u8) !bool {
+    const d = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return true,
         else => return err,
     };
-    defer d.close();
+    defer d.close(io);
     var it = d.iterate();
-    while (try it.next()) |_| return false;
+    while (try it.next(io)) |_| return false;
     return true;
 }
 
@@ -29,13 +29,13 @@ fn readField(parts: *std.mem.SplitIterator(u8, .scalar)) []const u8 {
     return parts.next() orelse "";
 }
 
-fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const stat = try file.stat();
+fn readFileAll(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
     const buf = try allocator.alloc(u8, stat.size);
     errdefer allocator.free(buf);
-    const n = try file.readAll(buf);
+    const n = try file.readPositionalAll(io, buf, 0);
     if (n != stat.size) return error.UnexpectedEof;
     return buf;
 }
@@ -50,7 +50,7 @@ fn importCategories(
     try path_to_id.put(try allocator.dupe(u8, "Top"), top_id);
     log.info("Created root category Top (id={d})", .{top_id});
 
-    const data = try readFileAll(allocator, tsv_path);
+    const data = try readFileAll(db.io, allocator, tsv_path);
     defer allocator.free(data);
 
     var n_created: u64 = 0;
@@ -100,7 +100,7 @@ fn importLinks(
     path_to_id: *std.StringHashMap(u64),
     tsv_path: []const u8,
 ) !u64 {
-    const data = try readFileAll(allocator, tsv_path);
+    const data = try readFileAll(db.io, allocator, tsv_path);
     defer allocator.free(data);
 
     var n_created: u64 = 0;
@@ -149,31 +149,31 @@ fn importLinks(
     return n_created;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
-    if (argv.len < 4) fail("usage: dmoz_import <data_dir> <cats.tsv> <links.tsv>", .{});
-    const data_dir = argv[1];
-    const cats_path = argv[2];
-    const links_path = argv[3];
+    var args = init.minimal.args.iterate();
+    _ = args.next();
+    const usage = "usage: dmoz_import <data_dir> <cats.tsv> <links.tsv>";
+    const data_dir = args.next() orelse fail(usage, .{});
+    const cats_path = args.next() orelse fail(usage, .{});
+    const links_path = args.next() orelse fail(usage, .{});
 
-    const abs_data_dir = std.fs.cwd().realpathAlloc(allocator, data_dir) catch |err| switch (err) {
+    const cwd = std.Io.Dir.cwd();
+    const abs_data_dir = cwd.realPathFileAlloc(io, data_dir, allocator) catch |err| switch (err) {
         error.FileNotFound => blk: {
-            std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+            cwd.createDir(io, data_dir, .default_dir) catch |e| switch (e) {
                 error.PathAlreadyExists => {},
                 else => return e,
             };
-            break :blk try std.fs.cwd().realpathAlloc(allocator, data_dir);
+            break :blk try cwd.realPathFileAlloc(io, data_dir, allocator);
         },
         else => return err,
     };
     defer allocator.free(abs_data_dir);
 
-    if (!try dirIsEmpty(abs_data_dir)) {
+    if (!try dirIsEmpty(io, abs_data_dir)) {
         fail("data dir {s} is not empty — refusing to import into an existing database", .{abs_data_dir});
     }
 
@@ -187,7 +187,7 @@ pub fn main() !void {
         },
     };
 
-    const db = try Directory.init(allocator, config);
+    const db = try Directory.init(io, allocator, config);
     defer db.deinit();
     try db.recover();
 
@@ -198,11 +198,11 @@ pub fn main() !void {
         path_to_id.deinit();
     }
 
-    const t0 = std.time.milliTimestamp();
+    const t0 = db.nowMillis();
     const n_cats = try importCategories(db, allocator, &path_to_id, cats_path);
-    const t1 = std.time.milliTimestamp();
+    const t1 = db.nowMillis();
     const n_links = try importLinks(db, allocator, &path_to_id, links_path);
-    const t2 = std.time.milliTimestamp();
+    const t2 = db.nowMillis();
 
     log.info("DONE: {d} categories in {d}ms, {d} links in {d}ms", .{ n_cats, t1 - t0, n_links, t2 - t1 });
 }

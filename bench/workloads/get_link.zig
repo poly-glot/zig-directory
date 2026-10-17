@@ -18,8 +18,9 @@ const Ctx = struct {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
-    var leftovers: std.ArrayList([]const u8) = .{};
+pub fn run(env: common.Env, args: *std.process.Args.Iterator) !void {
+    const allocator = env.allocator;
+    var leftovers: std.ArrayList([]const u8) = .empty;
     defer leftovers.deinit(allocator);
 
     const common_opts = try common.parseCommonOpts(args, &leftovers, allocator);
@@ -27,11 +28,11 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
 
     const seed_path = try common.seedPath(allocator, opts.data_dir);
     defer allocator.free(seed_path);
-    const seed = try common.loadSeed(allocator, seed_path);
+    const seed = try common.loadSeed(env.io, allocator, seed_path);
     defer seed.deinit();
 
     var ctx = Ctx{ .link_ids = seed.value.linkIds() };
-    var bench = common.Run.init(allocator, common_opts);
+    var bench = common.Run.init(env, common_opts);
     try bench.runWorkers(Ctx, &ctx);
 
     try bench.emit("get_link", .{ .get_link = .{

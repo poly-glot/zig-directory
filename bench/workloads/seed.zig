@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const common = @import("../common.zig");
 
 const SeedOpts = struct {
@@ -10,8 +9,9 @@ const SeedOpts = struct {
     server_cmd: ?[]const u8 = null,
 };
 
-pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
-    var leftovers: std.ArrayList([]const u8) = .{};
+pub fn run(env: common.Env, args: *std.process.Args.Iterator) !void {
+    const allocator = env.allocator;
+    var leftovers: std.ArrayList([]const u8) = .empty;
     defer leftovers.deinit(allocator);
 
     const common_opts = try common.parseCommonOpts(args, &leftovers, allocator);
@@ -21,25 +21,21 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     if (seed_opts.categories == 0) return error.InvalidCategories;
 
     var maybe_child: ?std.process.Child = null;
-    var argv_storage: std.ArrayList([]const u8) = .{};
+    var argv_storage: std.ArrayList([]const u8) = .empty;
     defer argv_storage.deinit(allocator);
 
     if (seed_opts.server_cmd) |cmd| {
-        try common.ensureDir(seed_opts.data_dir);
+        try common.ensureDir(env.io, seed_opts.data_dir);
         try tokenize(cmd, &argv_storage, allocator);
         if (argv_storage.items.len == 0) return error.EmptyServerCmd;
 
-        var child = std.process.Child.init(argv_storage.items, allocator);
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
-        maybe_child = child;
+        maybe_child = try std.process.spawn(env.io, .{ .argv = argv_storage.items, .stderr = .inherit });
     }
-    defer if (maybe_child) |*c| {
-        _ = c.kill() catch {};
-    };
+    defer if (maybe_child) |*c| c.kill(env.io);
 
     var rss = common.RssSampler{
-        .pid = if (maybe_child) |c| c.id else 0,
+        .io = env.io,
+        .pid = if (maybe_child) |c| c.id orelse 0 else 0,
         .interval_ms = if (maybe_child != null) common_opts.rss_sample_ms else 0,
     };
     if (maybe_child != null and common_opts.rss_sample_ms > 0) {
@@ -47,14 +43,14 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     }
     defer if (maybe_child != null and common_opts.rss_sample_ms > 0) rss.stop();
 
-    const stream_fd = try connectWithRetry(common_opts.connect_host, common_opts.port, 5_000);
-    defer posix.close(stream_fd);
+    const stream_fd = try connectWithRetry(env.io, common_opts.connect_host, common_opts.port, 5_000);
+    defer common.closeFd(stream_fd);
     try common.ping(stream_fd);
 
     const level_sizes = try planLevels(allocator, seed_opts.categories, seed_opts.depth);
     defer allocator.free(level_sizes);
 
-    const t_start = std.time.nanoTimestamp();
+    const t_start = common.now(env.io);
 
     const resp_buf = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(resp_buf);
@@ -97,14 +93,14 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const leaves = level_ids[seed_opts.depth - 1];
     const link_ids = try common.createLinksRoundRobin(stream_fd, req_buf, resp_buf, leaves, seed_opts.links);
 
-    var bench = common.Run.init(allocator, common_opts);
-    bench.duration_ms = common.elapsedMs(t_start);
+    var bench = common.Run.init(env, common_opts);
+    bench.duration_ms = common.elapsedMs(env.io, t_start);
 
     var paths_arena = std.heap.ArenaAllocator.init(allocator);
     defer paths_arena.deinit();
     const sample_paths = try buildSamplePaths(paths_arena.allocator(), level_ids, seed_opts.depth);
 
-    try writeSeedJson(allocator, seed_opts, total_cats, cat_id_min, cat_id_max, link_ids, leaves, sample_paths);
+    try writeSeedJson(env, seed_opts, total_cats, cat_id_min, cat_id_max, link_ids, leaves, sample_paths);
 
     if (maybe_child != null and common_opts.rss_sample_ms > 0) {
         bench.rss = .{ .peak = rss.peak.load(.monotonic), .final = rss.final.load(.monotonic), .note = null };
@@ -155,13 +151,13 @@ fn tokenize(s: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.A
     while (it.next()) |tok| try out.append(allocator, tok);
 }
 
-fn connectWithRetry(host: []const u8, port: u16, total_timeout_ms: u64) !i32 {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(total_timeout_ms));
+fn connectWithRetry(io: std.Io, host: []const u8, port: u16, total_timeout_ms: u64) !i32 {
+    const deadline = common.unixMillis(io) + @as(i64, @intCast(total_timeout_ms));
     var backoff_ms: u64 = 50;
     while (true) {
         if (common.tcpConnect(host, port)) |fd| return fd else |_| {}
-        if (std.time.milliTimestamp() >= deadline) return error.ConnectTimeout;
-        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+        if (common.unixMillis(io) >= deadline) return error.ConnectTimeout;
+        common.sleepMs(io, backoff_ms);
         backoff_ms = @min(backoff_ms * 2, 800);
     }
 }
@@ -206,7 +202,7 @@ fn buildSamplePaths(
 
     var i: usize = 0;
     while (i < sample_n) : (i += 1) {
-        var slugs: std.ArrayList([]const u8) = .{};
+        var slugs: std.ArrayList([]const u8) = .empty;
         defer slugs.deinit(arena);
         try slugs.append(arena, "top");
 
@@ -247,7 +243,7 @@ fn slugIndexFor(level_ids: []const []u64, level: u32, cat_id: u64) u32 {
 }
 
 fn writeSeedJson(
-    allocator: std.mem.Allocator,
+    env: common.Env,
     opts: SeedOpts,
     user_categories: u32,
     cat_id_min: u64,
@@ -256,7 +252,8 @@ fn writeSeedJson(
     leaves: []const u64,
     sample_paths: []const []const u8,
 ) !void {
-    try common.ensureDir(opts.data_dir);
+    const allocator = env.allocator;
+    try common.ensureDir(env.io, opts.data_dir);
     const path = try common.seedPath(allocator, opts.data_dir);
     defer allocator.free(path);
 
@@ -293,8 +290,5 @@ fn writeSeedJson(
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
 
-    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(json);
-    try f.writeAll("\n");
+    try common.writeFileAll(env.io, path, &.{ json, "\n" });
 }

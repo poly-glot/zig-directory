@@ -26,8 +26,9 @@ const Ctx = struct {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
-    var leftovers: std.ArrayList([]const u8) = .{};
+pub fn run(env: common.Env, args: *std.process.Args.Iterator) !void {
+    const allocator = env.allocator;
+    var leftovers: std.ArrayList([]const u8) = .empty;
     defer leftovers.deinit(allocator);
 
     const common_opts = try common.parseCommonOpts(args, &leftovers, allocator);
@@ -35,7 +36,7 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     if (opts.batch == 0) return error.InvalidBatch;
 
     var ctx = Ctx{ .batch = opts.batch };
-    var bench = common.Run.init(allocator, common_opts);
+    var bench = common.Run.init(env, common_opts);
     try bench.runWorkers(Ctx, &ctx);
 
     try bench.emit("create_link", .{ .create_link = .{

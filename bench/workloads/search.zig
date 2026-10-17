@@ -23,8 +23,9 @@ const Ctx = struct {
     }
 };
 
-pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
-    var leftovers: std.ArrayList([]const u8) = .{};
+pub fn run(env: common.Env, args: *std.process.Args.Iterator) !void {
+    const allocator = env.allocator;
+    var leftovers: std.ArrayList([]const u8) = .empty;
     defer leftovers.deinit(allocator);
 
     const common_opts = try common.parseCommonOpts(args, &leftovers, allocator);
@@ -37,7 +38,7 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
 
     const seed_path = try common.seedPath(allocator, opts.data_dir);
     defer allocator.free(seed_path);
-    const seed = try common.loadSeed(allocator, seed_path);
+    const seed = try common.loadSeed(env.io, allocator, seed_path);
     defer seed.deinit();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -49,7 +50,7 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     }
 
     var ctx = Ctx{ .corpus = corpus };
-    var bench = common.Run.init(allocator, common_opts);
+    var bench = common.Run.init(env, common_opts);
     try bench.runWorkers(Ctx, &ctx);
 
     const target_str: []const u8 = switch (target) {
@@ -98,7 +99,7 @@ fn buildCorpus(arena: std.mem.Allocator, tokens: []const []const u8) ![]const []
     const max_singletons: usize = @min(tokens.len, 20);
     const max_pairs: usize = if (tokens.len < 2) 0 else 10;
 
-    var list: std.ArrayList([]const u8) = .{};
+    var list: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < max_singletons) : (i += 1) {
         try list.append(arena, tokens[i]);
