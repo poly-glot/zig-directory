@@ -117,6 +117,30 @@ Seed: 51 000 ops at 12 209 → 3 008 ops/sec.
 
 - Give the write workloads URL ranges that cannot collide with `seed` or with each other, so `create_link` and `mixed`
   measure durable inserts only.
-- The write ceiling is the per-item `fdatasync`. The lever is batching: commit a whole `create_link` or `bulk_import`
-  frame as one WAL entry, or revisit zigstore's unmerged fsync-pipeline branch as a measured opt-in.
+- The write ceiling was the per-item `fdatasync`; the group-commit change below lifts it by waiting once per request.
 - Record server RSS: every record still says `rss_unavailable` because the server runs outside the bench process tree.
+
+## Group commit (`perf/group-commit`, 2026-10-17)
+
+Same procedure, same machine, a few hours later, on the commit that makes a request wait for durability once, after all
+its writes and outside `write_mutex`, instead of once per write. JSONL: `baseline-2026-10-17-group-commit-*.jsonl`.
+
+| Profile | Workload | ops/sec (before → after) | Δ | p50 µs per frame (before → after) |
+|---|---|---:|---:|---:|
+| unconstrained | seed | 3 091 → 17 299 | 5.6× | — |
+| unconstrained | create_link | 4 278 → 22 222 | 5.2× | 6 225 → 1 720 |
+| unconstrained | bulk_import | 3 180 → 45 454 | 14.3× | 306 184 → 21 757 |
+| 1cpu2gb | seed | 2 960 → 15 794 | 5.3× | — |
+| 1cpu2gb | create_link | 4 176 → 29 154 | 7.0× | 9 175 → 999 |
+| 1cpu2gb | bulk_import | 3 234 → 45 045 | 13.9× | 306 184 → 20 447 |
+| 2cpu4gb | seed | 3 008 → 18 123 | 6.0× | — |
+| 2cpu4gb | create_link | 4 159 → 29 761 | 7.2× | 6 291 → 1 114 |
+| 2cpu4gb | bulk_import | 3 267 → 47 169 | 14.4× | 301 989 → 20 709 |
+
+- `bulk_import` is about 14× faster in every profile: a 1000-item frame now pays a few fsyncs instead of 1000.
+- `create_link` (10-item frames, 4 connections) is 5–7× faster, and `seed` 5–6×.
+- The acknowledgement still means durable: every response leaves only after the request's last entry, and all entries
+  before it, are on disk.
+- Reads are unchanged. Single-run read rows moved between 0.65× and 1.55×, so an interleaved A/B (three rounds per
+  binary, two runs of each workload per round, after a write burst) settled it: `browse path` median 74k → 83k,
+  `get_link` 153k → 137k, `browse children` 135k → 132k ops/sec, with fully overlapping ranges.

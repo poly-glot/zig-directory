@@ -144,10 +144,12 @@ Writes follow the WAL-first protocol via the ChangeSet pipeline:
 
 1. **Compute**: `operations/operations_changeset_compute.zig` builds a typed `ChangeSet` describing every on-disk effect
    of the mutation (primary record, secondary indexes, ancestor count cascades, token entries).
-2. **Commit**: `db.commit(cs)` calls `zigstore.commit`, which encodes the ChangeSet, appends it to the WAL as op `100`
-   (CRC32 + monotonic sequence), applies it under the engine's apply mutex in sequence order, then blocks in
-   `awaitDurable` until the group-commit flusher has `fdatasync`ed that sequence. **The ack is the fsync**: a handler
-   does not return `ok` for a write until it is on disk.
+2. **Commit**: `db.commit(cs)` calls `zigstore.commitSeq`, which encodes the ChangeSet, appends it to the WAL as op
+   `100` (CRC32 + monotonic sequence) and applies it under the engine's apply mutex in sequence order. Inside a request,
+   `commit` records the sequence and returns, so the operation releases `write_mutex` at once; `Directory.dispatch`
+   then waits in `awaitDurable` for the highest sequence the request wrote before the response leaves. **The ack is the
+   fsync**: no `ok` for a write is sent until that entry, and every entry before it, is on disk. A commit made outside
+   a request (tests, the repair worker) waits for its own entry before returning.
 3. **Apply**: `apply/*.zig` walks the ChangeSet variants. Effects on the six memtable-backed indexes go to that index's
    32-shard memtable; token entries and repair-queue writes go straight to their B+Trees; ancestor counts are rewritten
    synchronously in the same apply.
@@ -805,8 +807,9 @@ tags (`link_inserted`, `link_deleted`, `link_text_updated`, `link_recategorized`
 `slug_path_repair_complete`), so replay and live apply share one decoder and one `apply()`.
 
 **Group commit**: the flusher thread wakes when the batch reaches `DMOZDB_WAL_BATCH_SIZE` (default 256) or after a
-fixed 2 ms, writes every pending entry and issues one `fdatasync`. Each committing handler waits in `awaitDurable` for
-its sequence to pass that fsync. If an fsync fails, `fsync_failed` is set and stays set: every later commit is refused
+fixed 2 ms, writes every pending entry and issues one `fdatasync`. A request waits once, after all its writes, for the
+highest sequence it wrote to pass that fsync, so the items of a batch frame and the writes of concurrent connections
+share fsyncs. If an fsync fails, `fsync_failed` is set and stays set: every later commit is refused
 with `error.WalFlushFailed` before it is appended, and `Directory.commit` aborts the process on it, because the entry
 whose fsync failed is already applied in memory and only a restart makes what is served match what is durable.
 
@@ -894,7 +897,7 @@ The steps in detail:
 **5. Commit.** `db.commit(cs)` appends the encoded ChangeSet to the WAL, then applies it under the apply mutex:
 `link_by_category`, `link_by_url_hash`, `link_by_submitter` (when `submitter_id != 0`) and `links_by_id` receive memtable puts; the token rows `(token ‖ link_id_be) → ""` go straight into `links_index_tree`; every ancestor's `link_count_subtree` (and the direct category's `link_count`) is rewritten through the `categories_by_id` memtable; the URL is added to the bloom filter; the status counter is bumped; the subtree cache is invalidated.
 
-**6. Wait for durability.** `commit` blocks in `awaitDurable` until the WAL flusher has `fdatasync`ed the entry, then the handler writes `[ok][none][link_id]` into the response. Write latency is therefore bounded below by one group-commit cycle.
+**6. Wait for durability.** The handler writes `[ok][none][link_id]` into the response, and `Directory.dispatch` holds the response until the WAL flusher has `fdatasync`ed the request's last entry. A frame of many items therefore pays a few fsyncs, not one per item, and write latency is bounded below by one group-commit cycle.
 
 ### Search
 
@@ -1025,8 +1028,8 @@ Every write appends its ChangeSet to the WAL before touching a memtable or B+Tre
 replayed from sequence 0 through the same `apply()` that served the live request, so recovery is pure replay with no
 business logic of its own.
 
-Group commit amortises `fdatasync` across up to `DMOZDB_WAL_BATCH_SIZE` entries, but the handler that issued a write
-blocks until its entry is synced. A client that receives `ok` has a durable write. The cost is write latency bounded
+Group commit amortises `fdatasync` across up to `DMOZDB_WAL_BATCH_SIZE` entries, and a request waits once for its
+last entry rather than once per entry, outside `write_mutex`, so other writers keep appending while it waits. A client that receives `ok` has a durable write. The cost is write latency bounded
 below by one flusher cycle; the benefit is that there is no window in which an acknowledged write can be lost.
 
 #### Inline processing on the epoll thread
