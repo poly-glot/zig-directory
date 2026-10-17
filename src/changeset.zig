@@ -2,6 +2,7 @@ const std = @import("std");
 const codec = @import("zigstore").codec;
 const wire_codec = @import("zigstore").wire_codec;
 const schema = @import("schema.zig");
+const test_support = @import("test_support.zig");
 pub const Op = enum(u8) {
     link_inserted = 1,
     link_deleted = 2,
@@ -146,7 +147,6 @@ pub const DecodeError = error{
     BufferTooShort,
     UnknownOpTag,
     UnsupportedSchemaVersion,
-    InvalidEnumValue,
     OutOfMemory,
 };
 
@@ -192,16 +192,13 @@ test "encode/decode roundtrip — link_inserted" {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const link = schema.Link{
+    const link = test_support.link(.{
         .id = 42,
         .category_id = 7,
-        .url = codec.FixedString(64).fromSlice("https://example.com"),
-        .title = codec.FixedString(128).fromSlice("Example"),
-        .description = codec.FixedString(256).fromSlice("desc"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = "https://example.com",
+        .title = "Example",
+        .description = "desc",
+    });
     const ancestors = try arena_alloc.dupe(AncestorUpdate, &.{
         .{ .cat_id = 7, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
         .{ .cat_id = 1, .link_count_subtree_delta = 1, .child_count_subtree_delta = 1 },

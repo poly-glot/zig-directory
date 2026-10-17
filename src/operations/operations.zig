@@ -17,6 +17,7 @@ pub const listChildren = category.listChildren;
 pub const getCategoryPath = category.getCategoryPath;
 pub const walkAncestors = category.walkAncestors;
 pub const recomputeCategoryCounts = category.recomputeCategoryCounts;
+pub const computeCategoryCounts = category.computeCategoryCounts;
 
 pub const createLink = link_mod.createLink;
 pub const createLinkWithOpts = link_mod.createLinkWithOpts;
@@ -39,5 +40,5 @@ pub const searchCategories = search.searchCategories;
 pub const searchLinks = search.searchLinks;
 
 pub const resolveSlugPath = slug_mod.resolveSlugPath;
-pub const buildCanonicalSlugPath = slug_mod.buildCanonicalSlugPath;
+pub const buildSlugPath = slug_mod.buildSlugPath;
 pub const composeOldDescendantPath = slug_mod.composeOldDescendantPath;

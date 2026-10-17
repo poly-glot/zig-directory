@@ -3,6 +3,7 @@ const zigstore = @import("zigstore");
 const codec = zigstore.codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
+const URL_BLOOM_INITIAL_CAPACITY = @import("../directory.zig").URL_BLOOM_INITIAL_CAPACITY;
 const shared = @import("operations_shared.zig");
 const compute = @import("operations_changeset_compute.zig");
 const category = @import("operations_category.zig");
@@ -203,11 +204,12 @@ pub fn countsByStatus(db: *Directory) !StatusCounts {
 pub fn recountLinkStatuses(db: *Directory) !void {
     db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
-    const bloom_capacity = @max(db.links_by_id().entry_count *| 2, 1_000_000);
-    const reseeded = zigstore.BloomFilter.init(db.allocator, bloom_capacity) catch null;
-    if (reseeded) |new_bloom| {
+    const bloom_capacity = @max(db.links_by_id().entry_count *| 2, URL_BLOOM_INITIAL_CAPACITY);
+    if (zigstore.BloomFilter.init(db.allocator, bloom_capacity)) |new_bloom| {
         db.url_bloom.deinit();
         db.url_bloom = new_bloom;
+    } else |err| {
+        std.log.scoped(.operations).warn("url bloom reseed skipped: {} — keeping the current filter", .{err});
     }
 
     var pending: u64 = 0;

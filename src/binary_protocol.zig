@@ -4,12 +4,11 @@ const protocol = zigstore.protocol;
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
 const operations = @import("operations/operations.zig");
+const subtree = @import("subtree.zig");
 
 const log = std.log.scoped(.binary);
 
 pub const RESPONSE_HEADER_SIZE: usize = protocol.RESPONSE_HEADER_SIZE;
-
-pub const HEADER_SIZE: usize = protocol.HEADER_SIZE;
 
 pub const Status = enum(u8) {
     ok = 0,
@@ -51,9 +50,7 @@ pub fn mapErrorWithSubStatus(err: anyerror) StatusPair {
         error.CategoryHasChildren => .{ .status = .has_children, .sub_status = .none },
         error.CircularHierarchy => .{ .status = .circular, .sub_status = .none },
         error.FieldTooLong => .{ .status = .invalid, .sub_status = .field_too_long },
-        error.BufferTooSmall => .{ .status = .invalid, .sub_status = .buffer_too_small },
         error.PathTooDeep => .{ .status = .invalid, .sub_status = .path_too_deep },
-        error.InvalidSlug => .{ .status = .invalid, .sub_status = .invalid_slug },
         error.UnsupportedOrder => .{ .status = .invalid, .sub_status = .unsupported_order },
         error.OffsetTooLarge => .{ .status = .invalid, .sub_status = .offset_too_large },
         error.SnapshotInProgress => .{ .status = .err, .sub_status = .already_in_progress },
@@ -148,6 +145,55 @@ fn writeMappedError(buf: []u8, op: u8, err: anyerror) usize {
     return writeErrorRespSub(buf, op, pair.status, pair.sub_status);
 }
 
+const ITEM_RESULT_BYTES: usize = 10;
+const OK_PAIR = StatusPair{ .status = .ok, .sub_status = .none };
+const INVALID_PAIR = StatusPair{ .status = .invalid, .sub_status = .none };
+
+fn writeItemResult(resp: []u8, off: usize, pair: StatusPair, id: u64) usize {
+    resp[off] = @intFromEnum(pair.status);
+    resp[off + 1] = @intFromEnum(pair.sub_status);
+    std.mem.writeInt(u64, resp[off + 2 ..][0..8], id, .little);
+    return off + ITEM_RESULT_BYTES;
+}
+
+fn appendRow(resp: []u8, off: usize, row: anytype) usize {
+    const bytes = std.mem.asBytes(row);
+    @memcpy(resp[off..][0..bytes.len], bytes);
+    return off + bytes.len;
+}
+
+fn writeU64s(resp: []u8, start: usize, values: []const u64) usize {
+    var off = start;
+    for (values) |value| {
+        std.mem.writeInt(u64, resp[off..][0..8], value, .little);
+        off += 8;
+    }
+    return off;
+}
+
+fn writeU64Frame(resp: []u8, op_byte: u8, values: []const u64) usize {
+    if (resp.len < RESPONSE_HEADER_SIZE + values.len * @sizeOf(u64)) return writeErrorResp(resp, op_byte, .err);
+    const off = writeU64s(resp, RESPONSE_HEADER_SIZE, values);
+    writeOkHeader(resp, op_byte, off, 0);
+    return off;
+}
+
+fn writeCountedCategoryRows(resp: []u8, start: usize, rows: []const schema.Category, tail_reserve: usize) usize {
+    var off = start + 2;
+    var written: u16 = 0;
+    for (rows) |*row| {
+        if (off + @sizeOf(schema.Category) + tail_reserve > resp.len) break;
+        off = appendRow(resp, off, row);
+        written += 1;
+    }
+    std.mem.writeInt(u16, resp[start..][0..2], written, .little);
+    return off;
+}
+
+fn isKnownLinkStatus(code: u8) bool {
+    return code <= @intFromEnum(schema.LinkStatus.rejected);
+}
+
 fn BatchCreateHandler(
     comptime fields: []const struct { []const u8, type },
     comptime op_code: u8,
@@ -155,7 +201,6 @@ fn BatchCreateHandler(
 ) type {
     return struct {
         fn handle(db: *Directory, resp: []u8, payload: []const u8, count: u16) usize {
-            const ITEM_BYTES: usize = 10;
             if (resp.len < RESPONSE_HEADER_SIZE) return 0;
 
             var off: usize = RESPONSE_HEADER_SIZE;
@@ -163,44 +208,29 @@ fn BatchCreateHandler(
             var written: u16 = 0;
 
             for (0..count) |_| {
-                if (off + ITEM_BYTES > resp.len) break;
+                if (off + ITEM_RESULT_BYTES > resp.len) break;
 
-                const parsed = parsePayload(fields, data);
-                if (parsed) |p| {
-                    const r = p.result;
-                    const id = @call(.auto, createFn, .{
-                        db,
-                        @field(r, fields[0][0]),
-                        @field(r, fields[1][0]),
-                        @field(r, fields[2][0]),
-                        @field(r, fields[3][0]),
-                    }) catch |err| {
-                        const pair = mapErrorWithSubStatus(err);
-                        resp[off] = @intFromEnum(pair.status);
-                        resp[off + 1] = @intFromEnum(pair.sub_status);
-                        off += 2;
-                        @memset(resp[off..][0..8], 0);
-                        off += 8;
-                        written += 1;
-                        data = advancePayload(fields, data) orelse &.{};
-                        continue;
-                    };
-                    resp[off] = @intFromEnum(Status.ok);
-                    resp[off + 1] = @intFromEnum(SubStatus.none);
-                    off += 2;
-                    std.mem.writeInt(u64, resp[off..][0..8], id, .little);
-                    off += 8;
-                    written += 1;
-                    data = p.rest;
-                } else {
-                    resp[off] = @intFromEnum(Status.invalid);
-                    resp[off + 1] = @intFromEnum(SubStatus.none);
-                    off += 2;
-                    @memset(resp[off..][0..8], 0);
-                    off += 8;
+                const parsed = parsePayload(fields, data) orelse {
+                    off = writeItemResult(resp, off, INVALID_PAIR, 0);
                     written += 1;
                     break;
+                };
+                const r = parsed.result;
+                const created = @call(.auto, createFn, .{
+                    db,
+                    @field(r, fields[0][0]),
+                    @field(r, fields[1][0]),
+                    @field(r, fields[2][0]),
+                    @field(r, fields[3][0]),
+                });
+                if (created) |id| {
+                    off = writeItemResult(resp, off, OK_PAIR, id);
+                    data = parsed.rest;
+                } else |err| {
+                    off = writeItemResult(resp, off, mapErrorWithSubStatus(err), 0);
+                    data = advancePayload(fields, data) orelse &.{};
                 }
+                written += 1;
             }
 
             writeOkHeader(resp, op_code, off, written);
@@ -241,13 +271,13 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
         .delete_link => handleDelete(db, resp, op_byte, payload, operations.deleteLink),
         .delete_category => handleDelete(db, resp, op_byte, payload, operations.deleteCategory),
         .update_category => handleBitmaskUpdate(operations.updateCategory, db, resp, op_byte, payload),
-        .move_category => handleMoveCategory(db, resp, op_byte, payload),
-        .move_link => handleMoveLink(db, resp, op_byte, payload),
+        .move_category => handleMove(db, resp, op_byte, payload, operations.moveCategory),
+        .move_link => handleMove(db, resp, op_byte, payload, operations.moveLink),
         .update_link => handleBitmaskUpdate(operations.updateLink, db, resp, op_byte, payload),
-        .list_root_categories => handleListRootCategories(db, resp, op_byte, payload),
-        .list_children => handleListChildren(db, resp, op_byte, payload),
-        .list_links => handleListLinks(db, resp, op_byte, payload),
-        .list_all_links => handleListAllLinks(db, resp, op_byte, payload),
+        .list_root_categories => handleListChildren(.none, db, resp, op_byte, payload),
+        .list_children => handleListChildren(.leading_id, db, resp, op_byte, payload),
+        .list_links => handleListLinks(.leading_id, operations.listLinks, db, resp, op_byte, payload),
+        .list_all_links => handleListLinks(.none, operations.listAllLinks, db, resp, op_byte, payload),
         .list_subtree_links => handleListSubtreeLinks(db, resp, op_byte, payload),
         .index_health => handleIndexHealth(db, resp, op_byte),
         .run_verifier => handleRunVerifier(db, resp, op_byte),
@@ -257,7 +287,7 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
         .bulk_import => handleBulkImport(db, resp, op_byte, payload, count),
         .create_submission => handleCreateSubmission(db, resp, op_byte, payload),
         .update_link_status => handleUpdateLinkStatus(db, resp, op_byte, payload),
-        .list_links_by_submitter => handleListLinksBySubmitter(db, resp, op_byte, payload),
+        .list_links_by_submitter => handleListLinks(.leading_id, operations.listLinksBySubmitter, db, resp, op_byte, payload),
         .browse_path => handleBrowsePath(db, resp, op_byte, payload),
         .search => handleSearch(db, resp, op_byte, payload),
         .stats => handleStats(db, resp, op_byte),
@@ -270,6 +300,11 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
 const MAX_SUBTREE_OFFSET: u32 = 5000;
 const MAX_SUBTREE_LIMIT: u32 = 100;
 const DEFAULT_SUBTREE_LIMIT: u32 = 50;
+const MAX_SUBTREE_FETCH: u32 = 10_000;
+const SUBTREE_OVERPROVISION_FACTOR: u32 = 2;
+const MAX_ANCESTOR_DEPTH: usize = 64;
+const BROWSE_CHILDREN_LIMIT: u32 = 100;
+const SEARCH_MAX_RESULTS: u32 = 50;
 
 pub const ListSubtreeLinksRequest = struct {
     cat_id: u64,
@@ -344,9 +379,7 @@ fn handleGetCategoriesByIds(
         const id = std.mem.readInt(u64, payload[id_off..][0..8], .little);
         const maybe_cat = operations.getCategory(db, id) catch null;
         if (maybe_cat) |cat| {
-            const bytes = std.mem.asBytes(&cat);
-            @memcpy(resp[off..][0..bytes.len], bytes);
-            off += bytes.len;
+            off = appendRow(resp, off, &cat);
             found += 1;
         }
     }
@@ -447,37 +480,74 @@ fn handleBitmaskUpdate(
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleMoveCategory(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+fn handleMove(
+    db: *Directory,
+    resp: []u8,
+    op_byte: u8,
+    payload: []const u8,
+    comptime moveFn: fn (*Directory, u64, u64) anyerror!void,
+) usize {
     if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
-    const new_parent = std.mem.readInt(u64, payload[8..16], .little);
-    operations.moveCategory(db, id, new_parent) catch |err| {
+    const destination = std.mem.readInt(u64, payload[8..16], .little);
+    moveFn(db, id, destination) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
     return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleMoveLink(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
-    const id = std.mem.readInt(u64, payload[0..8], .little);
-    const new_cat = std.mem.readInt(u64, payload[8..16], .little);
-    operations.moveLink(db, id, new_cat) catch |err| {
-        return writeMappedError(resp, op_byte, err);
+const PageKey = enum { none, leading_id };
+
+const ListWindow = struct {
+    key: u64,
+    offset: u32,
+    limit: u32,
+    fixed_len: usize,
+};
+
+fn parseListWindow(comptime page_key: PageKey, payload: []const u8) ?ListWindow {
+    const key_len: usize = if (page_key == .leading_id) 8 else 0;
+    if (payload.len < key_len + 8) return null;
+    return .{
+        .key = if (page_key == .leading_id) std.mem.readInt(u64, payload[0..8], .little) else 0,
+        .offset = std.mem.readInt(u32, payload[key_len..][0..4], .little),
+        .limit = std.mem.readInt(u32, payload[key_len + 4 ..][0..4], .little),
+        .fixed_len = key_len + 8,
     };
-    return writeResp(resp, op_byte, .ok, 0, &.{});
 }
 
-fn handleListRootCategories(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
-    const offset = std.mem.readInt(u32, payload[0..4], .little);
-    const limit = std.mem.readInt(u32, payload[4..8], .little);
-    const N = comptime defaultListBufLen(schema.Category);
-    var buf: [N]schema.Category = undefined;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    const items = operations.listChildren(db, 0, offset, max, &buf) catch |err| {
+fn handleListChildren(comptime page_key: PageKey, db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    const window = parseListWindow(page_key, payload) orelse return writeErrorResp(resp, op_byte, .invalid);
+    var buf: [defaultListBufLen(schema.Category)]schema.Category = undefined;
+    const max = @min(window.limit, @as(u32, @intCast(buf.len)));
+    const items = operations.listChildren(db, window.key, window.offset, max, &buf) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
     return writeRowList(schema.Category, resp, op_byte, items);
+}
+
+fn handleListLinks(
+    comptime page_key: PageKey,
+    comptime listFn: anytype,
+    db: *Directory,
+    resp: []u8,
+    op_byte: u8,
+    payload: []const u8,
+) usize {
+    const window = parseListWindow(page_key, payload) orelse return writeErrorResp(resp, op_byte, .invalid);
+    const extras = readOptionalListExtras(payload, window.fixed_len) orelse {
+        return writeErrorResp(resp, op_byte, .invalid);
+    };
+    var buf: [defaultListBufLen(schema.Link)]schema.Link = undefined;
+    const max = @min(window.limit, @as(u32, @intCast(buf.len)));
+    const listed = if (page_key == .leading_id)
+        listFn(db, window.key, window.offset, max, &buf, extras.status, extras.after_id)
+    else
+        listFn(db, window.offset, max, &buf, extras.status, extras.after_id);
+    const page = listed catch |err| {
+        return writeMappedError(resp, op_byte, err);
+    };
+    return writeLinkPage(resp, op_byte, page);
 }
 
 fn handleBrowsePath(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -497,126 +567,39 @@ fn handleBrowsePath(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
     const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(schema.Category) + 2 + 2 + 8;
     if (resp.len < MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
 
-    var off: usize = RESPONSE_HEADER_SIZE;
-
-    const cat_bytes = std.mem.asBytes(&cat);
-    @memcpy(resp[off..][0..cat_bytes.len], cat_bytes);
-    off += cat_bytes.len;
-
-    var anc_buf: [64]schema.Category = undefined;
+    var anc_buf: [MAX_ANCESTOR_DEPTH]schema.Category = undefined;
     const ancestors = operations.walkAncestors(db, cat_id, &anc_buf) catch
         return writeErrorResp(resp, op_byte, .err);
-    const anc_count_off = off;
-    off += 2;
-    var anc_written: u16 = 0;
-    for (ancestors) |a| {
-        if (off + @sizeOf(schema.Category) + 2 + 8 > resp.len) break;
-        const ab = std.mem.asBytes(&a);
-        @memcpy(resp[off..][0..ab.len], ab);
-        off += ab.len;
-        anc_written += 1;
-    }
-    std.mem.writeInt(u16, resp[anc_count_off..][0..2], anc_written, .little);
-
-    var children_buf: [100]schema.Category = undefined;
-    const children = operations.listChildren(db, cat_id, 0, 100, &children_buf) catch
+    var children_buf: [BROWSE_CHILDREN_LIMIT]schema.Category = undefined;
+    const children = operations.listChildren(db, cat_id, 0, BROWSE_CHILDREN_LIMIT, &children_buf) catch
         return writeErrorResp(resp, op_byte, .err);
-    const child_count_off = off;
-    off += 2;
-    var children_written: u16 = 0;
-    for (children) |child| {
-        if (off + @sizeOf(schema.Category) + 8 > resp.len) break;
-        const cb = std.mem.asBytes(&child);
-        @memcpy(resp[off..][0..cb.len], cb);
-        off += cb.len;
-        children_written += 1;
-    }
-    std.mem.writeInt(u16, resp[child_count_off..][0..2], children_written, .little);
 
-    const subtree = @import("subtree.zig");
-    const total_links: u64 = if (db.subtree_cache.getLinkCount(cat_id)) |hit|
-        hit
-    else blk: {
-        const desc = subtree.collectDescendantsCached(
-            db.cat_by_parent(),
-            cat_id,
-            &db.subtree_cache,
-            db.allocator,
-        ) catch break :blk 0;
-        defer db.allocator.free(desc);
-        const t = subtree.countSubtreeLinks(db.link_by_category(), desc, db.allocator) catch break :blk 0;
-        db.subtree_cache.putLinkCount(cat_id, t) catch {};
-        break :blk t;
-    };
-    std.mem.writeInt(u64, resp[off..][0..8], total_links, .little);
-    off += 8;
+    var off = appendRow(resp, RESPONSE_HEADER_SIZE, &cat);
+    off = writeCountedCategoryRows(resp, off, ancestors, 2 + 8);
+    off = writeCountedCategoryRows(resp, off, children, 8);
+    off = writeU64s(resp, off, &.{subtreeLinkTotal(db, cat_id)});
 
     writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
 
-fn handleListChildren(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
-    const parent_id = std.mem.readInt(u64, payload[0..8], .little);
-    const offset = std.mem.readInt(u32, payload[8..12], .little);
-    const limit = std.mem.readInt(u32, payload[12..16], .little);
-    const N = comptime defaultListBufLen(schema.Category);
-    var buf: [N]schema.Category = undefined;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    const items = operations.listChildren(db, parent_id, offset, max, &buf) catch |err| {
-        return writeMappedError(resp, op_byte, err);
-    };
-    return writeRowList(schema.Category, resp, op_byte, items);
-}
+fn subtreeLinkTotal(db: *Directory, cat_id: u64) u64 {
+    if (db.subtree_cache.getLinkCount(cat_id)) |hit| return hit;
 
-fn handleListLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
-    const cat_id = std.mem.readInt(u64, payload[0..8], .little);
-    const offset = std.mem.readInt(u32, payload[8..12], .little);
-    const limit = std.mem.readInt(u32, payload[12..16], .little);
-    const extras = readOptionalListExtras(payload, 16) orelse {
-        return writeErrorResp(resp, op_byte, .invalid);
+    const descendants = subtree.collectDescendantsCached(db.cat_by_parent(), cat_id, &db.subtree_cache, db.allocator) catch |err| {
+        log.warn("browse_path: descendants of {d} unavailable, reporting 0 subtree links: {}", .{ cat_id, err });
+        return 0;
     };
-    const N = comptime defaultListBufLen(schema.Link);
-    var buf: [N]schema.Link = undefined;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    const page = operations.listLinks(db, cat_id, offset, max, &buf, extras.status, extras.after_id) catch |err| {
-        return writeMappedError(resp, op_byte, err);
-    };
-    return writeLinkPage(resp, op_byte, page);
-}
+    defer db.allocator.free(descendants);
 
-fn handleListAllLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    if (payload.len < 8) return writeErrorResp(resp, op_byte, .invalid);
-    const offset = std.mem.readInt(u32, payload[0..4], .little);
-    const limit = std.mem.readInt(u32, payload[4..8], .little);
-    const extras = readOptionalListExtras(payload, 8) orelse {
-        return writeErrorResp(resp, op_byte, .invalid);
+    const total = subtree.countSubtreeLinks(db.link_by_category(), descendants, db.allocator) catch |err| {
+        log.warn("browse_path: subtree link count of {d} unavailable, reporting 0: {}", .{ cat_id, err });
+        return 0;
     };
-    const N = comptime defaultListBufLen(schema.Link);
-    var buf: [N]schema.Link = undefined;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    const page = operations.listAllLinks(db, offset, max, &buf, extras.status, extras.after_id) catch |err| {
-        return writeMappedError(resp, op_byte, err);
+    db.subtree_cache.putLinkCount(cat_id, total) catch |err| {
+        log.warn("browse_path: subtree link count of {d} not cached: {}", .{ cat_id, err });
     };
-    return writeLinkPage(resp, op_byte, page);
-}
-
-fn handleListLinksBySubmitter(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    if (payload.len < 16) return writeErrorResp(resp, op_byte, .invalid);
-    const submitter_id = std.mem.readInt(u64, payload[0..8], .little);
-    const offset = std.mem.readInt(u32, payload[8..12], .little);
-    const limit = std.mem.readInt(u32, payload[12..16], .little);
-    const extras = readOptionalListExtras(payload, 16) orelse {
-        return writeErrorResp(resp, op_byte, .invalid);
-    };
-    const N = comptime defaultListBufLen(schema.Link);
-    var buf: [N]schema.Link = undefined;
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    const page = operations.listLinksBySubmitter(db, submitter_id, offset, max, &buf, extras.status, extras.after_id) catch |err| {
-        return writeMappedError(resp, op_byte, err);
-    };
-    return writeLinkPage(resp, op_byte, page);
+    return total;
 }
 
 const NO_STATUS_FILTER: u8 = 0xFF;
@@ -629,12 +612,12 @@ fn readOptionalListExtras(payload: []const u8, fixed_len: usize) ?OptionalListEx
         0 => OptionalListExtras{ .status = null, .after_id = 0 },
         1 => blk: {
             const s = tail[0];
-            if (s > 2) break :blk null;
+            if (!isKnownLinkStatus(s)) break :blk null;
             break :blk OptionalListExtras{ .status = s, .after_id = 0 };
         },
         9 => blk: {
             const s = tail[0];
-            const status: ?u8 = if (s == NO_STATUS_FILTER) null else if (s > 2) break :blk null else s;
+            const status: ?u8 = if (s == NO_STATUS_FILTER) null else if (!isKnownLinkStatus(s)) break :blk null else s;
             const a = std.mem.readInt(u64, tail[1..9], .little);
             break :blk OptionalListExtras{ .status = status, .after_id = a };
         },
@@ -652,21 +635,38 @@ fn writeLinkPage(resp: []u8, op_byte: u8, page: operations.LinkPage) usize {
     return off;
 }
 
-fn writeSubtreeLinkPage(
-    db: *Directory,
-    resp: []u8,
-    start_off: usize,
-    link_ids: []const u64,
+const SUBTREE_ROWS_OFF: usize = RESPONSE_HEADER_SIZE + 4;
+const SUBTREE_TRAILER_BYTES: usize = 8 + 8;
+const SUBTREE_MIN_FRAME: usize = SUBTREE_ROWS_OFF + SUBTREE_TRAILER_BYTES;
+
+const SubtreePageSpec = struct {
     limit: u32,
+    offset: u32,
     status_filter: ?u8,
     after_id: u64,
-    offset: u32,
-    initial_total: u64,
-) struct { off: usize, written: u32, total: u64, next_after_id: u64 } {
-    const cursor_mode = after_id > 0;
-    var off = start_off;
+
+    fn cursorMode(self: SubtreePageSpec) bool {
+        return self.after_id > 0;
+    }
+
+    fn needsFullScan(self: SubtreePageSpec) bool {
+        return self.cursorMode() or self.status_filter != null;
+    }
+};
+
+const SubtreePageResult = struct { off: usize, written: u32, total: u64, next_after_id: u64 };
+
+fn writeSubtreeLinkRows(
+    db: *Directory,
+    resp: []u8,
+    link_ids: []const u64,
+    unfiltered_total: u64,
+    spec: SubtreePageSpec,
+) SubtreePageResult {
+    const cursor_mode = spec.cursorMode();
+    var off = SUBTREE_ROWS_OFF;
     var written: u32 = 0;
-    var total: u64 = initial_total;
+    var total: u64 = if (spec.status_filter == null) unfiltered_total else 0;
     var skipped: u32 = 0;
     var passed_cursor = !cursor_mode;
     var next_after_id: u64 = 0;
@@ -674,33 +674,38 @@ fn writeSubtreeLinkPage(
 
     for (link_ids) |lid| {
         const link = (operations.getLink(db, lid) catch null) orelse continue;
-        if (status_filter) |s| {
+        if (spec.status_filter) |s| {
             if (link.status != s) continue;
             total += 1;
         }
         if (!passed_cursor) {
-            if (link.id == after_id) passed_cursor = true;
+            if (link.id == spec.after_id) passed_cursor = true;
             continue;
         }
-        if (!cursor_mode and status_filter != null and skipped < offset) {
+        if (!cursor_mode and spec.status_filter != null and skipped < spec.offset) {
             skipped += 1;
             continue;
         }
-        if (written >= limit) {
+        if (written >= spec.limit) {
             next_after_id = last_written_id;
-            if (status_filter == null) break else continue;
+            if (spec.status_filter == null) break else continue;
         }
-        if (off + @sizeOf(schema.Link) + 16 > resp.len) {
-            if (status_filter == null) break else continue;
+        if (off + @sizeOf(schema.Link) + SUBTREE_TRAILER_BYTES > resp.len) {
+            if (spec.status_filter == null) break else continue;
         }
-        const lb = std.mem.asBytes(&link);
-        @memcpy(resp[off..][0..lb.len], lb);
-        off += lb.len;
+        off = appendRow(resp, off, &link);
         last_written_id = link.id;
         written += 1;
     }
 
     return .{ .off = off, .written = written, .total = total, .next_after_id = next_after_id };
+}
+
+fn fetchSubtreeLinkIds(db: *Directory, descendants: []const u64, offset: u32, limit: u32) !subtree.SubtreeLinkPage {
+    if (descendants.len > db.config.subtree_scan_threshold) {
+        return subtree.listSubtreeLinkIdsScan(db.link_by_category(), descendants, offset, limit, db.allocator);
+    }
+    return subtree.listSubtreeLinkIds(db.link_by_category(), descendants, offset, limit, db.allocator);
 }
 
 fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -710,14 +715,16 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     const extras = readOptionalListExtras(payload, 17) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
-    const status_filter = extras.status;
-    const cursor_mode = extras.after_id > 0;
+    const spec = SubtreePageSpec{
+        .limit = req.effectiveLimit(),
+        .offset = req.offset,
+        .status_filter = extras.status,
+        .after_id = extras.after_id,
+    };
 
     db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
     db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
     db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
-
-    const subtree = @import("subtree.zig");
 
     const descendants = subtree.collectDescendantsCached(
         db.cat_by_parent(),
@@ -727,57 +734,19 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     ) catch |err| return writeMappedError(resp, op_byte, err);
     defer db.allocator.free(descendants);
 
-    const limit = req.effectiveLimit();
+    if (resp.len < SUBTREE_MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
 
-    const min_frame: usize = RESPONSE_HEADER_SIZE + 4 + 8 + 8;
-    if (resp.len < min_frame) return writeErrorResp(resp, op_byte, .err);
-
-    const MAX_SUBTREE_FETCH: u32 = 10_000;
-    const overprovision_factor: u32 = 2;
-    const full_scan = cursor_mode or status_filter != null;
-    const fetch_offset: u32 = if (full_scan) 0 else req.offset;
-    const fetch_limit: u32 = if (full_scan) MAX_SUBTREE_FETCH else limit *| overprovision_factor;
-
-    const scan_threshold: u32 = db.config.subtree_scan_threshold;
-    const slice = if (descendants.len > scan_threshold)
-        subtree.listSubtreeLinkIdsScan(
-            db.link_by_category(),
-            descendants,
-            fetch_offset,
-            fetch_limit,
-            db.allocator,
-        ) catch |err| return writeMappedError(resp, op_byte, err)
-    else
-        subtree.listSubtreeLinkIds(
-            db.link_by_category(),
-            descendants,
-            fetch_offset,
-            fetch_limit,
-            db.allocator,
-        ) catch |err| return writeMappedError(resp, op_byte, err);
+    const fetch_offset: u32 = if (spec.needsFullScan()) 0 else spec.offset;
+    const fetch_limit: u32 = if (spec.needsFullScan()) MAX_SUBTREE_FETCH else spec.limit *| SUBTREE_OVERPROVISION_FACTOR;
+    const slice = fetchSubtreeLinkIds(db, descendants, fetch_offset, fetch_limit) catch |err| {
+        return writeMappedError(resp, op_byte, err);
+    };
     defer db.allocator.free(slice.link_ids);
 
-    const start_off = RESPONSE_HEADER_SIZE + 4;
-    const initial_total: u64 = if (status_filter == null) slice.total else 0;
-    const pg = writeSubtreeLinkPage(
-        db,
-        resp,
-        start_off,
-        slice.link_ids,
-        limit,
-        status_filter,
-        extras.after_id,
-        req.offset,
-        initial_total,
-    );
-    var off = pg.off;
-
-    std.mem.writeInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], pg.written, .little);
-    if (off + 16 > resp.len) return writeErrorResp(resp, op_byte, .err);
-    std.mem.writeInt(u64, resp[off..][0..8], pg.total, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], pg.next_after_id, .little);
-    off += 8;
+    const page = writeSubtreeLinkRows(db, resp, slice.link_ids, slice.total, spec);
+    std.mem.writeInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], page.written, .little);
+    if (page.off + SUBTREE_TRAILER_BYTES > resp.len) return writeErrorResp(resp, op_byte, .err);
+    const off = writeU64s(resp, page.off, &.{ page.total, page.next_after_id });
 
     writeOkHeader(resp, op_byte, off, 0);
     return off;
@@ -809,37 +778,22 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const consumed: usize = 2 + query_len + 4;
     const scope: SearchScope = switch (payload.len - consumed) {
         0 => .both,
-        1 => blk: {
-            const s = payload[consumed];
-            if (s > 2) return writeErrorResp(resp, op_byte, .invalid);
-            break :blk @enumFromInt(s);
-        },
+        1 => std.meta.intToEnum(SearchScope, payload[consumed]) catch return writeErrorResp(resp, op_byte, .invalid),
         else => return writeErrorResp(resp, op_byte, .invalid),
     };
 
     if (resp.len < RESPONSE_HEADER_SIZE + 4) return writeErrorResp(resp, op_byte, .err);
 
-    const max = @min(limit, 50);
-    var off: usize = RESPONSE_HEADER_SIZE;
+    const max = @min(limit, SEARCH_MAX_RESULTS);
 
-    var cat_buf: [50]schema.Category = undefined;
+    var cat_buf: [SEARCH_MAX_RESULTS]schema.Category = undefined;
     const cats = if (scope == .links_only)
         cat_buf[0..0]
     else
         operations.searchCategories(db, query, max, &cat_buf) catch &[0]schema.Category{};
-    const cat_count_off = off;
-    off += 2;
-    var cats_written: u16 = 0;
-    for (cats) |cat| {
-        if (off + @sizeOf(schema.Category) + 2 > resp.len) break;
-        const cb = std.mem.asBytes(&cat);
-        @memcpy(resp[off..][0..cb.len], cb);
-        off += cb.len;
-        cats_written += 1;
-    }
-    std.mem.writeInt(u16, resp[cat_count_off..][0..2], cats_written, .little);
+    var off = writeCountedCategoryRows(resp, RESPONSE_HEADER_SIZE, cats, 2);
 
-    var link_buf: [50]schema.Link = undefined;
+    var link_buf: [SEARCH_MAX_RESULTS]schema.Link = undefined;
     const links = if (scope == .categories_only)
         link_buf[0..0]
     else
@@ -847,12 +801,10 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const link_count_off = off;
     off += 2;
     var links_written: u16 = 0;
-    for (links) |link| {
+    for (links) |*link| {
         if (off + @sizeOf(schema.Link) + 1 > resp.len) break;
-        const lb = std.mem.asBytes(&link);
-        @memcpy(resp[off..][0..lb.len], lb);
-        off += lb.len;
-        resp[off] = linkMatchField(link, query);
+        off = appendRow(resp, off, link);
+        resp[off] = linkMatchField(link.*, query);
         off += 1;
         links_written += 1;
     }
@@ -912,20 +864,7 @@ fn handleRebuildIndex(db: *Directory, resp: []u8, op_byte: u8) usize {
         log.err("rebuild_index failed: {}", .{err});
         return writeMappedError(resp, op_byte, err);
     };
-
-    const PAYLOAD_BYTES: usize = 24;
-    if (resp.len < RESPONSE_HEADER_SIZE + PAYLOAD_BYTES) return writeErrorResp(resp, op_byte, .err);
-
-    var off: usize = RESPONSE_HEADER_SIZE;
-    std.mem.writeInt(u64, resp[off..][0..8], stats.categories_rebuilt, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], stats.links_rebuilt, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], stats.queue_entries_drained, .little);
-    off += 8;
-
-    writeOkHeader(resp, op_byte, off, 0);
-    return off;
+    return writeU64Frame(resp, op_byte, &.{ stats.categories_rebuilt, stats.links_rebuilt, stats.queue_entries_drained });
 }
 
 fn handleSnapshot(db: *Directory, resp: []u8, op_byte: u8) usize {
@@ -935,18 +874,7 @@ fn handleSnapshot(db: *Directory, resp: []u8, op_byte: u8) usize {
         }
         return writeMappedError(resp, op_byte, err);
     };
-
-    const PAYLOAD_BYTES: usize = 16;
-    if (resp.len < RESPONSE_HEADER_SIZE + PAYLOAD_BYTES) return writeErrorResp(resp, op_byte, .err);
-
-    var off: usize = RESPONSE_HEADER_SIZE;
-    std.mem.writeInt(u64, resp[off..][0..8], result.wal_sequence, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], result.duration_ms, .little);
-    off += 8;
-
-    writeOkHeader(resp, op_byte, off, 0);
-    return off;
+    return writeU64Frame(resp, op_byte, &.{ result.wal_sequence, result.duration_ms });
 }
 
 fn handleOpLatencyStats(db: *Directory, resp: []u8, op_byte: u8) usize {
@@ -967,21 +895,15 @@ fn handleOpLatencyStats(db: *Directory, resp: []u8, op_byte: u8) usize {
         if (emitted == 255) break;
 
         resp[off] = @intCast(i);
-        off += 1;
-        std.mem.writeInt(u64, resp[off..][0..8], h.percentile(50.0), .little);
-        off += 8;
-        std.mem.writeInt(u64, resp[off..][0..8], h.percentile(95.0), .little);
-        off += 8;
-        std.mem.writeInt(u64, resp[off..][0..8], h.percentile(99.0), .little);
-        off += 8;
-        std.mem.writeInt(u64, resp[off..][0..8], h.percentile(99.9), .little);
-        off += 8;
-        std.mem.writeInt(u64, resp[off..][0..8], h.maxValue(), .little);
-        off += 8;
-        std.mem.writeInt(u64, resp[off..][0..8], h.mean(), .little);
-        off += 8;
-        std.mem.writeInt(u64, resp[off..][0..8], samples, .little);
-        off += 8;
+        off = writeU64s(resp, off + 1, &.{
+            h.percentile(50.0),
+            h.percentile(95.0),
+            h.percentile(99.0),
+            h.percentile(99.9),
+            h.maxValue(),
+            h.mean(),
+            samples,
+        });
         emitted += 1;
     }
 
@@ -990,9 +912,10 @@ fn handleOpLatencyStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     return off;
 }
 
+const BULK_IMPORT_RESULT_BYTES: usize = 6 * @sizeOf(u64);
+
 fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8, count: u16) usize {
-    const PAYLOAD_BYTES: usize = 48;
-    if (resp.len < RESPONSE_HEADER_SIZE + PAYLOAD_BYTES) return writeErrorResp(resp, op_byte, .err);
+    if (resp.len < RESPONSE_HEADER_SIZE + BULK_IMPORT_RESULT_BYTES) return writeErrorResp(resp, op_byte, .err);
 
     if (payload.len > BULK_IMPORT_MAX_BYTES) {
         log.warn("bulk_import: payload {d} bytes exceeds cap {d}", .{ payload.len, BULK_IMPORT_MAX_BYTES });
@@ -1054,27 +977,11 @@ fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
         count, inserted, duplicates, errors, elapsed_ms,
     });
 
-    var off: usize = RESPONSE_HEADER_SIZE;
-    std.mem.writeInt(u64, resp[off..][0..8], inserted, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], duplicates, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], errors, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], first_id, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], last_id, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], elapsed_ms, .little);
-    off += 8;
-
-    writeOkHeader(resp, op_byte, off, 0);
-    return off;
+    return writeU64Frame(resp, op_byte, &.{ inserted, duplicates, errors, first_id, last_id, elapsed_ms });
 }
 
 fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
-    const ITEM_BYTES: usize = 10;
-    if (resp.len < RESPONSE_HEADER_SIZE + ITEM_BYTES) return 0;
+    if (resp.len < RESPONSE_HEADER_SIZE + ITEM_RESULT_BYTES) return 0;
 
     const parsed = parsePayload(link_fields, payload) orelse
         return writeErrorResp(resp, op_byte, .invalid);
@@ -1082,7 +989,6 @@ fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     if (rest.len < 8) return writeErrorResp(resp, op_byte, .invalid);
     const submitter_id = std.mem.readInt(u64, rest[0..8], .little);
 
-    var off: usize = RESPONSE_HEADER_SIZE;
     const r = parsed.result;
     const opts = operations.CreateLinkOpts{
         .status = @intFromEnum(schema.LinkStatus.pending),
@@ -1097,19 +1003,11 @@ fn handleCreateSubmission(db: *Directory, resp: []u8, op_byte: u8, payload: []co
         opts,
     ) catch |err| {
         const pair = mapErrorWithSubStatus(err);
-        resp[off] = @intFromEnum(pair.status);
-        resp[off + 1] = @intFromEnum(pair.sub_status);
-        off += 2;
-        @memset(resp[off..][0..8], 0);
-        off += 8;
+        const off = writeItemResult(resp, RESPONSE_HEADER_SIZE, pair, 0);
         writeRawHeader(resp, op_byte, off, pair.status, pair.sub_status, 1);
         return off;
     };
-    resp[off] = @intFromEnum(Status.ok);
-    resp[off + 1] = @intFromEnum(SubStatus.none);
-    off += 2;
-    std.mem.writeInt(u64, resp[off..][0..8], id, .little);
-    off += 8;
+    const off = writeItemResult(resp, RESPONSE_HEADER_SIZE, OK_PAIR, id);
     writeOkHeader(resp, op_byte, off, 1);
     return off;
 }
@@ -1118,7 +1016,7 @@ fn handleUpdateLinkStatus(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     if (payload.len < 9) return writeErrorResp(resp, op_byte, .invalid);
     const id = std.mem.readInt(u64, payload[0..8], .little);
     const status = payload[8];
-    if (status > 2) return writeErrorRespSub(resp, op_byte, .invalid, .unsupported_order);
+    if (!isKnownLinkStatus(status)) return writeErrorRespSub(resp, op_byte, .invalid, .unsupported_order);
     operations.updateLinkStatus(db, id, status) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
@@ -1198,7 +1096,7 @@ fn applyBulkDelete(db: *Directory, id: u64, status: u8) BulkResultCode {
 fn handleBulkUpdateLinkStatus(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 3) return writeErrorResp(resp, op_byte, .invalid);
     const status = payload[0];
-    if (status > 2) return writeErrorResp(resp, op_byte, .invalid);
+    if (!isKnownLinkStatus(status)) return writeErrorResp(resp, op_byte, .invalid);
     return handleBulkLinkOp(resp, op_byte, payload, 1, db, status, applyBulkStatus);
 }
 
@@ -1208,38 +1106,19 @@ fn handleBulkDeleteLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []con
 
 fn handleCountsByStatus(db: *Directory, resp: []u8, op_byte: u8) usize {
     const counts = operations.countsByStatus(db) catch |err| return writeMappedError(resp, op_byte, err);
-    if (resp.len < RESPONSE_HEADER_SIZE + 24) return writeErrorResp(resp, op_byte, .err);
-    var off: usize = RESPONSE_HEADER_SIZE;
-    std.mem.writeInt(u64, resp[off..][0..8], counts.pending, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], counts.approved, .little);
-    off += 8;
-    std.mem.writeInt(u64, resp[off..][0..8], counts.rejected, .little);
-    off += 8;
-    writeOkHeader(resp, op_byte, off, 0);
-    return off;
+    return writeU64Frame(resp, op_byte, &.{ counts.pending, counts.approved, counts.rejected });
 }
 
 fn handleStats(db: *Directory, resp: []u8, op_byte: u8) usize {
     const s = db.getStats();
-    const values = [_]u64{
+    return writeU64Frame(resp, op_byte, &.{
         s.category_count,
         s.link_count,
         @as(u64, s.page_count),
         s.cache_hits,
         s.cache_misses,
         s.wal_pending_batch_entries,
-    };
-    if (resp.len < RESPONSE_HEADER_SIZE + values.len * @sizeOf(u64)) {
-        return writeErrorResp(resp, op_byte, .err);
-    }
-    var off: usize = RESPONSE_HEADER_SIZE;
-    for (values) |val| {
-        std.mem.writeInt(u64, resp[off..][0..8], val, .little);
-        off += 8;
-    }
-    writeOkHeader(resp, op_byte, off, 0);
-    return off;
+    });
 }
 
 fn defaultListBufLen(comptime T: type) usize {
@@ -1329,8 +1208,7 @@ test "list_subtree_links: rejects offset > 5000" {
 }
 
 test "list_subtree_links: min_frame allows empty result set" {
-    const min_frame_required: usize = RESPONSE_HEADER_SIZE + 4 + 8 + 8;
-    try std.testing.expectEqual(@as(usize, 30), min_frame_required);
+    try std.testing.expectEqual(@as(usize, 30), SUBTREE_MIN_FRAME);
 }
 
 test "index_health response carries slug_path_repair_queue fields" {
@@ -1356,8 +1234,6 @@ test "index_health response carries slug_path_repair_queue fields" {
 test "mapErrorWithSubStatus: maps each known error to a distinct (status, sub_status) pair" {
     const cases = [_]struct { err: anyerror, status: Status, sub: SubStatus }{
         .{ .err = error.FieldTooLong, .status = .invalid, .sub = .field_too_long },
-        .{ .err = error.InvalidSlug, .status = .invalid, .sub = .invalid_slug },
-        .{ .err = error.BufferTooSmall, .status = .invalid, .sub = .buffer_too_small },
         .{ .err = error.PathTooDeep, .status = .invalid, .sub = .path_too_deep },
         .{ .err = error.UnsupportedOrder, .status = .invalid, .sub = .unsupported_order },
         .{ .err = error.OffsetTooLarge, .status = .invalid, .sub = .offset_too_large },
@@ -1461,7 +1337,7 @@ test "list_subtree_links: unsupported order_code produces sub_status=unsupported
     try std.testing.expectEqual(@as(u8, 0), resp[7]);
 }
 
-test "list_subtree_links: small subtree (<= scan_threshold) and large subtree both return correct results" {
+test "list_subtree_links: the sequential scan above subtree_scan_threshold and the per-descendant walk below it emit identical frames" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1923,7 +1799,7 @@ test "list_all_links (op=16) with trailing status byte filters by status" {
     payload[8] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
-    const reply_len = handleListAllLinks(db, &resp, @intFromEnum(Op.list_all_links), &payload);
+    const reply_len = handleListLinks(.none, operations.listAllLinks, db, &resp, @intFromEnum(Op.list_all_links), &payload);
     try std.testing.expect(reply_len >= RESPONSE_HEADER_SIZE);
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
 
@@ -1940,7 +1816,7 @@ test "list_all_links (op=16) with trailing status byte filters by status" {
     std.mem.writeInt(u32, payload_all[0..4], 0, .little);
     std.mem.writeInt(u32, payload_all[4..8], 50, .little);
     var resp_all: [16384]u8 = undefined;
-    const reply_all = handleListAllLinks(db, &resp_all, @intFromEnum(Op.list_all_links), &payload_all);
+    const reply_all = handleListLinks(.none, operations.listAllLinks, db, &resp_all, @intFromEnum(Op.list_all_links), &payload_all);
     try std.testing.expect(reply_all >= RESPONSE_HEADER_SIZE);
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp_all[5]);
     try std.testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, resp_all[8..10], .little));
@@ -1969,7 +1845,7 @@ test "list_links (op=13) with trailing status byte filters within a category" {
     payload[16] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
-    const reply_len = handleListLinks(db, &resp, @intFromEnum(Op.list_links), &payload);
+    const reply_len = handleListLinks(.leading_id, operations.listLinks, db, &resp, @intFromEnum(Op.list_links), &payload);
     try std.testing.expect(reply_len >= RESPONSE_HEADER_SIZE);
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
 
@@ -2004,7 +1880,7 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     payload[16] = @intFromEnum(schema.LinkStatus.pending);
 
     var resp: [8192]u8 = undefined;
-    const reply_len = handleListLinksBySubmitter(db, &resp, @intFromEnum(Op.list_links_by_submitter), &payload);
+    const reply_len = handleListLinks(.leading_id, operations.listLinksBySubmitter, db, &resp, @intFromEnum(Op.list_links_by_submitter), &payload);
     try std.testing.expect(reply_len >= RESPONSE_HEADER_SIZE);
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
 
@@ -2254,7 +2130,7 @@ test "list_all_links with out-of-range status returns invalid" {
     payload[8] = 99;
 
     var resp: [64]u8 = undefined;
-    const reply_len = handleListAllLinks(db, &resp, @intFromEnum(Op.list_all_links), &payload);
+    const reply_len = handleListLinks(.none, operations.listAllLinks, db, &resp, @intFromEnum(Op.list_all_links), &payload);
     try std.testing.expectEqual(@as(usize, RESPONSE_HEADER_SIZE), reply_len);
     try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
 }

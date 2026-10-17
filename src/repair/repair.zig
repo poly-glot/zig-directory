@@ -4,7 +4,8 @@ const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const operations = @import("../operations/operations.zig");
 const operations_slug = @import("../operations/operations_slug.zig");
-const inverted = @import("zigstore").inverted_index;
+const compute = @import("../operations/operations_changeset_compute.zig");
+const apply = @import("../apply/apply.zig");
 const repair_worker = @import("repair_worker.zig");
 
 const log = std.log.scoped(.repair);
@@ -72,8 +73,8 @@ fn rebuildCategoryIndices(db: *Directory) !u64 {
 
     var written: u64 = 0;
     var path_buf: [2048]u8 = undefined;
-    var key_buf: [4096]u8 = undefined;
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    var token_arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer token_arena.deinit();
 
     for (cat_ids.items) |cat_id| {
         const cat = (try operations.getCategory(db, cat_id)) orelse continue;
@@ -81,15 +82,13 @@ fn rebuildCategoryIndices(db: *Directory) !u64 {
 
         const slug = cat.slug.slice();
         if (slug.len > 0) {
-            if (try operations_slug.buildCanonicalSlugPath(db, &cat, &path_buf)) |full_path| {
+            if (try operations_slug.buildSlugPath(db, cat.id, &path_buf)) |full_path| {
                 try db.categories_by_slug_path().insert(full_path, &id_key);
                 written += 1;
 
-                var depth: u32 = 0;
-                for (full_path) |c| {
-                    if (c == '/') depth += 1;
-                }
+                const depth: u32 = @intCast(std.mem.count(u8, full_path, "/"));
                 const owned_slug = try db.allocator.dupe(u8, slug);
+                errdefer db.allocator.free(owned_slug);
                 const gop = try slug_best.getOrPut(owned_slug);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .{ .depth = depth, .cat_id = cat.id };
@@ -102,21 +101,10 @@ fn rebuildCategoryIndices(db: *Directory) !u64 {
             }
         }
 
-        const fields = [_][]const u8{
-            cat.name.slice(),
-            cat.slug.slice(),
-            cat.description.slice(),
-        };
-        for (fields) |field| {
-            var token_iter = inverted.TokenIterator.init(field);
-            while (token_iter.next(&tok_buf)) |tok| {
-                if (tok.len == 0 or tok.len + 8 > key_buf.len) continue;
-                @memcpy(key_buf[0..tok.len], tok);
-                @memcpy(key_buf[tok.len..][0..8], &id_key);
-                try db.categories_index_tree().insert(key_buf[0 .. tok.len + 8], &.{});
-                written += 1;
-            }
-        }
+        _ = token_arena.reset(.retain_capacity);
+        const tokens = try compute.categoryTokens(&cat, token_arena.allocator());
+        try apply.writeTokens(db.categories_index_tree(), tokens, cat.id, .insert);
+        written += tokens.len;
     }
 
     var sit = slug_best.iterator();
@@ -137,29 +125,17 @@ fn rebuildLinkIndex(db: *Directory) !u64 {
     const min_key = codec.encodeU64(0);
     var iter = try db.links_by_id().rangeScan(&min_key, null);
     defer iter.deinit();
-    var key_buf: [4096]u8 = undefined;
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    var token_arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer token_arena.deinit();
 
     while (try iter.next()) |entry| {
         if (entry.value.len != @sizeOf(schema.Link)) continue;
         const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
-        const id_key = codec.encodeU64(link.id);
 
-        const fields = [_][]const u8{
-            link.title.slice(),
-            link.url.slice(),
-            link.description.slice(),
-        };
-        for (fields) |field| {
-            var token_iter = inverted.TokenIterator.init(field);
-            while (token_iter.next(&tok_buf)) |tok| {
-                if (tok.len == 0 or tok.len + 8 > key_buf.len) continue;
-                @memcpy(key_buf[0..tok.len], tok);
-                @memcpy(key_buf[tok.len..][0..8], &id_key);
-                try db.links_index_tree().insert(key_buf[0 .. tok.len + 8], &.{});
-                written += 1;
-            }
-        }
+        _ = token_arena.reset(.retain_capacity);
+        const tokens = try compute.linkTokens(&link, token_arena.allocator());
+        try apply.writeTokens(db.links_index_tree(), tokens, link.id, .insert);
+        written += tokens.len;
     }
 
     return written;

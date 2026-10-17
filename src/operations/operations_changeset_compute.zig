@@ -6,10 +6,12 @@ const changeset = @import("../changeset.zig");
 const inverted = @import("zigstore").inverted_index;
 const category = @import("operations_category.zig");
 const slug_mod = @import("operations_slug.zig");
+const MAX_DEPTH = @import("operations_shared.zig").MAX_DEPTH;
 
 const TokenSource = struct { text: []const u8, field: changeset.TokenField };
 
-fn appendTokens(out: *std.ArrayList(changeset.Token), allocator: std.mem.Allocator, sources: []const TokenSource) !void {
+fn tokenize(sources: []const TokenSource, allocator: std.mem.Allocator) ![]changeset.Token {
+    var out: std.ArrayList(changeset.Token) = .{};
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     for (sources) |f| {
         var iter = inverted.TokenIterator.init(f.text);
@@ -20,6 +22,57 @@ fn appendTokens(out: *std.ArrayList(changeset.Token), allocator: std.mem.Allocat
             });
         }
     }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn categoryTokens(cat: *const schema.Category, allocator: std.mem.Allocator) ![]changeset.Token {
+    return tokenize(&.{
+        .{ .text = cat.name.slice(), .field = .name },
+        .{ .text = cat.slug.slice(), .field = .slug },
+        .{ .text = cat.description.slice(), .field = .desc },
+    }, allocator);
+}
+
+pub fn linkTokens(link: *const schema.Link, allocator: std.mem.Allocator) ![]changeset.Token {
+    return tokenize(&.{
+        .{ .text = link.title.slice(), .field = .title },
+        .{ .text = link.url.slice(), .field = .url },
+        .{ .text = link.description.slice(), .field = .desc },
+    }, allocator);
+}
+
+fn collectAncestorUpdates(
+    db: *Directory,
+    start_id: u64,
+    link_count_subtree_delta: i64,
+    child_count_subtree_delta: i64,
+    allocator: std.mem.Allocator,
+) ![]changeset.AncestorUpdate {
+    var updates: std.ArrayList(changeset.AncestorUpdate) = .{};
+    var current_id = start_id;
+    var depth: usize = 0;
+    while (current_id != 0 and depth < MAX_DEPTH) : (depth += 1) {
+        const ancestor = (try category.getCategory(db, current_id)) orelse break;
+        try updates.append(allocator, .{
+            .cat_id = current_id,
+            .link_count_subtree_delta = link_count_subtree_delta,
+            .child_count_subtree_delta = child_count_subtree_delta,
+        });
+        current_id = ancestor.parent_id;
+    }
+    return updates.toOwnedSlice(allocator);
+}
+
+fn ownSlugPath(db: *Directory, cat: schema.Category, allocator: std.mem.Allocator) ![]const u8 {
+    var path_buf: [2048]u8 = undefined;
+    const path = (try slug_mod.buildSlugPath(db, cat.id, &path_buf)) orelse cat.slug.slice();
+    return allocator.dupe(u8, path);
+}
+
+fn childSlugPath(db: *Directory, parent_id: u64, slug: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    var path_buf: [2048]u8 = undefined;
+    const path = (try slug_mod.composeChildSlugPath(db, parent_id, slug, &path_buf)) orelse slug;
+    return allocator.dupe(u8, path);
 }
 
 pub fn computeCategoryInsertChangeSet(
@@ -27,42 +80,11 @@ pub fn computeCategoryInsertChangeSet(
     cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
-    var current_id = cat.parent_id;
-    var depth: u32 = 0;
-    while (current_id != 0 and depth < 64) : (depth += 1) {
-        const ancestor = (try category.getCategory(db, current_id)) orelse break;
-        try ancestors.append(allocator, .{
-            .cat_id = current_id,
-            .link_count_subtree_delta = 0,
-            .child_count_subtree_delta = 1,
-        });
-        current_id = ancestor.parent_id;
-    }
-
-    var tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&tokens, allocator, &.{
-        .{ .text = cat.name.slice(), .field = .name },
-        .{ .text = cat.slug.slice(), .field = .slug },
-        .{ .text = cat.description.slice(), .field = .desc },
-    });
+    const ancestor_updates = try collectAncestorUpdates(db, cat.parent_id, 0, 1, allocator);
+    const tokens = try categoryTokens(&cat, allocator);
 
     const slug_slice = cat.slug.slice();
-    const slug_path: []const u8 = blk: {
-        if (cat.parent_id == 0) {
-            break :blk try allocator.dupe(u8, slug_slice);
-        }
-        var parent_buf: [2048]u8 = undefined;
-        const parent_path = (try slug_mod.buildSlugPath(db, cat.parent_id, &parent_buf)) orelse {
-            break :blk try allocator.dupe(u8, slug_slice);
-        };
-        const total_len = parent_path.len + 1 + slug_slice.len;
-        const out = try allocator.alloc(u8, total_len);
-        @memcpy(out[0..parent_path.len], parent_path);
-        out[parent_path.len] = '/';
-        @memcpy(out[parent_path.len + 1 ..], slug_slice);
-        break :blk out;
-    };
+    const slug_path = try childSlugPath(db, cat.parent_id, slug_slice, allocator);
 
     const new_depth = std.mem.count(u8, slug_path, "/");
     var existing_id_buf: [16]u8 = undefined;
@@ -82,8 +104,8 @@ pub fn computeCategoryInsertChangeSet(
 
     return changeset.ChangeSet{ .category_inserted = .{
         .cat = cat,
-        .ancestor_updates = try ancestors.toOwnedSlice(allocator),
-        .tokens = try tokens.toOwnedSlice(allocator),
+        .ancestor_updates = ancestor_updates,
+        .tokens = tokens,
         .slug_path = slug_path,
         .is_shallowest_for_slug = is_shallowest_for_slug,
     } };
@@ -94,25 +116,11 @@ pub fn computeCategoryTextUpdateChangeSet(
     new_cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var old_tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&old_tokens, allocator, &.{
-        .{ .text = old_cat.name.slice(), .field = .name },
-        .{ .text = old_cat.slug.slice(), .field = .slug },
-        .{ .text = old_cat.description.slice(), .field = .desc },
-    });
-
-    var new_tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&new_tokens, allocator, &.{
-        .{ .text = new_cat.name.slice(), .field = .name },
-        .{ .text = new_cat.slug.slice(), .field = .slug },
-        .{ .text = new_cat.description.slice(), .field = .desc },
-    });
-
     return changeset.ChangeSet{ .category_text_updated = .{
         .old_cat = old_cat,
         .new_cat = new_cat,
-        .old_tokens = try old_tokens.toOwnedSlice(allocator),
-        .new_tokens = try new_tokens.toOwnedSlice(allocator),
+        .old_tokens = try categoryTokens(&old_cat, allocator),
+        .new_tokens = try categoryTokens(&new_cat, allocator),
     } };
 }
 
@@ -139,11 +147,11 @@ fn collectDescendantSwaps(
     defer stack.deinit(allocator);
     try stack.append(allocator, root_id);
 
+    const children_buf = try allocator.alloc(schema.Category, 256);
     walk: while (stack.pop()) |cur_id| {
-        var children_buf: [256]schema.Category = undefined;
         var offset: u32 = 0;
         while (true) {
-            const children = try category.listChildren(db, cur_id, offset, 256, &children_buf);
+            const children = try category.listChildren(db, cur_id, offset, 256, children_buf);
             if (children.len == 0) break;
             for (children) |child| {
                 descendant_count += 1;
@@ -191,22 +199,8 @@ pub fn computeCategoryRenameChangeSet(
     new_cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var old_buf: [2048]u8 = undefined;
-    const old_path_slice = (try slug_mod.buildSlugPath(db, old_cat.id, &old_buf)) orelse
-        old_cat.slug.slice();
-    const old_path = try allocator.dupe(u8, old_path_slice);
-
-    const new_slug = new_cat.slug.slice();
-    const new_path: []const u8 = blk: {
-        if (new_cat.parent_id == 0) {
-            break :blk try allocator.dupe(u8, new_slug);
-        }
-        var parent_buf: [2048]u8 = undefined;
-        const parent_path = (try slug_mod.buildSlugPath(db, new_cat.parent_id, &parent_buf)) orelse {
-            break :blk try allocator.dupe(u8, new_slug);
-        };
-        break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent_path, new_slug });
-    };
+    const old_path = try ownSlugPath(db, old_cat, allocator);
+    const new_path = try childSlugPath(db, new_cat.parent_id, new_cat.slug.slice(), allocator);
 
     const ds = try collectDescendantSwaps(db, new_cat.id, old_path, new_path, .renamed_slug, allocator);
 
@@ -226,35 +220,12 @@ pub fn computeCategoryDeleteChangeSet(
     cat: schema.Category,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
-    var current_id = cat.parent_id;
-    var depth: u32 = 0;
-    while (current_id != 0 and depth < 64) : (depth += 1) {
-        const ancestor = (try category.getCategory(db, current_id)) orelse break;
-        try ancestors.append(allocator, .{
-            .cat_id = current_id,
-            .link_count_subtree_delta = -@as(i64, @intCast(cat.link_count_subtree)),
-            .child_count_subtree_delta = -1,
-        });
-        current_id = ancestor.parent_id;
-    }
-
-    var tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&tokens, allocator, &.{
-        .{ .text = cat.name.slice(), .field = .name },
-        .{ .text = cat.slug.slice(), .field = .slug },
-        .{ .text = cat.description.slice(), .field = .desc },
-    });
-
-    var path_buf: [2048]u8 = undefined;
-    const path_slice = (try slug_mod.buildSlugPath(db, cat.id, &path_buf)) orelse cat.slug.slice();
-    const slug_path = try allocator.dupe(u8, path_slice);
-
+    const link_delta: i64 = @intCast(cat.link_count_subtree);
     return changeset.ChangeSet{ .category_deleted = .{
         .cat = cat,
-        .ancestor_updates = try ancestors.toOwnedSlice(allocator),
-        .tokens = try tokens.toOwnedSlice(allocator),
-        .slug_path = slug_path,
+        .ancestor_updates = try collectAncestorUpdates(db, cat.parent_id, -link_delta, -1, allocator),
+        .tokens = try categoryTokens(&cat, allocator),
+        .slug_path = try ownSlugPath(db, cat, allocator),
     } };
 }
 
@@ -272,57 +243,14 @@ pub fn computeCategoryMoveChangeSet(
 
     const link_subtree_delta: u64 = cat.link_count_subtree;
     const child_subtree_delta: u32 = cat.child_count_subtree + 1;
+    const link_delta: i64 = @intCast(link_subtree_delta);
+    const child_delta: i64 = @intCast(child_subtree_delta);
 
-    var old_chain: std.ArrayList(changeset.AncestorUpdate) = .{};
-    {
-        var current_id = old_parent_id;
-        var depth: u32 = 0;
-        while (current_id != 0 and depth < 64) : (depth += 1) {
-            const ancestor = (try category.getCategory(db, current_id)) orelse break;
-            try old_chain.append(allocator, .{
-                .cat_id = current_id,
-                .link_count_subtree_delta = -@as(i64, @intCast(link_subtree_delta)),
-                .child_count_subtree_delta = -@as(i64, @intCast(child_subtree_delta)),
-            });
-            current_id = ancestor.parent_id;
-        }
-    }
+    const old_chain = try collectAncestorUpdates(db, old_parent_id, -link_delta, -child_delta, allocator);
+    const new_chain = try collectAncestorUpdates(db, new_parent_id, link_delta, child_delta, allocator);
 
-    var new_chain: std.ArrayList(changeset.AncestorUpdate) = .{};
-    {
-        var current_id = new_parent_id;
-        var depth: u32 = 0;
-        while (current_id != 0 and depth < 64) : (depth += 1) {
-            const ancestor = (try category.getCategory(db, current_id)) orelse break;
-            try new_chain.append(allocator, .{
-                .cat_id = current_id,
-                .link_count_subtree_delta = @as(i64, @intCast(link_subtree_delta)),
-                .child_count_subtree_delta = @as(i64, @intCast(child_subtree_delta)),
-            });
-            current_id = ancestor.parent_id;
-        }
-    }
-
-    var old_buf: [2048]u8 = undefined;
-    const old_path_slice = (try slug_mod.buildSlugPath(db, cat.id, &old_buf)) orelse cat.slug.slice();
-    const old_slug_path = try allocator.dupe(u8, old_path_slice);
-
-    const new_slug = cat.slug.slice();
-    const new_slug_path: []const u8 = blk: {
-        if (new_parent_id == 0) {
-            break :blk try allocator.dupe(u8, new_slug);
-        }
-        var parent_buf: [2048]u8 = undefined;
-        const parent_path = (try slug_mod.buildSlugPath(db, new_parent_id, &parent_buf)) orelse {
-            break :blk try allocator.dupe(u8, new_slug);
-        };
-        const total_len = parent_path.len + 1 + new_slug.len;
-        const out = try allocator.alloc(u8, total_len);
-        @memcpy(out[0..parent_path.len], parent_path);
-        out[parent_path.len] = '/';
-        @memcpy(out[parent_path.len + 1 ..], new_slug);
-        break :blk out;
-    };
+    const old_slug_path = try ownSlugPath(db, cat, allocator);
+    const new_slug_path = try childSlugPath(db, new_parent_id, cat.slug.slice(), allocator);
 
     const ds = try collectDescendantSwaps(db, cat.id, old_slug_path, new_slug_path, .moved_parent, allocator);
 
@@ -330,8 +258,8 @@ pub fn computeCategoryMoveChangeSet(
         .cat = cat_post_move,
         .old_parent_id = old_parent_id,
         .new_parent_id = new_parent_id,
-        .old_chain_updates = try old_chain.toOwnedSlice(allocator),
-        .new_chain_updates = try new_chain.toOwnedSlice(allocator),
+        .old_chain_updates = old_chain,
+        .new_chain_updates = new_chain,
         .old_slug_path = old_slug_path,
         .new_slug_path = new_slug_path,
         .link_subtree_delta = link_subtree_delta,
@@ -347,30 +275,10 @@ pub fn computeLinkInsertChangeSet(
     link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
-    var current_id = link.category_id;
-    var depth: u32 = 0;
-    while (current_id != 0 and depth < 64) : (depth += 1) {
-        const cat = (try category.getCategory(db, current_id)) orelse break;
-        try ancestors.append(allocator, .{
-            .cat_id = current_id,
-            .link_count_subtree_delta = 1,
-            .child_count_subtree_delta = 0,
-        });
-        current_id = cat.parent_id;
-    }
-
-    var tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&tokens, allocator, &.{
-        .{ .text = link.title.slice(), .field = .title },
-        .{ .text = link.url.slice(), .field = .url },
-        .{ .text = link.description.slice(), .field = .desc },
-    });
-
     return changeset.ChangeSet{ .link_inserted = .{
         .link = link,
-        .ancestor_updates = try ancestors.toOwnedSlice(allocator),
-        .tokens = try tokens.toOwnedSlice(allocator),
+        .ancestor_updates = try collectAncestorUpdates(db, link.category_id, 1, 0, allocator),
+        .tokens = try linkTokens(&link, allocator),
     } };
 }
 
@@ -379,25 +287,11 @@ pub fn computeLinkTextUpdateChangeSet(
     new_link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var old_tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&old_tokens, allocator, &.{
-        .{ .text = old_link.title.slice(), .field = .title },
-        .{ .text = old_link.url.slice(), .field = .url },
-        .{ .text = old_link.description.slice(), .field = .desc },
-    });
-
-    var new_tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&new_tokens, allocator, &.{
-        .{ .text = new_link.title.slice(), .field = .title },
-        .{ .text = new_link.url.slice(), .field = .url },
-        .{ .text = new_link.description.slice(), .field = .desc },
-    });
-
     return changeset.ChangeSet{ .link_text_updated = .{
         .old_link = old_link,
         .new_link = new_link,
-        .old_tokens = try old_tokens.toOwnedSlice(allocator),
-        .new_tokens = try new_tokens.toOwnedSlice(allocator),
+        .old_tokens = try linkTokens(&old_link, allocator),
+        .new_tokens = try linkTokens(&new_link, allocator),
     } };
 }
 
@@ -406,30 +300,30 @@ pub fn computeLinkDeleteChangeSet(
     link: schema.Link,
     allocator: std.mem.Allocator,
 ) !changeset.ChangeSet {
-    var ancestors: std.ArrayList(changeset.AncestorUpdate) = .{};
-    var current_id = link.category_id;
-    var depth: u32 = 0;
-    while (current_id != 0 and depth < 64) : (depth += 1) {
-        const cat = (try category.getCategory(db, current_id)) orelse break;
-        try ancestors.append(allocator, .{
-            .cat_id = current_id,
-            .link_count_subtree_delta = -1,
-            .child_count_subtree_delta = 0,
-        });
-        current_id = cat.parent_id;
-    }
-
-    var tokens: std.ArrayList(changeset.Token) = .{};
-    try appendTokens(&tokens, allocator, &.{
-        .{ .text = link.title.slice(), .field = .title },
-        .{ .text = link.url.slice(), .field = .url },
-        .{ .text = link.description.slice(), .field = .desc },
-    });
-
     return changeset.ChangeSet{ .link_deleted = .{
         .link = link,
-        .ancestor_updates = try ancestors.toOwnedSlice(allocator),
-        .tokens = try tokens.toOwnedSlice(allocator),
+        .ancestor_updates = try collectAncestorUpdates(db, link.category_id, -1, 0, allocator),
+        .tokens = try linkTokens(&link, allocator),
+    } };
+}
+
+pub fn computeLinkRecatChangeSet(
+    db: *Directory,
+    link: schema.Link,
+    new_category_id: u64,
+    allocator: std.mem.Allocator,
+) !changeset.ChangeSet {
+    const old_category_id = link.category_id;
+
+    var link_post_move = link;
+    link_post_move.category_id = new_category_id;
+    link_post_move.updated_at = std.time.timestamp();
+
+    return changeset.ChangeSet{ .link_recategorized = .{
+        .link = link_post_move,
+        .old_category_id = old_category_id,
+        .old_chain_updates = try collectAncestorUpdates(db, old_category_id, -1, 0, allocator),
+        .new_chain_updates = try collectAncestorUpdates(db, new_category_id, 1, 0, allocator),
     } };
 }
 
@@ -596,54 +490,4 @@ test "computeCategoryMoveChangeSet: > threshold sets above_threshold + populates
     try std.testing.expect(e.enqueue.seq != 0);
     try std.testing.expectEqualStrings("top/a", e.enqueue.old_slug_prefix);
     try std.testing.expectEqual(schema.RepairOp.moved_parent, e.enqueue.op);
-}
-
-pub fn computeLinkRecatChangeSet(
-    db: *Directory,
-    link: schema.Link,
-    new_category_id: u64,
-    allocator: std.mem.Allocator,
-) !changeset.ChangeSet {
-    const old_category_id = link.category_id;
-
-    var link_post_move = link;
-    link_post_move.category_id = new_category_id;
-    link_post_move.updated_at = std.time.timestamp();
-
-    var old_chain: std.ArrayList(changeset.AncestorUpdate) = .{};
-    {
-        var current_id = old_category_id;
-        var depth: u32 = 0;
-        while (current_id != 0 and depth < 64) : (depth += 1) {
-            const ancestor = (try category.getCategory(db, current_id)) orelse break;
-            try old_chain.append(allocator, .{
-                .cat_id = current_id,
-                .link_count_subtree_delta = -1,
-                .child_count_subtree_delta = 0,
-            });
-            current_id = ancestor.parent_id;
-        }
-    }
-
-    var new_chain: std.ArrayList(changeset.AncestorUpdate) = .{};
-    {
-        var current_id = new_category_id;
-        var depth: u32 = 0;
-        while (current_id != 0 and depth < 64) : (depth += 1) {
-            const ancestor = (try category.getCategory(db, current_id)) orelse break;
-            try new_chain.append(allocator, .{
-                .cat_id = current_id,
-                .link_count_subtree_delta = 1,
-                .child_count_subtree_delta = 0,
-            });
-            current_id = ancestor.parent_id;
-        }
-    }
-
-    return changeset.ChangeSet{ .link_recategorized = .{
-        .link = link_post_move,
-        .old_category_id = old_category_id,
-        .old_chain_updates = try old_chain.toOwnedSlice(allocator),
-        .new_chain_updates = try new_chain.toOwnedSlice(allocator),
-    } };
 }

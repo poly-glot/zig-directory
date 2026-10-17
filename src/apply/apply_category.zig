@@ -4,6 +4,7 @@ const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
 const Directory = @import("../directory.zig").Directory;
 const apply = @import("apply.zig");
+const test_support = @import("../test_support.zig");
 
 pub fn applyCategoryInserted(db: *Directory, e: changeset.CategoryInsertEffect) !void {
     const id_key = codec.encodeU64(e.cat.id);
@@ -150,18 +151,12 @@ test "applyCategoryInserted: writes primary + secondaries + slug paths + tokens 
     const aa = arena.allocator();
 
     const child_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const child_cat = schema.Category{
+    const child_cat = test_support.category(.{
         .id = child_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("Test"),
-        .slug = codec.FixedString(128).fromSlice("test"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "Test",
+        .slug = "test",
+    });
     const ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = top_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
     });
@@ -187,12 +182,7 @@ test "applyCategoryInserted: writes primary + secondaries + slug paths + tokens 
 
     const pc_key = schema.ParentChildKey.encode(.{ top_id, child_id });
     var v_buf: [64]u8 = undefined;
-    const pc_in_mt = db.mt_cat_by_parent().get(&pc_key);
-    const pc_present = switch (pc_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.cat_by_parent().search(&pc_key, &v_buf)) != null,
-    };
+    const pc_present = try test_support.isPresent(db.mt_cat_by_parent(), db.cat_by_parent(), &pc_key);
     try std.testing.expect(pc_present);
 
     const child_id_be = codec.encodeU64(child_id);
@@ -203,9 +193,8 @@ test "applyCategoryInserted: writes primary + secondaries + slug paths + tokens 
     try std.testing.expectEqualSlices(u8, &child_id_be, slug_only_val);
 
     var token_key_buf: [32]u8 = undefined;
-    @memcpy(token_key_buf[0..4], "test");
-    @memcpy(token_key_buf[4..12], &child_id_be);
-    try std.testing.expect((try db.categories_index_tree().search(token_key_buf[0..12], &v_buf)) != null);
+    const token_key = test_support.tokenKey(&token_key_buf, "test", child_id);
+    try std.testing.expect((try db.categories_index_tree().search(token_key, &v_buf)) != null);
 
     const got_top = (try ops.getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u32, 1), got_top.child_count_subtree);
@@ -229,18 +218,12 @@ test "applyCategoryDeleted: reverses category_inserted (primary + secondaries + 
     const aa = arena.allocator();
 
     const child_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const child_cat = schema.Category{
+    const child_cat = test_support.category(.{
         .id = child_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("Test"),
-        .slug = codec.FixedString(128).fromSlice("test"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "Test",
+        .slug = "test",
+    });
     const insert_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = top_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
     });
@@ -275,12 +258,7 @@ test "applyCategoryDeleted: reverses category_inserted (primary + secondaries + 
 
     const pc_key = schema.ParentChildKey.encode(.{ top_id, child_id });
     var v_buf: [64]u8 = undefined;
-    const pc_in_mt = db.mt_cat_by_parent().get(&pc_key);
-    const pc_present = switch (pc_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.cat_by_parent().search(&pc_key, &v_buf)) != null,
-    };
+    const pc_present = try test_support.isPresent(db.mt_cat_by_parent(), db.cat_by_parent(), &pc_key);
     try std.testing.expect(!pc_present);
 
     try std.testing.expect((try db.categories_by_slug_path().search("top/test", &v_buf)) == null);
@@ -288,10 +266,8 @@ test "applyCategoryDeleted: reverses category_inserted (primary + secondaries + 
     try std.testing.expect((try db.categories_by_slug_only().search("test", &v_buf)) == null);
 
     var token_key_buf: [32]u8 = undefined;
-    @memcpy(token_key_buf[0..4], "test");
-    const child_id_be = codec.encodeU64(child_id);
-    @memcpy(token_key_buf[4..12], &child_id_be);
-    try std.testing.expect((try db.categories_index_tree().search(token_key_buf[0..12], &v_buf)) == null);
+    const token_key = test_support.tokenKey(&token_key_buf, "test", child_id);
+    try std.testing.expect((try db.categories_index_tree().search(token_key, &v_buf)) == null);
 
     const got_top = (try ops.getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u32, 0), got_top.child_count_subtree);
@@ -315,18 +291,12 @@ test "applyCategoryTextUpdated: rewrites primary, swaps token entries; slug+coun
     const aa = arena.allocator();
 
     const child_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const child_cat = schema.Category{
+    const child_cat = test_support.category(.{
         .id = child_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("Foo"),
-        .slug = codec.FixedString(128).fromSlice("test"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "Foo",
+        .slug = "test",
+    });
     const insert_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = top_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
     });
@@ -344,28 +314,21 @@ test "applyCategoryTextUpdated: rewrites primary, swaps token entries; slug+coun
     try db.commit(insert_cs);
 
     var v_buf: [64]u8 = undefined;
-    const child_id_be = codec.encodeU64(child_id);
-    var foo_key: [32]u8 = undefined;
-    @memcpy(foo_key[0..3], "foo");
-    @memcpy(foo_key[3..11], &child_id_be);
-    try std.testing.expect((try db.categories_index_tree().search(foo_key[0..11], &v_buf)) != null);
-    var test_key: [32]u8 = undefined;
-    @memcpy(test_key[0..4], "test");
-    @memcpy(test_key[4..12], &child_id_be);
-    try std.testing.expect((try db.categories_index_tree().search(test_key[0..12], &v_buf)) != null);
+    var foo_key_buf: [32]u8 = undefined;
+    const foo_key = test_support.tokenKey(&foo_key_buf, "foo", child_id);
+    try std.testing.expect((try db.categories_index_tree().search(foo_key, &v_buf)) != null);
+    var test_key_buf: [32]u8 = undefined;
+    const test_key = test_support.tokenKey(&test_key_buf, "test", child_id);
+    try std.testing.expect((try db.categories_index_tree().search(test_key, &v_buf)) != null);
 
-    const new_cat = schema.Category{
+    const new_cat = test_support.category(.{
         .id = child_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("Bar"),
-        .slug = codec.FixedString(128).fromSlice("test"),
-        .description = codec.FixedString(1024).fromSlice("New desc"),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
+        .name = "Bar",
+        .slug = "test",
+        .description = "New desc",
         .updated_at = 2000,
-    };
+    });
     const old_tokens = try aa.dupe(changeset.Token, &.{
         .{ .text = try aa.dupe(u8, "foo"), .field = .name },
         .{ .text = try aa.dupe(u8, "test"), .field = .slug },
@@ -387,14 +350,13 @@ test "applyCategoryTextUpdated: rewrites primary, swaps token entries; slug+coun
     try std.testing.expectEqualStrings("New desc", got_child.description.slice());
     try std.testing.expectEqualStrings("test", got_child.slug.slice());
 
-    try std.testing.expect((try db.categories_index_tree().search(foo_key[0..11], &v_buf)) == null);
+    try std.testing.expect((try db.categories_index_tree().search(foo_key, &v_buf)) == null);
 
-    var bar_key: [32]u8 = undefined;
-    @memcpy(bar_key[0..3], "bar");
-    @memcpy(bar_key[3..11], &child_id_be);
-    try std.testing.expect((try db.categories_index_tree().search(bar_key[0..11], &v_buf)) != null);
+    var bar_key_buf: [32]u8 = undefined;
+    const bar_key = test_support.tokenKey(&bar_key_buf, "bar", child_id);
+    try std.testing.expect((try db.categories_index_tree().search(bar_key, &v_buf)) != null);
 
-    try std.testing.expect((try db.categories_index_tree().search(test_key[0..12], &v_buf)) != null);
+    try std.testing.expect((try db.categories_index_tree().search(test_key, &v_buf)) != null);
 
     const got_top = (try ops.getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u32, 1), got_top.child_count_subtree);
@@ -415,18 +377,12 @@ test "applyCategoryRenamed: rewrites self slug paths and rebuilds descendant slu
     const aa = arena.allocator();
 
     const top_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const top_cat = schema.Category{
+    const top_cat = test_support.category(.{
         .id = top_id,
         .parent_id = 0,
-        .name = codec.FixedString(64).fromSlice("Top"),
-        .slug = codec.FixedString(128).fromSlice("top"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "Top",
+        .slug = "top",
+    });
     const top_cs = changeset.ChangeSet{ .category_inserted = .{
         .cat = top_cat,
         .ancestor_updates = &.{},
@@ -437,18 +393,12 @@ test "applyCategoryRenamed: rewrites self slug paths and rebuilds descendant slu
     try db.commit(top_cs);
 
     const c_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const c_cat = schema.Category{
+    const c_cat = test_support.category(.{
         .id = c_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("C"),
-        .slug = codec.FixedString(128).fromSlice("c"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "C",
+        .slug = "c",
+    });
     const c_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = top_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
     });
@@ -462,18 +412,12 @@ test "applyCategoryRenamed: rewrites self slug paths and rebuilds descendant slu
     try db.commit(c_cs);
 
     const d_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const d_cat = schema.Category{
+    const d_cat = test_support.category(.{
         .id = d_id,
         .parent_id = c_id,
-        .name = codec.FixedString(64).fromSlice("D"),
-        .slug = codec.FixedString(128).fromSlice("d"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "D",
+        .slug = "d",
+    });
     const d_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = c_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
         .{ .cat_id = top_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
@@ -488,18 +432,12 @@ test "applyCategoryRenamed: rewrites self slug paths and rebuilds descendant slu
     try db.commit(d_cs);
 
     const e_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const e_cat = schema.Category{
+    const e_cat = test_support.category(.{
         .id = e_id,
         .parent_id = d_id,
-        .name = codec.FixedString(64).fromSlice("E"),
-        .slug = codec.FixedString(128).fromSlice("e"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "E",
+        .slug = "e",
+    });
     const e_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = d_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
         .{ .cat_id = c_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
@@ -522,18 +460,14 @@ test "applyCategoryRenamed: rewrites self slug paths and rebuilds descendant slu
     try std.testing.expectEqualSlices(u8, &d_id_be, (try db.categories_by_slug_path().search("top/c/d", &v_buf)).?);
     try std.testing.expectEqualSlices(u8, &e_id_be, (try db.categories_by_slug_path().search("top/c/d/e", &v_buf)).?);
 
-    const c_renamed = schema.Category{
+    const c_renamed = test_support.category(.{
         .id = c_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("C"),
-        .slug = codec.FixedString(128).fromSlice("newc"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
+        .name = "C",
+        .slug = "newc",
         .child_count = 1,
-        .sort_order = 0,
-        .created_at = 1000,
         .updated_at = 2000,
-    };
+    });
     const rename_swaps = try aa.dupe(changeset.SlugPathSwap, &.{
         .{ .old_path = "top/c/d", .new_path = "top/newc/d", .cat_id = d_id },
         .{ .old_path = "top/c/d/e", .new_path = "top/newc/d/e", .cat_id = e_id },
@@ -579,18 +513,12 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     const aa = arena.allocator();
 
     const top_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const top_cat = schema.Category{
+    const top_cat = test_support.category(.{
         .id = top_id,
         .parent_id = 0,
-        .name = codec.FixedString(64).fromSlice("Top"),
-        .slug = codec.FixedString(128).fromSlice("top"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "Top",
+        .slug = "top",
+    });
     try db.commit(.{ .category_inserted = .{
         .cat = top_cat,
         .ancestor_updates = &.{},
@@ -600,18 +528,12 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     } });
 
     const a_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const a_cat = schema.Category{
+    const a_cat = test_support.category(.{
         .id = a_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("A"),
-        .slug = codec.FixedString(128).fromSlice("a"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "A",
+        .slug = "a",
+    });
     try db.commit(.{ .category_inserted = .{
         .cat = a_cat,
         .ancestor_updates = try aa.dupe(changeset.AncestorUpdate, &.{
@@ -623,18 +545,12 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     } });
 
     const b_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const b_cat = schema.Category{
+    const b_cat = test_support.category(.{
         .id = b_id,
         .parent_id = top_id,
-        .name = codec.FixedString(64).fromSlice("B"),
-        .slug = codec.FixedString(128).fromSlice("b"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "B",
+        .slug = "b",
+    });
     try db.commit(.{ .category_inserted = .{
         .cat = b_cat,
         .ancestor_updates = try aa.dupe(changeset.AncestorUpdate, &.{
@@ -646,18 +562,12 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     } });
 
     const c_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const c_cat = schema.Category{
+    const c_cat = test_support.category(.{
         .id = c_id,
         .parent_id = a_id,
-        .name = codec.FixedString(64).fromSlice("C"),
-        .slug = codec.FixedString(128).fromSlice("c"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "C",
+        .slug = "c",
+    });
     try db.commit(.{ .category_inserted = .{
         .cat = c_cat,
         .ancestor_updates = try aa.dupe(changeset.AncestorUpdate, &.{
@@ -670,18 +580,12 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     } });
 
     const d_id = db.next_category_id.fetchAdd(1, .monotonic);
-    const d_cat = schema.Category{
+    const d_cat = test_support.category(.{
         .id = d_id,
         .parent_id = c_id,
-        .name = codec.FixedString(64).fromSlice("D"),
-        .slug = codec.FixedString(128).fromSlice("d"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
-        .child_count = 0,
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .name = "D",
+        .slug = "d",
+    });
     try db.commit(.{ .category_inserted = .{
         .cat = d_cat,
         .ancestor_updates = try aa.dupe(changeset.AncestorUpdate, &.{
@@ -700,18 +604,14 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     try std.testing.expectEqualSlices(u8, &c_id_be, (try db.categories_by_slug_path().search("top/a/c", &v_buf)).?);
     try std.testing.expectEqualSlices(u8, &d_id_be, (try db.categories_by_slug_path().search("top/a/c/d", &v_buf)).?);
 
-    const c_moved = schema.Category{
+    const c_moved = test_support.category(.{
         .id = c_id,
         .parent_id = b_id,
-        .name = codec.FixedString(64).fromSlice("C"),
-        .slug = codec.FixedString(128).fromSlice("c"),
-        .description = codec.FixedString(1024).fromSlice(""),
-        .link_count = 0,
+        .name = "C",
+        .slug = "c",
         .child_count = 1,
-        .sort_order = 0,
-        .created_at = 1000,
         .updated_at = 2000,
-    };
+    });
     const old_chain = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = a_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = -2 },
         .{ .cat_id = top_id, .link_count_subtree_delta = 0, .child_count_subtree_delta = -2 },
@@ -743,21 +643,11 @@ test "applyCategoryMoved: swaps cat_by_parent + rebuilds slug paths + cascades b
     try std.testing.expectEqual(b_id, got_c.parent_id);
 
     const old_pc_key = schema.ParentChildKey.encode(.{ a_id, c_id });
-    const old_pc_in_mt = db.mt_cat_by_parent().get(&old_pc_key);
-    const old_pc_present = switch (old_pc_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.cat_by_parent().search(&old_pc_key, &v_buf)) != null,
-    };
+    const old_pc_present = try test_support.isPresent(db.mt_cat_by_parent(), db.cat_by_parent(), &old_pc_key);
     try std.testing.expect(!old_pc_present);
 
     const new_pc_key = schema.ParentChildKey.encode(.{ b_id, c_id });
-    const new_pc_in_mt = db.mt_cat_by_parent().get(&new_pc_key);
-    const new_pc_present = switch (new_pc_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.cat_by_parent().search(&new_pc_key, &v_buf)) != null,
-    };
+    const new_pc_present = try test_support.isPresent(db.mt_cat_by_parent(), db.cat_by_parent(), &new_pc_key);
     try std.testing.expect(new_pc_present);
 
     try std.testing.expectEqualSlices(u8, &c_id_be, (try db.categories_by_slug_path().search("top/b/c", &v_buf)).?);

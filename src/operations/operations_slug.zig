@@ -3,7 +3,9 @@ const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const category = @import("operations_category.zig");
-const OperationError = @import("operations_shared.zig").OperationError;
+const shared = @import("operations_shared.zig");
+const OperationError = shared.OperationError;
+const MAX_DEPTH = shared.MAX_DEPTH;
 
 pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
     if (path.len == 0) return null;
@@ -39,9 +41,8 @@ pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
 
     if (db.slug_path_repair_queue().entry_count == 0) return cat_id;
 
-    const cat = (try category.getCategory(db, cat_id)) orelse return null;
     var path_buf: [2048]u8 = undefined;
-    const canonical = (try buildCanonicalSlugPath(db, &cat, &path_buf)) orelse return null;
+    const canonical = (try buildSlugPath(db, cat_id, &path_buf)) orelse return null;
     if (!std.mem.eql(u8, canonical, resolved_path)) return null;
     return cat_id;
 }
@@ -55,7 +56,7 @@ pub fn ensureSlugPathFree(db: *Directory, parent_id: u64, slug: []const u8, own_
     return OperationError.DuplicateSlug;
 }
 
-fn composeChildSlugPath(db: *Directory, parent_id: u64, slug: []const u8, buf: []u8) !?[]const u8 {
+pub fn composeChildSlugPath(db: *Directory, parent_id: u64, slug: []const u8, buf: []u8) !?[]const u8 {
     if (parent_id == 0) {
         if (slug.len > buf.len) return null;
         @memcpy(buf[0..slug.len], slug);
@@ -70,7 +71,7 @@ fn composeChildSlugPath(db: *Directory, parent_id: u64, slug: []const u8, buf: [
 }
 
 pub fn buildSlugPath(db: *Directory, id: u64, buf: []u8) !?[]const u8 {
-    var id_path: [64]u64 = undefined;
+    var id_path: [MAX_DEPTH]u64 = undefined;
     const path_ids = try category.getCategoryPath(db, id, &id_path);
 
     var pos: usize = 0;
@@ -94,27 +95,6 @@ pub fn buildSlugPath(db: *Directory, id: u64, buf: []u8) !?[]const u8 {
     return buf[0..pos];
 }
 
-pub fn buildCanonicalSlugPath(db: *Directory, cat: *const schema.Category, buf: []u8) !?[]const u8 {
-    var id_path: [64]u64 = undefined;
-    const path_ids = try category.getCategoryPath(db, cat.id, &id_path);
-    var pos: usize = 0;
-    for (path_ids, 0..) |cid, i| {
-        const c = if (cid == cat.id) cat.* else (try category.getCategory(db, cid)) orelse return null;
-        const slug = c.slug.slice();
-        if (slug.len == 0) continue;
-        if (i > 0 and pos > 0) {
-            if (pos >= buf.len) return null;
-            buf[pos] = '/';
-            pos += 1;
-        }
-        if (pos + slug.len > buf.len) return null;
-        @memcpy(buf[pos..][0..slug.len], slug);
-        pos += slug.len;
-    }
-    if (pos == 0) return null;
-    return buf[0..pos];
-}
-
 pub fn composeOldDescendantPath(
     db: *Directory,
     old_root_path: []const u8,
@@ -122,7 +102,7 @@ pub fn composeOldDescendantPath(
     descendant_id: u64,
     buf: []u8,
 ) ![]const u8 {
-    var chain: [64]u64 = undefined;
+    var chain: [MAX_DEPTH]u64 = undefined;
     var depth: u32 = 0;
     var cur = descendant_id;
     while (cur != root_id and depth < chain.len) : (depth += 1) {
@@ -182,7 +162,7 @@ test "resolveSlugPath: full path, single-segment fallback, miss" {
     try std.testing.expectEqual(@as(?u64, null), try resolveSlugPath(db, "a/nonexistent"));
 }
 
-test "buildCanonicalSlugPath: composes path from cat + parent chain" {
+test "buildSlugPath: composes path from the parent chain" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -190,9 +170,8 @@ test "buildCanonicalSlugPath: composes path from cat + parent chain" {
     defer db.deinitTestInstance();
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const child_id = try category.createCategory(db, top_id, "Child", "child", "");
-    const child = (try category.getCategory(db, child_id)).?;
     var buf: [1024]u8 = undefined;
-    const path = (try buildCanonicalSlugPath(db, &child, &buf)).?;
+    const path = (try buildSlugPath(db, child_id, &buf)).?;
     try std.testing.expectEqualStrings("top/child", path);
 }
 

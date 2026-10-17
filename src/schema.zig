@@ -1,7 +1,6 @@
 const std = @import("std");
 const codec = @import("zigstore").codec;
 const FixedString = codec.FixedString;
-const Serializable = codec.Serializable;
 const CompositeKey = codec.CompositeKey;
 
 pub const Category = extern struct {
@@ -22,12 +21,6 @@ pub const Category = extern struct {
     child_count_subtree: u32 = 0,
 
     flags: u32 = 0,
-
-    const Ser = Serializable(Category);
-    pub const asBytes = Ser.asBytes;
-    pub const asMutableBytes = Ser.asMutableBytes;
-    pub const toBytes = Ser.toBytes;
-    pub const fromBytes = Ser.fromBytes;
 };
 
 comptime {
@@ -62,12 +55,6 @@ pub const Link = extern struct {
     region: FixedString(8) = .{},
     license: FixedString(64) = .{},
     _pad2: [6]u8 = .{0} ** 6,
-
-    const Ser = Serializable(Link);
-    pub const asBytes = Ser.asBytes;
-    pub const asMutableBytes = Ser.asMutableBytes;
-    pub const toBytes = Ser.toBytes;
-    pub const fromBytes = Ser.fromBytes;
 };
 
 comptime {
@@ -87,12 +74,6 @@ pub const RepairTask = extern struct {
     _pad: [7]u8 = [_]u8{0} ** 7,
     created_at: i64 = 0,
     old_slug_prefix: FixedString(2048) = .{},
-
-    const Ser = Serializable(RepairTask);
-    pub const asBytes = Ser.asBytes;
-    pub const asMutableBytes = Ser.asMutableBytes;
-    pub const toBytes = Ser.toBytes;
-    pub const fromBytes = Ser.fromBytes;
 };
 
 comptime {
@@ -118,38 +99,6 @@ test "CategoryLinkKey encode / decode" {
     try std.testing.expectEqual(@as(u64, 99), decoded.link_id);
 }
 
-test "Serializable Category asBytes roundtrip" {
-    var cat = Category{};
-    cat.id = 42;
-    cat.parent_id = 7;
-    cat.name = FixedString(64).fromSlice("Test Category");
-
-    const bytes = cat.asBytes();
-    try std.testing.expectEqual(@as(usize, @sizeOf(Category)), bytes.len);
-
-    const restored = Category.fromBytes(bytes);
-    try std.testing.expectEqual(@as(u64, 42), restored.id);
-    try std.testing.expectEqual(@as(u64, 7), restored.parent_id);
-    try std.testing.expect(restored.name.eql("Test Category"));
-}
-
-test "Serializable Link toBytes / fromBytes roundtrip" {
-    var link = Link{};
-    link.id = 100;
-    link.category_id = 5;
-    link.url = FixedString(64).fromSlice("https://example.com");
-    link.title = FixedString(128).fromSlice("Example");
-
-    const bytes = link.toBytes();
-    try std.testing.expectEqual(@as(usize, @sizeOf(Link)), bytes.len);
-
-    const restored = Link.fromBytes(&bytes);
-    try std.testing.expectEqual(@as(u64, 100), restored.id);
-    try std.testing.expectEqual(@as(u64, 5), restored.category_id);
-    try std.testing.expect(restored.url.eql("https://example.com"));
-    try std.testing.expect(restored.title.eql("Example"));
-}
-
 test "Link defaults: status=approved, submitter_id=0, padding=zero" {
     const link = Link{};
     try std.testing.expectEqual(@as(u8, @intFromEnum(LinkStatus.approved)), link.status);
@@ -170,8 +119,8 @@ test "Link round-trip preserves status + submitter_id" {
     link.status = @intFromEnum(LinkStatus.pending);
     link.submitter_id = 314;
 
-    const bytes = link.toBytes();
-    const restored = Link.fromBytes(&bytes);
+    const bytes = std.mem.toBytes(link);
+    const restored = std.mem.bytesToValue(Link, &bytes);
     try std.testing.expectEqual(@as(u8, @intFromEnum(LinkStatus.pending)), restored.status);
     try std.testing.expectEqual(@as(u64, 314), restored.submitter_id);
 }
@@ -196,8 +145,8 @@ test "Link v6 round-trip preserves all new fields" {
     link.region = FixedString(8).fromSlice("US");
     link.license = FixedString(64).fromSlice("CC BY-NC 4.0");
 
-    const bytes = link.toBytes();
-    const restored = Link.fromBytes(&bytes);
+    const bytes = std.mem.toBytes(link);
+    const restored = std.mem.bytesToValue(Link, &bytes);
     try std.testing.expect(restored.editor_note.eql(
         "Indexed by M. Vargas on 2026-05-09; archive flagged.",
     ));
@@ -205,14 +154,6 @@ test "Link v6 round-trip preserves all new fields" {
     try std.testing.expect(restored.language.eql("en-US"));
     try std.testing.expect(restored.region.eql("US"));
     try std.testing.expect(restored.license.eql("CC BY-NC 4.0"));
-}
-
-test "Serializable asBytes matches std.mem.asBytes" {
-    var cat = Category{};
-    cat.id = 123;
-    const via_mixin = cat.asBytes();
-    const via_std = std.mem.asBytes(&cat);
-    try std.testing.expectEqualSlices(u8, via_std, via_mixin);
 }
 
 test "RepairTask: extern layout is exactly 2080 bytes" {

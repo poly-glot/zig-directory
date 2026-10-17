@@ -2,40 +2,16 @@ const std = @import("std");
 const testing = std.testing;
 
 const Directory = @import("directory.zig").Directory;
-const Config = @import("main.zig").Config;
 const ops = @import("operations/operations.zig");
 const zigstore = @import("zigstore");
 const schema = @import("schema.zig");
 
-fn testConfig(dir: []const u8) Config {
-    return Config{
-        .data_dir = dir,
-        .server = .{
-            .port = 0,
-            .cache_size_mb = 1,
-            .thread_count = 1,
-            .snapshot_interval_s = 3600,
-            .wal_sync_interval_ms = 50,
-            .wal_batch_size = 32,
-        },
-    };
-}
-
-fn initTestDb(dir: []const u8) !*Directory {
-    return Directory.init(testing.allocator, testConfig(dir));
-}
-
-fn cleanupTestDir(dir: []const u8) void {
-    std.fs.deleteTreeAbsolute(dir) catch {};
-}
-
 test "E2E: database init creates valid file" {
-    const dir = "/tmp/e2e_db_init";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     try testing.expectEqual(@as(u32, 0x444D4F5A), db.store.header.magic);
     try testing.expectEqual(@import("directory.zig").schema.format_version, db.store.header.format_version);
@@ -47,12 +23,11 @@ test "E2E: database init creates valid file" {
 }
 
 test "E2E: create and retrieve categories" {
-    const dir = "/tmp/e2e_cat_crud";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const cat1_id = try ops.createCategory(db, 0, "Computers", "computers", "Computer-related topics");
     try testing.expect(cat1_id > 0);
@@ -75,12 +50,11 @@ test "E2E: create and retrieve categories" {
 }
 
 test "E2E: create and retrieve links" {
-    const dir = "/tmp/e2e_link_crud";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const cat_id = try ops.createCategory(db, 0, "Zig", "zig", "Zig programming");
 
@@ -101,12 +75,11 @@ test "E2E: create and retrieve links" {
 }
 
 test "E2E: update category" {
-    const dir = "/tmp/e2e_cat_update";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const cat_id = try ops.createCategory(db, 0, "Original", "original", "Original description");
     try ops.updateCategory(db, cat_id, "Updated Name", "updated-slug", "New description");
@@ -118,12 +91,11 @@ test "E2E: update category" {
 }
 
 test "E2E: update link" {
-    const dir = "/tmp/e2e_link_update";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const cat_id = try ops.createCategory(db, 0, "Test", "test", "");
     const link_id = try ops.createLink(db, cat_id, "https://old.com", "Old Title", "Old desc");
@@ -136,12 +108,11 @@ test "E2E: update link" {
 }
 
 test "E2E: delete category rejects when it has children" {
-    const dir = "/tmp/e2e_cat_delete";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const parent_id = try ops.createCategory(db, 0, "Parent", "parent", "");
     const child_id = try ops.createCategory(db, parent_id, "Child", "child", "");
@@ -164,12 +135,11 @@ test "E2E: delete category rejects when it has children" {
 }
 
 test "E2E: delete link updates category count" {
-    const dir = "/tmp/e2e_link_delete";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const cat_id = try ops.createCategory(db, 0, "Test", "test", "");
     const link_id = try ops.createLink(db, cat_id, "https://example.com", "Example", "");
@@ -185,12 +155,11 @@ test "E2E: delete link updates category count" {
 }
 
 test "E2E: move category with circular hierarchy prevention" {
-    const dir = "/tmp/e2e_cat_move";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const a = try ops.createCategory(db, 0, "A", "a", "");
     const b = try ops.createCategory(db, a, "B", "b", "");
@@ -209,12 +178,11 @@ test "E2E: move category with circular hierarchy prevention" {
 }
 
 test "E2E: listChildren with pagination" {
-    const dir = "/tmp/e2e_list_children";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const parent = try ops.createCategory(db, 0, "Parent", "parent", "");
     for (0..10) |i| {
@@ -235,12 +203,11 @@ test "E2E: listChildren with pagination" {
 }
 
 test "E2E: listLinks with pagination" {
-    const dir = "/tmp/e2e_list_links";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const cat = try ops.createCategory(db, 0, "Links", "links", "");
     for (0..8) |i| {
@@ -260,12 +227,11 @@ test "E2E: listLinks with pagination" {
 }
 
 test "E2E: getCategoryPath" {
-    const dir = "/tmp/e2e_cat_path";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const a = try ops.createCategory(db, 0, "A", "a", "");
     const b = try ops.createCategory(db, a, "B", "b", "");
@@ -281,12 +247,11 @@ test "E2E: getCategoryPath" {
 }
 
 test "E2E: search categories and links" {
-    const dir = "/tmp/e2e_search";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     _ = try ops.createCategory(db, 0, "Zig Programming", "zig", "The Zig language");
     _ = try ops.createCategory(db, 0, "Rust Programming", "rust", "The Rust language");
@@ -309,15 +274,13 @@ test "E2E: search categories and links" {
 }
 
 test "E2E: snapshot create and load meta" {
-    const dir = "/tmp/e2e_snapshot";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    std.fs.makeDirAbsolute(dir) catch {};
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
-
+    const dir = db.config.data_dir;
     var snap_mgr = zigstore.snapshot.SnapshotManager.init(dir, 3600);
     try snap_mgr.createSnapshot(db.store.snapshotHost(), 42);
 
@@ -330,25 +293,24 @@ test "E2E: snapshot create and load meta" {
 }
 
 test "E2E: data persists across database close and reopen" {
-    const dir = "/tmp/e2e_persist";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     var cat_id: u64 = undefined;
     var link_id: u64 = undefined;
 
     {
-        var db = try initTestDb(dir);
+        var db = try Directory.openTestInstance(testing.allocator, &tmp);
         cat_id = try ops.createCategory(db, 0, "Persistent", "persistent", "This should survive restart");
         link_id = try ops.createLink(db, cat_id, "https://persist.com", "Persist Link", "Persistent link");
         try db.flushHeader();
         try db.store.cache.flushAll();
-        db.deinit();
+        db.deinitTestInstance();
     }
 
     {
-        var db = try initTestDb(dir);
-        defer db.deinit();
+        var db = try Directory.openTestInstance(testing.allocator, &tmp);
+        defer db.deinitTestInstance();
 
         const cat = try ops.getCategory(db, cat_id);
         try testing.expect(cat != null);
@@ -366,24 +328,22 @@ test "E2E: data persists across database close and reopen" {
 }
 
 test "E2E: error handling - create link in nonexistent category" {
-    const dir = "/tmp/e2e_error_link_nocat";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const result = ops.createLink(db, 99999, "https://example.com", "Test", "");
     try testing.expectError(ops.OperationError.CategoryNotFound, result);
 }
 
 test "E2E: full DMOZ workflow - create hierarchy, browse, search" {
-    const dir = "/tmp/e2e_full_workflow";
-    cleanupTestDir(dir);
-    defer cleanupTestDir(dir);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var db = try initTestDb(dir);
-    defer db.deinit();
+    var db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
 
     const computers = try ops.createCategory(db, 0, "Computers", "Computers", "Computer topics");
     const programming = try ops.createCategory(db, computers, "Programming", "Programming", "Programming topics");

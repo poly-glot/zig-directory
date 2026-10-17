@@ -195,21 +195,6 @@ fn treeNonEmpty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
     return (try iter.next()) != null;
 }
 
-fn collectAllChildIds(db: *Directory, parent_id: u64) ![]u64 {
-    const ops = @import("operations/operations.zig");
-    var ids: std.ArrayListUnmanaged(u64) = .{};
-    errdefer ids.deinit(db.allocator);
-    var buf: [4096]schema.Category = undefined;
-    var offset: u32 = 0;
-    while (true) {
-        const children = try ops.listChildren(db, parent_id, offset, buf.len, &buf);
-        for (children) |c| try ids.append(db.allocator, c.id);
-        if (children.len < buf.len) break;
-        offset +|= @intCast(children.len);
-    }
-    return ids.toOwnedSlice(db.allocator);
-}
-
 fn countTops(db: *Directory) !u64 {
     const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id().rangeScan(&min_key, null);
@@ -269,95 +254,21 @@ fn countLinksWithMissingCategory(db: *Directory) !u64 {
     return orphans;
 }
 
-const SubtreeComputed = struct { link_subtree: u64, child_subtree: u32 };
+fn countSubtreeDrift(db: *Directory) !u64 {
+    const ops = @import("operations/operations.zig");
+    var counts = try ops.computeCategoryCounts(db);
+    defer counts.deinit();
 
-fn findTopId(db: *Directory) !u64 {
+    var drift: u64 = 0;
     const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id().rangeScan(&min_key, null);
     defer iter.deinit();
     while (try iter.next()) |entry| {
         if (entry.value.len < @sizeOf(schema.Category)) continue;
         const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
-        if (cat.parent_id == 0) return cat.id;
-    }
-    return 0;
-}
-
-fn tallyDirectLinks(db: *Directory) !std.AutoHashMap(u64, u32) {
-    var direct_links = std.AutoHashMap(u64, u32).init(db.allocator);
-    errdefer direct_links.deinit();
-    const min_key: [16]u8 = .{0} ** 16;
-    var iter = try db.link_by_category().rangeScan(&min_key, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
-        if (entry.key.len < 8) continue;
-        const cid = codec.decodeU64(entry.key[0..8]);
-        const gop = try direct_links.getOrPut(cid);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* +|= 1;
-    }
-    return direct_links;
-}
-
-fn computeSubtreeAggregates(
-    db: *Directory,
-    top_id: u64,
-    direct_links: *const std.AutoHashMap(u64, u32),
-) !std.AutoHashMap(u64, SubtreeComputed) {
-    var computed = std.AutoHashMap(u64, SubtreeComputed).init(db.allocator);
-    errdefer computed.deinit();
-
-    const StackFrame = struct { id: u64, expanded: bool };
-    var stack = std.ArrayList(StackFrame){};
-    defer stack.deinit(db.allocator);
-    try stack.append(db.allocator, .{ .id = top_id, .expanded = false });
-
-    while (stack.items.len > 0) {
-        const top = stack.items[stack.items.len - 1];
-        if (!top.expanded) {
-            stack.items[stack.items.len - 1].expanded = true;
-            const child_ids = try collectAllChildIds(db, top.id);
-            defer db.allocator.free(child_ids);
-            for (child_ids) |cid| {
-                try stack.append(db.allocator, .{ .id = cid, .expanded = false });
-            }
-            continue;
-        }
-        _ = stack.pop();
-
-        const direct = direct_links.get(top.id) orelse 0;
-        var sub_links: u64 = direct;
-        var sub_children: u32 = 0;
-        const child_ids = try collectAllChildIds(db, top.id);
-        defer db.allocator.free(child_ids);
-        for (child_ids) |cid| {
-            const c_comp = computed.get(cid) orelse SubtreeComputed{ .link_subtree = 0, .child_subtree = 0 };
-            sub_links += c_comp.link_subtree;
-            sub_children += 1 + c_comp.child_subtree;
-        }
-        try computed.put(top.id, .{ .link_subtree = sub_links, .child_subtree = sub_children });
-    }
-    return computed;
-}
-
-fn countSubtreeDrift(db: *Directory) !u64 {
-    const ops = @import("operations/operations.zig");
-
-    const top_id = try findTopId(db);
-    if (top_id == 0) return 0;
-
-    var direct_links = try tallyDirectLinks(db);
-    defer direct_links.deinit();
-
-    var computed = try computeSubtreeAggregates(db, top_id, &direct_links);
-    defer computed.deinit();
-
-    var drift: u64 = 0;
-    var it = computed.iterator();
-    while (it.next()) |kv| {
-        const cat = (try ops.getCategory(db, kv.key_ptr.*)) orelse continue;
-        if (cat.link_count_subtree != kv.value_ptr.link_subtree or
-            cat.child_count_subtree != kv.value_ptr.child_subtree)
+        const want = counts.expectedFor(cat.id);
+        if (cat.link_count_subtree != want.link_count_subtree or
+            cat.child_count_subtree != want.child_count_subtree)
         {
             drift += 1;
         }

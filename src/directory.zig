@@ -40,9 +40,11 @@ pub const Stats = struct {
     page_count: u32 = 0,
     cache_hits: u64 = 0,
     cache_misses: u64 = 0,
-    cache_hit_rate: f64 = 0.0,
     wal_pending_batch_entries: u64 = 0,
 };
+
+pub const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
+const MEMTABLE_FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
 
 pub const Directory = struct {
     allocator: std.mem.Allocator,
@@ -190,7 +192,7 @@ pub const Directory = struct {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        var url_bloom = try zigstore.BloomFilter.init(allocator, 1_000_000);
+        var url_bloom = try zigstore.BloomFilter.init(allocator, URL_BLOOM_INITIAL_CAPACITY);
         errdefer url_bloom.deinit();
 
         const op_latency = blk: {
@@ -238,7 +240,7 @@ pub const Directory = struct {
 
     pub fn startBackgroundThreads(self: *Self) void {
         self.mt_flusher = self.store.spawnWorker(self, .{
-            .interval_ns = 5 * std.time.ns_per_ms,
+            .interval_ns = MEMTABLE_FLUSH_INTERVAL_NS,
             .tick = &flushTick,
         }) catch blk: {
             log.warn("Memtable flusher thread failed to start", .{});
@@ -288,10 +290,6 @@ pub const Directory = struct {
             log.err("changeset apply failed after its WAL append: {} — aborting so recovery replays it whole", .{err});
             @panic("changeset apply failed after WAL append");
         };
-    }
-
-    pub fn signalMemtableFlusher(self: *Self) void {
-        self.drainAllMemtables();
     }
 
     pub fn drainAllMemtables(self: *Self) void {
@@ -475,11 +473,6 @@ pub const Directory = struct {
 
         const hits = self.store.cache.hit_count.load(.monotonic);
         const misses = self.store.cache.miss_count.load(.monotonic);
-        const cache_total = hits + misses;
-        const hit_rate: f64 = if (cache_total > 0)
-            @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(cache_total))
-        else
-            0.0;
 
         const cat_count = self.categories_by_id().entryCount();
         const link_count = self.links_by_id().entryCount();
@@ -501,7 +494,6 @@ pub const Directory = struct {
             .page_count = pg_count,
             .cache_hits = hits,
             .cache_misses = misses,
-            .cache_hit_rate = hit_rate,
             .wal_pending_batch_entries = wal_pending,
         };
     }

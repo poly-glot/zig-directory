@@ -10,8 +10,6 @@ const SeedOpts = struct {
     server_cmd: ?[]const u8 = null,
 };
 
-const HEADER_SIZE = common.HEADER_SIZE;
-
 pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var leftovers: std.ArrayList([]const u8) = .{};
     defer leftovers.deinit(allocator);
@@ -27,7 +25,7 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     defer argv_storage.deinit(allocator);
 
     if (seed_opts.server_cmd) |cmd| {
-        try ensureDir(seed_opts.data_dir);
+        try common.ensureDir(seed_opts.data_dir);
         try tokenize(cmd, &argv_storage, allocator);
         if (argv_storage.items.len == 0) return error.EmptyServerCmd;
 
@@ -51,14 +49,14 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
 
     const stream_fd = try connectWithRetry(common_opts.connect_host, common_opts.port, 5_000);
     defer posix.close(stream_fd);
-    try ping(stream_fd);
+    try common.ping(stream_fd);
 
     const level_sizes = try planLevels(allocator, seed_opts.categories, seed_opts.depth);
     defer allocator.free(level_sizes);
 
     const t_start = std.time.nanoTimestamp();
 
-    var resp_buf = try allocator.alloc(u8, 1 << 20);
+    const resp_buf = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(resp_buf);
     const req_buf = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(req_buf);
@@ -88,7 +86,7 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
             var slug_buf: [32]u8 = undefined;
             const name = try std.fmt.bufPrint(&name_buf, "C{d}", .{cat_counter});
             const slug = try std.fmt.bufPrint(&slug_buf, "c{d}", .{cat_counter});
-            ids[i] = try createCategory(stream_fd, req_buf, resp_buf, parent_id, name, slug, "");
+            ids[i] = try common.createCategory(stream_fd, req_buf, resp_buf, parent_id, name, slug, "");
         }
     }
 
@@ -97,90 +95,26 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const cat_id_max: u64 = level_ids[seed_opts.depth - 1][level_ids[seed_opts.depth - 1].len - 1];
 
     const leaves = level_ids[seed_opts.depth - 1];
-    const BATCH: usize = 100;
-    var link_counter: u64 = 0;
-    var link_id_min: u64 = 0;
-    var link_id_max: u64 = 0;
+    const link_ids = try common.createLinksRoundRobin(stream_fd, req_buf, resp_buf, leaves, seed_opts.links);
 
-    while (link_counter < seed_opts.links) {
-        const remaining = seed_opts.links - link_counter;
-        const batch = @min(@as(u64, BATCH), remaining);
-        var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.create_link));
-
-        var bi: u64 = 0;
-        while (bi < batch) : (bi += 1) {
-            const idx: u64 = link_counter + bi + 1;
-            const cat_id = leaves[@intCast((link_counter + bi) % leaves.len)];
-            var url_buf: [64]u8 = undefined;
-            var title_buf: [32]u8 = undefined;
-            const url = try std.fmt.bufPrint(&url_buf, "https://b{d}.t", .{idx});
-            const title = try std.fmt.bufPrint(&title_buf, "L{d}", .{idx});
-            fb.writeU64(cat_id);
-            fb.writeU16LenPrefixed(url);
-            fb.writeU16LenPrefixed(title);
-            fb.writeU16LenPrefixed("");
-        }
-        const frame = fb.finalize(@intCast(batch));
-        const resp_len = try common.sendAndReceive(stream_fd, frame, resp_buf);
-        try checkBatchResponse(resp_buf[0..resp_len], @intCast(batch), &link_id_min, &link_id_max);
-
-        link_counter += batch;
-    }
-
-    const t_end = std.time.nanoTimestamp();
-    const duration_ns: u64 = @intCast(t_end - t_start);
-    const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
+    var bench = common.Run.init(allocator, common_opts);
+    bench.duration_ms = common.elapsedMs(t_start);
 
     var paths_arena = std.heap.ArenaAllocator.init(allocator);
     defer paths_arena.deinit();
     const sample_paths = try buildSamplePaths(paths_arena.allocator(), level_ids, seed_opts.depth);
 
-    try writeSeedJson(allocator, seed_opts, total_cats, cat_id_min, cat_id_max, link_id_min, link_id_max, leaves, sample_paths);
+    try writeSeedJson(allocator, seed_opts, total_cats, cat_id_min, cat_id_max, link_ids, leaves, sample_paths);
 
-    const ops_total: u64 = @as(u64, total_cats) + seed_opts.links;
-    const ops_per_sec: u64 = if (duration_ms > 0) ops_total * 1000 / duration_ms else 0;
-
-    const rss_stats: common.RssStats = if (maybe_child != null and common_opts.rss_sample_ms > 0)
-        .{ .peak = rss.peak.load(.monotonic), .final = rss.final.load(.monotonic), .note = null }
-    else
-        .{ .peak = 0, .final = 0, .note = "rss_unavailable" };
-
-    const host = std.posix.getenv("HOSTNAME") orelse "unknown";
-    const git_rev: []const u8 = common_opts.git_rev orelse "unknown";
-
-    const record = common.BenchRecord{
-        .ts = std.time.milliTimestamp(),
-        .host = host,
-        .git_rev = git_rev,
-        .profile = common_opts.profile,
-        .workload = "seed",
-        .params = .{ .seed = .{
-            .categories = seed_opts.categories,
-            .links = seed_opts.links,
-            .depth = seed_opts.depth,
-        } },
-        .duration_ms = duration_ms,
-        .ops_total = ops_total,
-        .ops_per_sec = ops_per_sec,
-        .latency_ns = .{ .p50 = 0, .p95 = 0, .p99 = 0, .p99_9 = 0, .max = 0, .mean = 0, .samples = 0 },
-        .rss_bytes = rss_stats,
-        .errors = .{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 },
-    };
-
-    if (common_opts.output_path) |path| {
-        var w = try common.JsonLineWriter.open(path);
-        defer w.close();
-        try w.appendRecord(record);
-    } else {
-        const json = try std.json.Stringify.valueAlloc(allocator, record, .{});
-        defer allocator.free(json);
-        var stdout_buf: [4096]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-        const w = &stdout_writer.interface;
-        try w.writeAll(json);
-        try w.writeAll("\n");
-        try w.flush();
+    if (maybe_child != null and common_opts.rss_sample_ms > 0) {
+        bench.rss = .{ .peak = rss.peak.load(.monotonic), .final = rss.final.load(.monotonic), .note = null };
     }
+
+    try bench.emit("seed", .{ .seed = .{
+        .categories = seed_opts.categories,
+        .links = seed_opts.links,
+        .depth = seed_opts.depth,
+    } }, @as(u64, total_cats) + seed_opts.links);
 }
 
 fn parseSeedOpts(leftovers: []const []const u8) !SeedOpts {
@@ -221,40 +155,15 @@ fn tokenize(s: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.A
     while (it.next()) |tok| try out.append(allocator, tok);
 }
 
-fn ensureDir(path: []const u8) !void {
-    std.fs.cwd().makePath(path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-}
-
 fn connectWithRetry(host: []const u8, port: u16, total_timeout_ms: u64) !i32 {
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(total_timeout_ms));
     var backoff_ms: u64 = 50;
     while (true) {
-        if (tcpConnect(host, port)) |fd| return fd else |_| {}
+        if (common.tcpConnect(host, port)) |fd| return fd else |_| {}
         if (std.time.milliTimestamp() >= deadline) return error.ConnectTimeout;
         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
         backoff_ms = @min(backoff_ms * 2, 800);
     }
-}
-
-fn tcpConnect(host: []const u8, port: u16) !i32 {
-    const addr = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &addr.any, addr.getOsSockLen());
-    return fd;
-}
-
-fn ping(stream_fd: i32) !void {
-    var req: [HEADER_SIZE]u8 = undefined;
-    var fb = common.FrameBuilder.init(&req, 255);
-    const frame = fb.finalize(0);
-    var resp_buf: [64]u8 = undefined;
-    const n = try common.sendAndReceive(stream_fd, frame, &resp_buf);
-    if (n < common.RESPONSE_HEADER_SIZE) return error.ProtocolError;
-    if (resp_buf[5] != 0) return error.PingFailed;
 }
 
 fn planLevels(allocator: std.mem.Allocator, total: u32, depth: u32) ![]u32 {
@@ -284,65 +193,6 @@ fn planLevels(allocator: std.mem.Allocator, total: u32, depth: u32) ![]u32 {
         sizes[depth - 1] = total - running;
     }
     return sizes;
-}
-
-const Op = enum(u8) {
-    create_link = 1,
-    create_category = 2,
-    ping = 255,
-};
-
-const Status = enum(u8) {
-    ok = 0,
-};
-
-fn createCategory(
-    stream_fd: i32,
-    req_buf: []u8,
-    resp_buf: []u8,
-    parent_id: u64,
-    name: []const u8,
-    slug: []const u8,
-    desc: []const u8,
-) !u64 {
-    var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.create_category));
-    fb.writeU64(parent_id);
-    fb.writeU16LenPrefixed(name);
-    fb.writeU16LenPrefixed(slug);
-    fb.writeU16LenPrefixed(desc);
-    const frame = fb.finalize(1);
-    const resp_len = try common.sendAndReceive(stream_fd, frame, resp_buf);
-    if (resp_len < common.RESPONSE_HEADER_SIZE + 10) return error.ProtocolError;
-    if (resp_buf[5] != @intFromEnum(Status.ok)) {
-        std.debug.print("create_category failed: server status={d} sub={d}\n", .{ resp_buf[5], resp_buf[6] });
-        return error.CreateCategoryFailed;
-    }
-    const item_status = resp_buf[common.RESPONSE_HEADER_SIZE];
-    if (item_status != @intFromEnum(Status.ok)) {
-        const item_sub = resp_buf[common.RESPONSE_HEADER_SIZE + 1];
-        std.debug.print("create_category item failed: status={d} sub={d}\n", .{ item_status, item_sub });
-        return error.CreateCategoryFailed;
-    }
-    return std.mem.readInt(u64, resp_buf[common.RESPONSE_HEADER_SIZE + 2 ..][0..8], .little);
-}
-
-fn checkBatchResponse(resp: []const u8, expected_count: u16, id_min: *u64, id_max: *u64) !void {
-    if (resp.len < common.RESPONSE_HEADER_SIZE) return error.ProtocolError;
-    if (resp[5] != @intFromEnum(Status.ok)) return error.ProtocolError;
-    const count = std.mem.readInt(u16, resp[8..10], .little);
-    if (count != expected_count) return error.ProtocolError;
-    var off: usize = common.RESPONSE_HEADER_SIZE;
-    const ITEM_BYTES: usize = 10;
-    var i: u16 = 0;
-    while (i < count) : (i += 1) {
-        if (off + ITEM_BYTES > resp.len) return error.ProtocolError;
-        const status = resp[off];
-        if (status != @intFromEnum(Status.ok)) return error.BatchItemFailed;
-        const id = std.mem.readInt(u64, resp[off + 2 ..][0..8], .little);
-        if (id_min.* == 0 or id < id_min.*) id_min.* = id;
-        if (id > id_max.*) id_max.* = id;
-        off += ITEM_BYTES;
-    }
 }
 
 fn buildSamplePaths(
@@ -402,13 +252,12 @@ fn writeSeedJson(
     user_categories: u32,
     cat_id_min: u64,
     cat_id_max: u64,
-    link_id_min: u64,
-    link_id_max: u64,
+    link_ids: common.IdRange,
     leaves: []const u64,
     sample_paths: []const []const u8,
 ) !void {
-    try ensureDir(opts.data_dir);
-    const path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
+    try common.ensureDir(opts.data_dir);
+    const path = try common.seedPath(allocator, opts.data_dir);
     defer allocator.free(path);
 
     const SeedJson = struct {
@@ -434,8 +283,8 @@ fn writeSeedJson(
         .depth = opts.depth,
         .category_id_min = cat_id_min,
         .category_id_max = cat_id_max,
-        .link_id_min = link_id_min,
-        .link_id_max = link_id_max,
+        .link_id_min = link_ids.min,
+        .link_id_max = link_ids.max,
         .leaf_category_ids = leaves,
         .sample_paths = sample_paths,
         .sample_query_tokens = &tokens,
