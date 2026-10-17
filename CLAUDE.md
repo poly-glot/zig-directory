@@ -32,7 +32,7 @@ The web stack version lives in **`web/deno.json`**. Docs and rules describe it; 
 ## Knowledge hierarchy
 
 - **Durable canon:** this file and `.claude/rules/`, version-controlled and inherited by subagents.
-- **Session and project state:** `memory.md`, `docs/superpowers/` specs and plans.
+- **Session and project state:** `memory.md`, `docs/plans/`.
 - **Scratch:** home-dir auto-memory. Capture a lesson there, then *promote* it into a rule here. It isn't shared, so don't rely on it.
 
 ## Communication

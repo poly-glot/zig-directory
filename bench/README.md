@@ -5,8 +5,8 @@ Multi-workload benchmark client emitting **JSON Lines** with p50 / p95 / p99 / p
 ## Quick start
 
 ```bash
-# 1. Build (ReleaseFast)
-zig build -Doptimize=ReleaseFast
+# 1. Build the server plus the tools (bench is always compiled ReleaseFast)
+zig build -Dtools=true
 
 # 2. Start dmozdb with a fresh data dir
 mkdir -p /tmp/bench-data
@@ -35,21 +35,26 @@ jq '.workload, .latency_ns' /tmp/bench.jsonl
 kill $SERVER_PID
 ```
 
+A plain `zig build` produces only `dmozdb`; `bench` and `dmoz_import` exist only after `zig build -Dtools=true`.
+
 ## Subcommands
 
-| Subcommand | Purpose |
-|---|---|
-| `bench seed` | Populate a deterministic category tree + link fixture; write `seed.json` sidecar |
-| `bench create_link` | Write hammer (existing legacy workload, with percentiles) |
-| `bench get_link` | Random point reads against `links_by_id` |
-| `bench browse --kind {path\|children\|subtree-links}` | Hierarchy traversal (op 11 / 12 / 17) |
-| `bench search --target {links\|categories}` | Token search via `links_index_tree` / `categories_index_tree` |
-| `bench mixed --read-pct PCT` | Mixed RW with configurable split (use 80 / 50 / 20 by convention) |
-| `bench cold --kind {cache\|boot}` | Spawn-server-aware cold-cache or cold-boot timing |
+| Subcommand                                             | Purpose                                                                  |
+|--------------------------------------------------------|--------------------------------------------------------------------------|
+| `bench seed`                                           | Populate a deterministic category tree + link fixture; write `seed.json` sidecar |
+| `bench create_link`                                    | Write hammer via op 1, `--batch` items per frame                         |
+| `bench bulk_import`                                    | Stream links via op 24 in `--batch-size` chunks until `--count` is reached |
+| `bench get_link`                                       | Random point reads against `links_by_id` (op 3)                          |
+| `bench browse --kind {path\|children\|subtree-links}`  | Hierarchy traversal (op 11 / 12 / 17)                                    |
+| `bench search --target {links\|categories}`            | Token search via `links_index_tree` / `categories_index_tree` (op 14)    |
+| `bench mixed --read-pct PCT`                           | Mixed `get_link` / `create_link` with configurable split (use 80 / 50 / 20 by convention) |
+| `bench cold --kind {cache\|boot} --server-cmd CMD`     | Spawns the server itself; cold-cache or cold-boot timing                 |
 
-`bench --help` prints the full common-options reference.
+`bench --help` prints the common-options reference.
 
 ## Common options
+
+Parsed by every subcommand before its own flags:
 
 ```
 --profile {1cpu2gb|2cpu4gb|unconstrained}    Tag the JSON record (does NOT enforce; the wrapper does)
@@ -65,9 +70,35 @@ kill $SERVER_PID
 
 **Note on `--warmup-ops`:** the default 1000 is sized for production runs. For tiny smoke tests (workers × ops < 1000), pass `--warmup-ops 0` or your percentiles will read zero.
 
+## Per-workload options
+
+| Subcommand    | Flag                | Default           | Meaning                                                        |
+|---------------|---------------------|-------------------|----------------------------------------------------------------|
+| `seed`        | `--data-dir DIR`    | `/var/lib/dmozdb` | Where `seed.json` is written (must be the server's data dir)    |
+| `seed`        | `--categories N`    | `1000`            | Categories to create                                           |
+| `seed`        | `--links N`         | `100000`          | Links to create                                                |
+| `seed`        | `--depth N`         | `4`               | Depth of the generated category tree                           |
+| `seed`        | `--server-cmd CMD`  | (none)            | Spawn the server with this command instead of connecting       |
+| `create_link` | `--batch N`         | `10`              | Items per `create_link` frame                                  |
+| `bulk_import` | `--count N`         | `10000`           | Total links to import                                          |
+| `bulk_import` | `--batch-size N`    | `1000`            | Items per `bulk_import` frame (max 4000; `--count` max 10,000,000) |
+| `get_link`    | `--data-dir DIR`    | `/var/lib/dmozdb` | Reads `seed.json` for the link id range                        |
+| `browse`      | `--kind K`          | (required)        | `path`, `children` or `subtree-links`                          |
+| `browse`      | `--data-dir DIR`    | `/var/lib/dmozdb` | Reads `seed.json` for the category id range                    |
+| `search`      | `--target T`        | (required)        | `links` or `categories`                                        |
+| `search`      | `--data-dir DIR`    | `/var/lib/dmozdb` | Reads `seed.json`                                              |
+| `mixed`       | `--read-pct PCT`    | (required)        | Percentage of ops that are reads                               |
+| `mixed`       | `--data-dir DIR`    | `/var/lib/dmozdb` | Reads `seed.json` for the link id range                        |
+| `cold`        | `--kind K`          | (required)        | `cache`: spawn the server once, measure the first reads; `boot`: spawn-to-first-ping, `--ops-per-worker` iterations |
+| `cold`        | `--server-cmd CMD`  | (required)        | Command used to spawn the server                               |
+| `cold`        | `--data-dir DIR`    | `/var/lib/dmozdb` | Data dir handed to the spawned server                          |
+| `cold`        | `--reseed`          | off               | Run an inline seed (200 categories × 2000 links) instead of requiring an existing `seed.json` |
+
+Workloads that take `--data-dir` read the `seed.json` sidecar that `bench seed` wrote there; run `seed` first.
+
 ## Constrained profiles
 
-`run-constrained.sh` and `run-server-constrained.sh` use `systemd-run --user --scope` to apply CPU + memory limits. No root required (cgroup v2 user delegation must be available — works in the dev container).
+`run-constrained.sh` and `run-server-constrained.sh` use `systemd-run --user --scope` to apply CPU + memory limits. No root required (cgroup v2 user delegation must be available; it works in the dev container).
 
 ```bash
 # Run a workload under the 1 CPU / 2 GB profile
@@ -166,8 +197,6 @@ jq -s '
 
 (For multi-record runs, use `jq -s '. | group_by(.workload + .profile)'` and diff per group.)
 
-## Spec / roadmap
+## Baselines
 
-- Spec: [`docs/superpowers/specs/2026-05-04-benchmark-harness-design.md`](../docs/superpowers/specs/2026-05-04-benchmark-harness-design.md)
-- Plan: [`docs/superpowers/plans/2026-05-04-benchmark-harness-plan.md`](../docs/superpowers/plans/2026-05-04-benchmark-harness-plan.md)
-- Roadmap: [`docs/superpowers/roadmaps/2026-05-04-iso-25010-quality-roadmap.md`](../docs/superpowers/roadmaps/2026-05-04-iso-25010-quality-roadmap.md)
+`baseline-2026-05-04-*.jsonl` and `baseline-2026-05-05-slice6.jsonl` in this directory are earlier recorded runs; `baseline-2026-05-04-summary.md` summarises them.
