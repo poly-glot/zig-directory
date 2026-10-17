@@ -17,6 +17,7 @@ pub const listChildren = category.listChildren;
 pub const getCategoryPath = category.getCategoryPath;
 pub const walkAncestors = category.walkAncestors;
 pub const recomputeCategoryCounts = category.recomputeCategoryCounts;
+pub const computeCategoryCounts = category.computeCategoryCounts;
 
 pub const createLink = link_mod.createLink;
 pub const createLinkWithOpts = link_mod.createLinkWithOpts;

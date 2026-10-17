@@ -257,15 +257,55 @@ pub fn walkAncestors(
 
 const SubtreeAgg = struct { link_subtree: u64, child_subtree: u32 };
 
-pub fn recomputeCategoryCounts(db: *Directory) !void {
+pub const ExpectedCounts = struct {
+    link_count: u32,
+    child_count: u32,
+    link_count_subtree: u64,
+    child_count_subtree: u32,
+};
+
+pub const CategoryCounts = struct {
+    allocator: std.mem.Allocator,
+    direct_links: std.AutoHashMap(u64, u32),
+    children_of: std.AutoHashMap(u64, std.ArrayListUnmanaged(u64)),
+    subtree: std.AutoHashMap(u64, SubtreeAgg),
+
+    pub fn deinit(self: *CategoryCounts) void {
+        self.direct_links.deinit();
+        var kids = self.children_of.valueIterator();
+        while (kids.next()) |list| list.deinit(self.allocator);
+        self.children_of.deinit();
+        self.subtree.deinit();
+    }
+
+    pub fn expectedFor(self: *const CategoryCounts, cat_id: u64) ExpectedCounts {
+        const link_count: u32 = self.direct_links.get(cat_id) orelse 0;
+        const child_count: u32 = if (self.children_of.get(cat_id)) |k| @intCast(k.items.len) else 0;
+        const agg = self.subtree.get(cat_id) orelse SubtreeAgg{ .link_subtree = link_count, .child_subtree = 0 };
+        return .{
+            .link_count = link_count,
+            .child_count = child_count,
+            .link_count_subtree = agg.link_subtree,
+            .child_count_subtree = agg.child_subtree,
+        };
+    }
+};
+
+pub fn computeCategoryCounts(db: *Directory) !CategoryCounts {
     const allocator = db.allocator;
 
     db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
     db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
     db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
-    var direct_links = std.AutoHashMap(u64, u32).init(allocator);
-    defer direct_links.deinit();
+    var counts = CategoryCounts{
+        .allocator = allocator,
+        .direct_links = std.AutoHashMap(u64, u32).init(allocator),
+        .children_of = std.AutoHashMap(u64, std.ArrayListUnmanaged(u64)).init(allocator),
+        .subtree = std.AutoHashMap(u64, SubtreeAgg).init(allocator),
+    };
+    errdefer counts.deinit();
+
     {
         const min_key: [16]u8 = .{0} ** 16;
         var iter = try db.link_by_category().rangeScan(&min_key, null);
@@ -273,18 +313,12 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
         while (try iter.next()) |entry| {
             if (entry.key.len < 8) continue;
             const cid = codec.decodeU64(entry.key[0..8]);
-            const gop = try direct_links.getOrPut(cid);
+            const gop = try counts.direct_links.getOrPut(cid);
             if (!gop.found_existing) gop.value_ptr.* = 0;
             gop.value_ptr.* +|= 1;
         }
     }
 
-    var children_of = std.AutoHashMap(u64, std.ArrayListUnmanaged(u64)).init(allocator);
-    defer {
-        var vit = children_of.valueIterator();
-        while (vit.next()) |list| list.deinit(allocator);
-        children_of.deinit();
-    }
     {
         const min_key: [16]u8 = .{0} ** 16;
         var iter = try db.cat_by_parent().rangeScan(&min_key, null);
@@ -293,7 +327,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
             if (entry.key.len < 16) continue;
             const parent = codec.decodeU64(entry.key[0..8]);
             const child = codec.decodeU64(entry.key[8..16]);
-            const gop = try children_of.getOrPut(parent);
+            const gop = try counts.children_of.getOrPut(parent);
             if (!gop.found_existing) gop.value_ptr.* = .{};
             try gop.value_ptr.append(allocator, child);
         }
@@ -312,9 +346,6 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
         }
     }
 
-    var computed = std.AutoHashMap(u64, SubtreeAgg).init(allocator);
-    defer computed.deinit();
-
     const Frame = struct { id: u64, expanded: bool };
     var stack: std.ArrayListUnmanaged(Frame) = .{};
     defer stack.deinit(allocator);
@@ -322,7 +353,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
     defer on_path.deinit();
 
     for (all_ids.items) |root| {
-        if (computed.contains(root)) continue;
+        if (counts.subtree.contains(root)) continue;
         stack.clearRetainingCapacity();
         on_path.clearRetainingCapacity();
         try stack.append(allocator, .{ .id = root, .expanded = false });
@@ -331,14 +362,14 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
             const cur = stack.items[idx];
             if (!cur.expanded) {
                 stack.items[idx].expanded = true;
-                if (computed.contains(cur.id)) {
+                if (counts.subtree.contains(cur.id)) {
                     _ = stack.pop();
                     continue;
                 }
                 try on_path.put(cur.id, {});
-                if (children_of.get(cur.id)) |kids| {
+                if (counts.children_of.get(cur.id)) |kids| {
                     for (kids.items) |c| {
-                        if (computed.contains(c)) continue;
+                        if (counts.subtree.contains(c)) continue;
                         if (on_path.contains(c)) continue;
                         try stack.append(allocator, .{ .id = c, .expanded = false });
                     }
@@ -347,49 +378,51 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
             }
             _ = stack.pop();
             _ = on_path.remove(cur.id);
-            if (computed.contains(cur.id)) continue;
+            if (counts.subtree.contains(cur.id)) continue;
 
-            var sub_l: u64 = direct_links.get(cur.id) orelse 0;
+            var sub_l: u64 = counts.direct_links.get(cur.id) orelse 0;
             var sub_c: u32 = 0;
-            if (children_of.get(cur.id)) |kids| {
+            if (counts.children_of.get(cur.id)) |kids| {
                 for (kids.items) |c| {
-                    const cc = computed.get(c) orelse SubtreeAgg{ .link_subtree = 0, .child_subtree = 0 };
+                    const cc = counts.subtree.get(c) orelse SubtreeAgg{ .link_subtree = 0, .child_subtree = 0 };
                     sub_l +%= cc.link_subtree;
                     sub_c +|= 1 +| cc.child_subtree;
                 }
             }
-            try computed.put(cur.id, .{ .link_subtree = sub_l, .child_subtree = sub_c });
+            try counts.subtree.put(cur.id, .{ .link_subtree = sub_l, .child_subtree = sub_c });
         }
     }
 
+    return counts;
+}
+
+pub fn recomputeCategoryCounts(db: *Directory) !void {
+    var counts = try computeCategoryCounts(db);
+    defer counts.deinit();
+
     const now = std.time.timestamp();
     var rewritten: u64 = 0;
-    {
-        const min_key = codec.encodeU64(0);
-        var iter = try db.categories_by_id().rangeScan(&min_key, null);
-        defer iter.deinit();
-        while (try iter.next()) |entry| {
-            if (entry.value.len < @sizeOf(schema.Category)) continue;
-            var cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+    const min_key = codec.encodeU64(0);
+    var iter = try db.categories_by_id().rangeScan(&min_key, null);
+    defer iter.deinit();
+    while (try iter.next()) |entry| {
+        if (entry.value.len < @sizeOf(schema.Category)) continue;
+        var cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+        const want = counts.expectedFor(cat.id);
 
-            const new_link: u32 = direct_links.get(cat.id) orelse 0;
-            const new_child: u32 = if (children_of.get(cat.id)) |k| @intCast(k.items.len) else 0;
-            const agg = computed.get(cat.id) orelse SubtreeAgg{ .link_subtree = new_link, .child_subtree = 0 };
-
-            if (cat.link_count == new_link and cat.child_count == new_child and
-                cat.link_count_subtree == agg.link_subtree and cat.child_count_subtree == agg.child_subtree)
-            {
-                continue;
-            }
-            cat.link_count = new_link;
-            cat.child_count = new_child;
-            cat.link_count_subtree = agg.link_subtree;
-            cat.child_count_subtree = agg.child_subtree;
-            cat.updated_at = now;
-            const id_key = codec.encodeU64(cat.id);
-            try db.mt_categories_by_id().put(&id_key, std.mem.asBytes(&cat));
-            rewritten += 1;
+        if (cat.link_count == want.link_count and cat.child_count == want.child_count and
+            cat.link_count_subtree == want.link_count_subtree and cat.child_count_subtree == want.child_count_subtree)
+        {
+            continue;
         }
+        cat.link_count = want.link_count;
+        cat.child_count = want.child_count;
+        cat.link_count_subtree = want.link_count_subtree;
+        cat.child_count_subtree = want.child_count_subtree;
+        cat.updated_at = now;
+        const id_key = codec.encodeU64(cat.id);
+        try db.mt_categories_by_id().put(&id_key, std.mem.asBytes(&cat));
+        rewritten += 1;
     }
 
     if (rewritten > 0) {
