@@ -199,4 +199,4 @@ jq -s '
 
 ## Baselines
 
-`baseline-2026-05-04-*.jsonl` and `baseline-2026-05-05-slice6.jsonl` in this directory are earlier recorded runs; `baseline-2026-05-04-summary.md` summarises them.
+`baseline-2026-10-17-*.jsonl` is the current baseline for all three profiles, summarised and compared against May in `baseline-2026-10-17-summary.md`. `baseline-2026-05-04-*.jsonl` and `baseline-2026-05-05-slice6.jsonl` are earlier recorded runs; `baseline-2026-05-04-summary.md` summarises them.
