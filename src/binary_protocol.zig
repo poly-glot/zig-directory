@@ -50,9 +50,7 @@ pub fn mapErrorWithSubStatus(err: anyerror) StatusPair {
         error.CategoryHasChildren => .{ .status = .has_children, .sub_status = .none },
         error.CircularHierarchy => .{ .status = .circular, .sub_status = .none },
         error.FieldTooLong => .{ .status = .invalid, .sub_status = .field_too_long },
-        error.BufferTooSmall => .{ .status = .invalid, .sub_status = .buffer_too_small },
         error.PathTooDeep => .{ .status = .invalid, .sub_status = .path_too_deep },
-        error.InvalidSlug => .{ .status = .invalid, .sub_status = .invalid_slug },
         error.UnsupportedOrder => .{ .status = .invalid, .sub_status = .unsupported_order },
         error.OffsetTooLarge => .{ .status = .invalid, .sub_status = .offset_too_large },
         error.SnapshotInProgress => .{ .status = .err, .sub_status = .already_in_progress },
@@ -1236,8 +1234,6 @@ test "index_health response carries slug_path_repair_queue fields" {
 test "mapErrorWithSubStatus: maps each known error to a distinct (status, sub_status) pair" {
     const cases = [_]struct { err: anyerror, status: Status, sub: SubStatus }{
         .{ .err = error.FieldTooLong, .status = .invalid, .sub = .field_too_long },
-        .{ .err = error.InvalidSlug, .status = .invalid, .sub = .invalid_slug },
-        .{ .err = error.BufferTooSmall, .status = .invalid, .sub = .buffer_too_small },
         .{ .err = error.PathTooDeep, .status = .invalid, .sub = .path_too_deep },
         .{ .err = error.UnsupportedOrder, .status = .invalid, .sub = .unsupported_order },
         .{ .err = error.OffsetTooLarge, .status = .invalid, .sub = .offset_too_large },

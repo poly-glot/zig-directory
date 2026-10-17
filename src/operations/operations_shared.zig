@@ -11,8 +11,6 @@ pub const OperationError = error{
     DuplicateSlug,
     CircularHierarchy,
     CategoryHasChildren,
-    InvalidSlug,
-    BufferTooSmall,
     PathTooDeep,
     FieldTooLong,
     DatabaseCorrupted,

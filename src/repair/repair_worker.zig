@@ -79,7 +79,7 @@ fn processTask(db: *Directory, qt: QueuedTask) !void {
     });
 }
 
-pub fn processOneChunk(db: *Directory) !void {
+fn processOneChunk(db: *Directory) !void {
     const qt = (try peekMin(db)) orelse return;
     if ((try operations.getCategory(db, qt.task.cat_id)) == null) {
         try db.commit(changeset.ChangeSet{ .slug_path_repair_complete = .{ .seq = qt.seq } });

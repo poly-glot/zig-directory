@@ -43,7 +43,7 @@ pub const Stats = struct {
     wal_pending_batch_entries: u64 = 0,
 };
 
-const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
+pub const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
 const MEMTABLE_FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
 
 pub const Directory = struct {

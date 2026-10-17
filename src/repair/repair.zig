@@ -88,6 +88,7 @@ fn rebuildCategoryIndices(db: *Directory) !u64 {
 
                 const depth: u32 = @intCast(std.mem.count(u8, full_path, "/"));
                 const owned_slug = try db.allocator.dupe(u8, slug);
+                errdefer db.allocator.free(owned_slug);
                 const gop = try slug_best.getOrPut(owned_slug);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = .{ .depth = depth, .cat_id = cat.id };
