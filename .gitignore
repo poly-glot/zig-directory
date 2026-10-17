@@ -39,3 +39,4 @@ web/data/
 # MCP server virtualenv
 mcp/.venv/
 __pycache__/
+zig-pkg/

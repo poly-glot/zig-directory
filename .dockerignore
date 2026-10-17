@@ -26,3 +26,4 @@ k8s/
 deployment/
 *.md
 .DS_Store
+zig-pkg/
