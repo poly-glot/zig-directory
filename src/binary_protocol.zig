@@ -33,6 +33,7 @@ pub const SubStatus = enum(u8) {
     duplicate_url = 7,
     offset_too_large = 8,
     already_in_progress = 9,
+    duplicate_slug = 10,
 };
 
 pub const StatusPair = struct {
@@ -43,6 +44,7 @@ pub const StatusPair = struct {
 pub fn mapErrorWithSubStatus(err: anyerror) StatusPair {
     return switch (err) {
         error.DuplicateUrl => .{ .status = .duplicate, .sub_status = .duplicate_url },
+        error.DuplicateSlug => .{ .status = .duplicate, .sub_status = .duplicate_slug },
         error.CategoryNotFound => .{ .status = .category_not_found, .sub_status = .none },
         error.ParentNotFound => .{ .status = .category_not_found, .sub_status = .parent_not_found },
         error.LinkNotFound => .{ .status = .not_found, .sub_status = .none },
@@ -1361,6 +1363,7 @@ test "mapErrorWithSubStatus: maps each known error to a distinct (status, sub_st
         .{ .err = error.OffsetTooLarge, .status = .invalid, .sub = .offset_too_large },
         .{ .err = error.ParentNotFound, .status = .category_not_found, .sub = .parent_not_found },
         .{ .err = error.DuplicateUrl, .status = .duplicate, .sub = .duplicate_url },
+        .{ .err = error.DuplicateSlug, .status = .duplicate, .sub = .duplicate_slug },
         .{ .err = error.LinkNotFound, .status = .not_found, .sub = .none },
         .{ .err = error.CategoryHasChildren, .status = .has_children, .sub = .none },
         .{ .err = error.CircularHierarchy, .status = .circular, .sub = .none },

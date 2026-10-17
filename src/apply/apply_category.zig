@@ -22,8 +22,22 @@ pub fn applyCategoryInserted(db: *Directory, e: changeset.CategoryInsertEffect) 
     try apply.cascadeAncestorCounts(db, e.ancestor_updates, e.cat.parent_id, .child_count, true);
 
     try db.mt_categories_by_id().put(&id_key, std.mem.asBytes(&e.cat));
+    db.noteIssuedCategoryId(e.cat.id);
 
     db.subtree_cache.invalidateAll();
+}
+
+fn enqueueRepairTask(db: *Directory, cat_id: u64, enqueue: changeset.EnqueueOnApply) !void {
+    if (enqueue.seq == 0) return;
+    var task = schema.RepairTask{
+        .cat_id = cat_id,
+        .op = enqueue.op,
+        .created_at = enqueue.created_at,
+        .old_slug_prefix = codec.FixedString(2048).fromSlice(enqueue.old_slug_prefix),
+    };
+    const key = codec.encodeU64(enqueue.seq);
+    try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
+    db.noteIssuedRepairSeq(enqueue.seq);
 }
 
 pub fn applyCategoryDeleted(db: *Directory, e: changeset.CategoryDeleteEffect) !void {
@@ -87,16 +101,7 @@ pub fn applyCategoryRenamed(db: *Directory, e: changeset.CategoryRenameEffect) !
         try db.categories_by_slug_path().insert(s.new_path, &d_id_key);
     }
 
-    if (e.enqueue.seq != 0) {
-        var task = schema.RepairTask{
-            .cat_id = e.new_cat.id,
-            .op = e.enqueue.op,
-            .created_at = e.enqueue.created_at,
-            .old_slug_prefix = codec.FixedString(2048).fromSlice(e.enqueue.old_slug_prefix),
-        };
-        const key = codec.encodeU64(e.enqueue.seq);
-        try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
-    }
+    try enqueueRepairTask(db, e.new_cat.id, e.enqueue);
 
     db.subtree_cache.invalidateAll();
 }
@@ -120,16 +125,7 @@ pub fn applyCategoryMoved(db: *Directory, e: changeset.CategoryMoveEffect) !void
         try db.categories_by_slug_path().insert(s.new_path, &d_id_key);
     }
 
-    if (e.enqueue.seq != 0) {
-        var task = schema.RepairTask{
-            .cat_id = e.cat.id,
-            .op = e.enqueue.op,
-            .created_at = e.enqueue.created_at,
-            .old_slug_prefix = codec.FixedString(2048).fromSlice(e.enqueue.old_slug_prefix),
-        };
-        const key = codec.encodeU64(e.enqueue.seq);
-        try db.slug_path_repair_queue().insert(&key, std.mem.asBytes(&task));
-    }
+    try enqueueRepairTask(db, e.cat.id, e.enqueue);
 
     try apply.cascadeAncestorCounts(db, e.old_chain_updates, e.old_parent_id, .child_count, false);
 

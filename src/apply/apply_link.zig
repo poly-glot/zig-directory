@@ -25,6 +25,27 @@ fn decrLinkStatus(db: *Directory, status: u8) void {
     }
 }
 
+fn urlHashOwner(db: *Directory, hash_key: *const [8]u8) !?u64 {
+    const in_memtable = db.mt_link_by_url_hash().get(hash_key);
+    const owner_bytes: []const u8 = switch (in_memtable) {
+        .found => |v| v,
+        .deleted => return null,
+        .not_found => blk: {
+            var tree_buf: [8]u8 = undefined;
+            break :blk (try db.link_by_url_hash().search(hash_key, &tree_buf)) orelse return null;
+        },
+    };
+    if (owner_bytes.len < 8) return null;
+    return codec.decodeU64(owner_bytes[0..8]);
+}
+
+fn deleteUrlHashIfOwnedBy(db: *Directory, url: []const u8, link_id: u64) !void {
+    const hash_key = codec.encodeU64(codec.hash(url));
+    const owner = (try urlHashOwner(db, &hash_key)) orelse return;
+    if (owner != link_id) return;
+    try db.mt_link_by_url_hash().delete(&hash_key);
+}
+
 pub fn applyLinkInserted(db: *Directory, e: changeset.LinkInsertEffect) !void {
     const id_key = codec.encodeU64(e.link.id);
 
@@ -44,6 +65,7 @@ pub fn applyLinkInserted(db: *Directory, e: changeset.LinkInsertEffect) !void {
     try apply.cascadeAncestorCounts(db, e.ancestor_updates, e.link.category_id, .link_count, true);
 
     try db.mt_links_by_id().put(&id_key, std.mem.asBytes(&e.link));
+    db.noteIssuedLinkId(e.link.id);
 
     db.url_bloom.add(e.link.url.slice());
     incrLinkStatus(db, e.link.status);
@@ -56,8 +78,7 @@ pub fn applyLinkDeleted(db: *Directory, e: changeset.LinkDeleteEffect) !void {
     const cl_key = schema.CategoryLinkKey.encode(.{ e.link.category_id, e.link.id });
     try db.mt_link_by_category().delete(&cl_key);
 
-    const hash_key = codec.encodeU64(codec.hash(e.link.url.slice()));
-    try db.mt_link_by_url_hash().delete(&hash_key);
+    try deleteUrlHashIfOwnedBy(db, e.link.url.slice(), e.link.id);
 
     if (e.link.submitter_id != 0) {
         const sl_key = schema.SubmitterLinkKey.encode(.{ e.link.submitter_id, e.link.id });
@@ -84,8 +105,7 @@ pub fn applyLinkTextUpdated(db: *Directory, e: changeset.LinkTextUpdateEffect) !
     try apply.writeTokens(db.links_index_tree(), e.new_tokens, e.new_link.id, .insert);
 
     if (!std.mem.eql(u8, e.old_link.url.slice(), e.new_link.url.slice())) {
-        const old_hash_key = codec.encodeU64(codec.hash(e.old_link.url.slice()));
-        try db.mt_link_by_url_hash().delete(&old_hash_key);
+        try deleteUrlHashIfOwnedBy(db, e.old_link.url.slice(), e.new_link.id);
         const new_hash_key = codec.encodeU64(codec.hash(e.new_link.url.slice()));
         try db.mt_link_by_url_hash().put(&new_hash_key, &id_key);
         db.url_bloom.add(e.new_link.url.slice());
@@ -653,4 +673,32 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     try std.testing.expectEqual(@as(u64, 1), got_cat_b.link_count_subtree);
     const got_top = (try ops.getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u64, 1), got_top.link_count_subtree);
+}
+
+test "deleting a link whose url hash maps to another link leaves that link's hash entry intact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const ops = @import("../operations/operations.zig");
+    const top_id = try ops.createCategory(db, 0, "Top", "top", "");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const no_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{});
+    const no_tokens = try aa.dupe(changeset.Token, &.{});
+
+    const shared_url = "https://collide.example";
+    const first = schema.Link{ .id = 300, .category_id = top_id, .url = codec.FixedString(64).fromSlice(shared_url) };
+    const second = schema.Link{ .id = 301, .category_id = top_id, .url = codec.FixedString(64).fromSlice(shared_url) };
+    try db.commit(.{ .link_inserted = .{ .link = first, .ancestor_updates = no_ancestors, .tokens = no_tokens } });
+    try db.commit(.{ .link_inserted = .{ .link = second, .ancestor_updates = no_ancestors, .tokens = no_tokens } });
+
+    try db.commit(.{ .link_deleted = .{ .link = first, .ancestor_updates = no_ancestors, .tokens = no_tokens } });
+
+    const hash_key = codec.encodeU64(codec.hash(shared_url));
+    try std.testing.expectEqual(@as(?u64, 301), try urlHashOwner(db, &hash_key));
 }

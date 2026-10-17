@@ -524,3 +524,53 @@ test "H1: a snapshot persists the page-0 header so data survives a later crash" 
     const l = (try ops.getLink(b, link_id)) orelse return error.LinkLostAfterSnapshot;
     try testing.expectEqualStrings("https://snap.example", l.url.slice());
 }
+
+test "crash recovery never reissues a link id that a replayed WAL entry already used" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const first_id = blk: {
+        const a = try Directory.openTestInstance(allocator, &tmp);
+        const top = try ops.createCategory(a, 0, "Top", "top", "");
+        const id = try ops.createLink(a, top, "https://first.example", "First", "");
+        a.deinitCrashTestInstance();
+        break :blk id;
+    };
+
+    const b = try Directory.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try b.recover();
+
+    const top = (try ops.resolveSlugPath(b, "top")) orelse return error.TopLost;
+    const second_id = try ops.createLink(b, top, "https://second.example", "Second", "");
+    try testing.expect(second_id != first_id);
+
+    const first = (try ops.getLink(b, first_id)) orelse return error.ReplayedLinkOverwritten;
+    try testing.expectEqualStrings("https://first.example", first.url.slice());
+}
+
+test "crash recovery never reissues a category id that a replayed WAL entry already used" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const arts_id = blk: {
+        const a = try Directory.openTestInstance(allocator, &tmp);
+        const top = try ops.createCategory(a, 0, "Top", "top", "");
+        const id = try ops.createCategory(a, top, "Arts", "arts", "");
+        a.deinitCrashTestInstance();
+        break :blk id;
+    };
+
+    const b = try Directory.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try b.recover();
+
+    const top = (try ops.resolveSlugPath(b, "top")) orelse return error.TopLost;
+    const music_id = try ops.createCategory(b, top, "Music", "music", "");
+    try testing.expect(music_id != arts_id);
+
+    const arts = (try ops.getCategory(b, arts_id)) orelse return error.ReplayedCategoryOverwritten;
+    try testing.expectEqualStrings("arts", arts.slug.slice());
+}

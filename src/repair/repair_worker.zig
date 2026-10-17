@@ -11,12 +11,8 @@ pub fn tickOnce(db: *Directory) !void {
     db.repair_worker_mutex.lock();
     defer db.repair_worker_mutex.unlock();
 
-    const max_tasks = db.config.repair_worker_max_tasks_per_tick;
-    var processed: u32 = 0;
-    while (processed < max_tasks) : (processed += 1) {
-        if (db.slug_path_repair_queue().entryCount() == 0) break;
-        const task = (try peekMin(db)) orelse break;
-        try processTask(db, task);
+    if (db.slug_path_repair_queue().entryCount() != 0) {
+        if (try peekMin(db)) |task| try processTask(db, task);
     }
 
     db.repair_worker_last_tick_ms.store(std.time.milliTimestamp(), .release);
@@ -69,9 +65,13 @@ fn processTask(db: *Directory, qt: QueuedTask) !void {
     try stack.append(arena.allocator(), .{ .id = qt.task.cat_id, .child_offset = 0 });
 
     while (stack.items.len > 0) {
+        db.write_mutex.lock();
+        defer db.write_mutex.unlock();
         if (try processChunk(db, qt, &stack, arena.allocator())) chunks += 1;
     }
 
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
     try db.commit(changeset.ChangeSet{ .slug_path_repair_complete = .{ .seq = qt.seq } });
     _ = db.repair_worker_tasks_processed.fetchAdd(1, .monotonic);
     log.info("task seq={d} cat_id={d} op={s} chunks={d} processed in {d} ms", .{

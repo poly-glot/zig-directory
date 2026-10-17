@@ -53,6 +53,8 @@ pub const Directory = struct {
     verifier_worker: ?*zigstore.Worker,
     verifier_interval_ns: u64,
 
+    write_mutex: std.Thread.Mutex,
+
     repair_worker: ?*zigstore.Worker,
     repair_worker_mutex: std.Thread.Mutex,
     repair_worker_tasks_processed: std.atomic.Value(u64),
@@ -198,11 +200,7 @@ pub const Directory = struct {
         };
         errdefer allocator.destroy(op_latency);
 
-        const verifier_interval_ns = blk: {
-            const env = std.posix.getenv("DMOZDB_VERIFIER_INTERVAL_S") orelse break :blk 300 * std.time.ns_per_s;
-            const secs = std.fmt.parseInt(u32, env, 10) catch 300;
-            break :blk @as(u64, secs) * std.time.ns_per_s;
-        };
+        const verifier_interval_ns = @as(u64, config.verifier_interval_s) * std.time.ns_per_s;
 
         self.* = Self{
             .allocator = allocator,
@@ -211,6 +209,7 @@ pub const Directory = struct {
             .verifier_state = .{},
             .verifier_worker = null,
             .verifier_interval_ns = verifier_interval_ns,
+            .write_mutex = .{},
             .repair_worker = null,
             .repair_worker_mutex = .{},
             .repair_worker_tasks_processed = std.atomic.Value(u64).init(0),
@@ -281,8 +280,14 @@ pub const Directory = struct {
     }
 
     fn applyChangeSet(ctx: *anyopaque, cs: changeset.ChangeSet) anyerror!void {
-        const dir = asDir(ctx);
-        return apply_mod.apply(dir, cs);
+        applyOrAbort(asDir(ctx), cs);
+    }
+
+    fn applyOrAbort(dir: *Self, cs: changeset.ChangeSet) void {
+        apply_mod.apply(dir, cs) catch |err| {
+            log.err("changeset apply failed after its WAL append: {} — aborting so recovery replays it whole", .{err});
+            @panic("changeset apply failed after WAL append");
+        };
     }
 
     pub fn signalMemtableFlusher(self: *Self) void {
@@ -430,6 +435,18 @@ pub const Directory = struct {
         atomic.store(@max(atomic.load(.monotonic), persisted), .monotonic);
     }
 
+    pub fn noteIssuedCategoryId(self: *Self, id: u64) void {
+        syncCounterUp(&self.next_category_id, id + 1);
+    }
+
+    pub fn noteIssuedLinkId(self: *Self, id: u64) void {
+        syncCounterUp(&self.next_link_id, id + 1);
+    }
+
+    pub fn noteIssuedRepairSeq(self: *Self, seq: u64) void {
+        syncCounterUp(&self.next_repair_seq, seq + 1);
+    }
+
     fn bootstrapRoots(ctx: *anyopaque) anyerror!void {
         const self = asDir(ctx);
         if (self.categories_by_id().entryCount() != 0) return;
@@ -552,7 +569,7 @@ test "recover boot path: clean DB reopens cleanly" {
         defer dir.deinitTestInstance();
         try dir.recover();
         const ops = @import("operations/operations.zig");
-        const top_id = try ops.createCategory(dir, 0, "Top", "top", "");
+        const top_id = (try ops.resolveSlugPath(dir, "top")) orelse return error.BootstrapTopMissing;
         _ = try ops.createCategory(dir, top_id, "Arts", "arts", "");
     }
 
@@ -564,4 +581,9 @@ test "recover boot path: clean DB reopens cleanly" {
         const id = try ops.resolveSlugPath(dir, "arts");
         try std.testing.expect(id != null);
     }
+}
+
+test "a changeset that reached the WAL is applied or the process aborts, never acked as failed" {
+    const info = @typeInfo(@TypeOf(Directory.applyOrAbort)).@"fn";
+    try std.testing.expectEqual(void, info.return_type.?);
 }

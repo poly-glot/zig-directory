@@ -35,6 +35,19 @@ pub fn createLinkWithOpts(
     desc: []const u8,
     opts: CreateLinkOpts,
 ) !u64 {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+    return createLinkWithOptsLocked(db, category_id, url, title, desc, opts);
+}
+
+fn createLinkWithOptsLocked(
+    db: *Directory,
+    category_id: u64,
+    url: []const u8,
+    title: []const u8,
+    desc: []const u8,
+    opts: CreateLinkOpts,
+) !u64 {
     if (url.len > MAX_URL_LEN) return OperationError.FieldTooLong;
     if (title.len > MAX_TITLE_LEN) return OperationError.FieldTooLong;
     if (desc.len > MAX_LINK_DESC_LEN) return OperationError.FieldTooLong;
@@ -115,6 +128,18 @@ pub fn updateLink(
     title: ?[]const u8,
     desc: ?[]const u8,
 ) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+    return updateLinkLocked(db, id, url, title, desc);
+}
+
+fn updateLinkLocked(
+    db: *Directory,
+    id: u64,
+    url: ?[]const u8,
+    title: ?[]const u8,
+    desc: ?[]const u8,
+) !void {
     if (url) |u| if (u.len > MAX_URL_LEN) return OperationError.FieldTooLong;
     if (title) |t| if (t.len > MAX_TITLE_LEN) return OperationError.FieldTooLong;
     if (desc) |d| if (d.len > MAX_LINK_DESC_LEN) return OperationError.FieldTooLong;
@@ -135,6 +160,8 @@ pub fn updateLink(
 }
 
 pub fn updateLinkStatus(db: *Directory, id: u64, status: u8) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
     var new_link = old_link;
     new_link.status = status;
@@ -148,6 +175,8 @@ pub fn updateLinkStatus(db: *Directory, id: u64, status: u8) !void {
 }
 
 pub fn updateLinkStatusBulkOne(db: *Directory, id: u64, status: u8) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
     if (old_link.status == status) return OperationError.AlreadyInState;
     var new_link = old_link;
@@ -205,6 +234,8 @@ pub fn recountLinkStatuses(db: *Directory) !void {
 }
 
 pub fn moveLink(db: *Directory, id: u64, new_category_id: u64) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
 
     if (new_category_id == 0) return OperationError.CategoryNotFound;
@@ -227,6 +258,12 @@ pub fn moveLink(db: *Directory, id: u64, new_category_id: u64) !void {
 }
 
 pub fn deleteLink(db: *Directory, id: u64) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+    return deleteLinkLocked(db, id);
+}
+
+pub fn deleteLinkLocked(db: *Directory, id: u64) !void {
     const link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
@@ -849,4 +886,61 @@ test "moveLink: missing target category returns CategoryNotFound" {
 
     const result = ops.moveLink(db, link_id, 99999);
     try std.testing.expectError(OperationError.CategoryNotFound, result);
+}
+
+const WriterProbe = struct {
+    db: *Directory,
+    top: u64,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *WriterProbe) void {
+        _ = createLink(self.db, self.top, "https://blocked.example", "Blocked", "") catch |err| {
+            std.debug.panic("writer probe failed: {}", .{err});
+        };
+        self.finished.store(true, .release);
+    }
+};
+
+test "every mutating operation waits for the write mutex before validating" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try category.createCategory(db, 0, "Top", "top", "");
+    var probe = WriterProbe{ .db = db, .top = top };
+
+    db.write_mutex.lock();
+    const writer = try std.Thread.spawn(.{}, WriterProbe.run, .{&probe});
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    try std.testing.expect(!probe.finished.load(.acquire));
+    db.write_mutex.unlock();
+    writer.join();
+
+    try std.testing.expect(probe.finished.load(.acquire));
+}
+
+test "a committed link stays visible while its memtable shard is draining" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try category.createCategory(db, 0, "Top", "top", "");
+    const id = try createLink(db, top, "https://draining.example", "Draining", "");
+
+    const mt = db.mt_links_by_id();
+    mt.lockAll();
+    for (0..zigstore.MEMTABLE_SHARDS) |i| _ = mt.swapShardLocked(i);
+    mt.unlockAll();
+
+    const link = (try getLink(db, id)) orelse return error.CommittedLinkInvisibleDuringDrain;
+    try std.testing.expectEqualStrings("https://draining.example", link.url.slice());
+    try std.testing.expectError(OperationError.DuplicateUrl, createLink(db, top, "https://draining.example", "Dup", ""));
+
+    mt.lockAll();
+    for (0..zigstore.MEMTABLE_SHARDS) |i| mt.resetShardBackLocked(i);
+    mt.unlockAll();
 }
