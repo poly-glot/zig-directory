@@ -27,19 +27,19 @@ pub const Config = struct {
             config.data_dir = v;
         }
         if (std.posix.getenv("DMOZDB_RENAME_INLINE_THRESHOLD")) |v| {
-            config.rename_inline_threshold = std.fmt.parseInt(u32, v, 10) catch 5000;
+            config.rename_inline_threshold = std.fmt.parseInt(u32, v, 10) catch config.rename_inline_threshold;
         }
         if (std.posix.getenv("DMOZDB_REPAIR_WORKER_INTERVAL_MS")) |v| {
-            config.repair_worker_interval_ms = std.fmt.parseInt(u32, v, 10) catch 1000;
+            config.repair_worker_interval_ms = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_interval_ms;
         }
         if (std.posix.getenv("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |v| {
-            config.repair_worker_chunk_size = std.fmt.parseInt(u32, v, 10) catch 10000;
+            config.repair_worker_chunk_size = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_chunk_size;
         }
         if (std.posix.getenv("DMOZDB_SUBTREE_SCAN_THRESHOLD")) |v| {
-            config.subtree_scan_threshold = std.fmt.parseInt(u32, v, 10) catch 1024;
+            config.subtree_scan_threshold = std.fmt.parseInt(u32, v, 10) catch config.subtree_scan_threshold;
         }
         if (std.posix.getenv("DMOZDB_VERIFIER_INTERVAL_S")) |v| {
-            config.verifier_interval_s = std.fmt.parseInt(u32, v, 10) catch 300;
+            config.verifier_interval_s = std.fmt.parseInt(u32, v, 10) catch config.verifier_interval_s;
         }
         return config;
     }
@@ -94,10 +94,11 @@ test {
     _ = @import("repair/repair.zig");
 }
 
-test "Config: rename_inline_threshold default and env override" {
+test "Config: every tuning knob has its documented default" {
     const default_cfg = Config{};
     try std.testing.expectEqual(@as(u32, 5000), default_cfg.rename_inline_threshold);
     try std.testing.expectEqual(@as(u32, 1000), default_cfg.repair_worker_interval_ms);
     try std.testing.expectEqual(@as(u32, 10000), default_cfg.repair_worker_chunk_size);
+    try std.testing.expectEqual(@as(u32, 1024), default_cfg.subtree_scan_threshold);
     try std.testing.expectEqual(@as(u32, 300), default_cfg.verifier_interval_s);
 }

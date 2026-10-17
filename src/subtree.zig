@@ -3,6 +3,8 @@ const codec = @import("zigstore").codec;
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
 
+const log = std.log.scoped(.subtree);
+
 pub const MAX_DESCENDANTS: u32 = 1_000_000;
 pub const SubtreeError = error{ SubtreeTooLarge, OutOfMemory };
 
@@ -155,7 +157,9 @@ pub fn collectDescendantsCached(
 ) ![]u64 {
     if (try cache.getDescendantsCopy(root, allocator)) |copy| return copy;
     const fresh = try collectDescendants(cat_by_parent, root, allocator);
-    cache.putDescendantsCopy(root, fresh) catch {};
+    cache.putDescendantsCopy(root, fresh) catch |err| {
+        log.warn("descendants of {d} not cached: {}", .{ root, err });
+    };
     return fresh;
 }
 
