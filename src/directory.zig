@@ -77,7 +77,7 @@ pub const Directory = struct {
 
     const Self = @This();
 
-    pub fn dispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
+    pub fn dispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8, _: *zigstore.protocol.FrameGate) usize {
         const dir = asDir(ctx);
         return binary_protocol.dispatch(dir, op_byte, payload, count, resp);
     }

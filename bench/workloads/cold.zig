@@ -2,16 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench cold` — server-lifecycle-aware workload with two sub-modes:
-//   --kind=cache  : measure read latency on a freshly-booted server (cold
-//                   internal caches), with stderr-only warmup gradient.
-//   --kind=boot   : measure cold-boot wall-clock duration (spawn → first
-//                   successful ping) over N iterations.
-//
-// In both modes, bench owns the server: it spawns dmozdb, waits for ping,
-// runs its measurements, then SIGTERMs the child. Reseeding (--reseed)
-// runs an inline mini-seed if seed.json is missing.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const Kind = enum { cache, boot };
@@ -54,46 +44,31 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Sub-mode: cold cache
-// ─────────────────────────────────────────────────────────────────
-
 fn runCache(
     allocator: std.mem.Allocator,
     common_opts: common.CommonOpts,
     opts: ColdOpts,
     server_cmd: []const u8,
 ) !void {
-    // 1. Make sure seed.json exists. Optionally reseed inline.
     try ensureSeed(allocator, opts, server_cmd, common_opts);
 
     const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
     defer allocator.free(seed_path);
     const seed = try loadSeed(allocator, seed_path);
 
-    // 2. Spawn server (fresh process → cold internal cache).
     var child = try spawnServer(allocator, server_cmd, opts.data_dir);
     defer killChild(&child);
 
-    // 3. Wait for ping.
     try waitForPing(common_opts.connect_host, common_opts.port, 10_000);
 
-    // 4. Run a single-threaded read sweep with windowed histograms so the
-    //    warmup-vs-steady gradient is visible on stderr. We collapse the
-    //    canonical record's `latency_ns` to the OVERALL stats (matching
-    //    the standard schema). The per-window curve goes to stderr.
     const total_ops: u64 = @as(u64, common_opts.workers) * common_opts.ops_per_worker;
     if (total_ops == 0) return error.NoOps;
 
-    var window_a = common.Histogram{}; // ops 0..1000
-    var window_b = common.Histogram{}; // ops 1000..5000
-    var window_c = common.Histogram{}; // ops 5000..end
+    var window_a = common.Histogram{};
+    var window_b = common.Histogram{};
+    var window_c = common.Histogram{};
     var overall = common.Histogram{};
 
-    // Worker threads share the windowing scheme by op-index. To keep the
-    // bucketing well-defined under concurrency, we serialize bucket choice
-    // on a global atomic counter — the i-th measured op (across workers)
-    // lands in the bucket that op-index dictates.
     const ctxs = try allocator.alloc(CacheCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
@@ -122,7 +97,6 @@ fn runCache(
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // Merge worker histograms.
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
     for (ctxs) |*ctx| {
@@ -136,7 +110,6 @@ fn runCache(
         ops_total += ctx.ops_completed;
     }
 
-    // Log per-window p50/p95/p99 to stderr (informational only).
     std.debug.print(
         "cold-cache curve (n={d}): " ++
             "win[0..1000]      p50={d}us p95={d}us p99={d}us samples={d}\n" ++
@@ -263,24 +236,15 @@ fn cacheWorkerRun(ctx: *CacheCtx) !void {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Sub-mode: cold boot
-// ─────────────────────────────────────────────────────────────────
-
 fn runBoot(
     allocator: std.mem.Allocator,
     common_opts: common.CommonOpts,
     opts: ColdOpts,
     server_cmd: []const u8,
 ) !void {
-    // Caller controls iteration count via --ops-per-worker (default 10000
-    // is too large for boot loops; users typically pass 1..10).
     const iterations = common_opts.ops_per_worker;
     if (iterations == 0) return error.NoOps;
 
-    // Reseed if requested + missing. Boot doesn't strictly need seed.json,
-    // but keeping the same precondition simplifies operator workflow and
-    // ensures the data dir is non-empty (so boot has actual work to do).
     try ensureSeed(allocator, opts, server_cmd, common_opts);
 
     var hist = common.Histogram{};
@@ -292,7 +256,6 @@ fn runBoot(
     while (i < iterations) : (i += 1) {
         const t0 = std.time.nanoTimestamp();
         var child = try spawnServer(allocator, server_cmd, opts.data_dir);
-        // 60 s upper bound on cold-boot.
         try waitForPing(common_opts.connect_host, common_opts.port, 60_000);
         const t1 = std.time.nanoTimestamp();
         const dt_ns: u64 = @intCast(t1 - t0);
@@ -300,15 +263,12 @@ fn runBoot(
         hist.recordValue(dt_ns);
         killChild(&child);
 
-        // Brief pause so the OS releases the listening port before the
-        // next spawn — otherwise occasional EADDRINUSE flakes show up.
         std.Thread.sleep(200 * std.time.ns_per_ms);
     }
     const t_end_all = std.time.nanoTimestamp();
     const duration_ns: u64 = @intCast(t_end_all - t_start_all);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // Per-iteration durations to stderr.
     std.debug.print("cold-boot iterations (ms): ", .{});
     for (per_iter, 0..) |ns, idx| {
         if (idx > 0) std.debug.print(", ", .{});
@@ -350,12 +310,6 @@ fn runBoot(
     try emitRecord(allocator, common_opts.output_path, record);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Reseed: spawn server, run a small inline seed, kill it. Only fires
-// when --reseed is set AND seed.json is missing. We use a small fixture
-// (N=200/M=2000) — cold-cache is about read latency, not seed throughput.
-// ─────────────────────────────────────────────────────────────────
-
 fn ensureSeed(
     allocator: std.mem.Allocator,
     opts: ColdOpts,
@@ -381,7 +335,6 @@ fn ensureSeed(
     defer killChild(&child);
     try waitForPing(common_opts.connect_host, common_opts.port, 10_000);
 
-    // Build a 1-level tree of 200 categories and 2000 round-robin links.
     const fd = try tcpConnect(common_opts.connect_host, common_opts.port);
     defer posix.close(fd);
 
@@ -436,7 +389,6 @@ fn ensureSeed(
         counter += batch;
     }
 
-    // Write a minimal seed.json compatible with loadSeed below.
     const SeedJson = struct {
         schema_version: u32,
         categories: u32,
@@ -467,10 +419,6 @@ fn ensureSeed(
     std.debug.print("cold: inline seed complete ({d} cats, {d} links)\n", .{ N_CATS, N_LINKS });
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Server lifecycle
-// ─────────────────────────────────────────────────────────────────
-
 fn spawnServer(
     allocator: std.mem.Allocator,
     server_cmd: []const u8,
@@ -482,17 +430,13 @@ fn spawnServer(
     while (it.next()) |tok| try argv.append(allocator, tok);
     if (argv.items.len == 0) return error.EmptyServerCmd;
 
-    // env_map must outlive the child (the child reads it during spawn);
-    // we leak the EnvMap deliberately because std.process.Child stores a
-    // pointer to it and we can't free it until after wait(). For our
-    // short-lived bench process this is fine.
     const env_map = try allocator.create(std.process.EnvMap);
     env_map.* = try std.process.getEnvMap(allocator);
     try env_map.put("DMOZDB_DATA_DIR", data_dir);
 
     var child = std.process.Child.init(argv.items, allocator);
     child.env_map = env_map;
-    child.stderr_behavior = .Inherit; // dmozdb logs flow through bench stderr
+    child.stderr_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     try child.spawn();
     return child;
@@ -535,10 +479,6 @@ fn tcpConnect(host: []const u8, port: u16) !i32 {
     return fd;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Wire-protocol helpers (mirror of seed.zig versions)
-// ─────────────────────────────────────────────────────────────────
-
 fn createCategory(
     stream_fd: i32,
     req_buf: []u8,
@@ -555,12 +495,10 @@ fn createCategory(
     fb.writeU16LenPrefixed(desc);
     const frame = fb.finalize(1);
     const resp_len = try common.sendAndReceive(stream_fd, frame, resp_buf);
-    // Response: 10-byte header + per-item [u8 status][u8 sub_status][u64 id] = 10 bytes.
     if (resp_len < common.RESPONSE_HEADER_SIZE + 10) return error.ProtocolError;
     if (resp_buf[5] != 0) return error.CreateCategoryFailed;
     const item_status = resp_buf[common.RESPONSE_HEADER_SIZE];
     if (item_status != 0) return error.CreateCategoryFailed;
-    // ID at offset RESPONSE_HEADER_SIZE + 2 (skipping item status + sub_status).
     return std.mem.readInt(u64, resp_buf[common.RESPONSE_HEADER_SIZE + 2 ..][0..8], .little);
 }
 
@@ -570,7 +508,7 @@ fn checkBatchResponse(resp: []const u8, expected_count: u16, id_min: *u64, id_ma
     const count = std.mem.readInt(u16, resp[8..10], .little);
     if (count != expected_count) return error.ProtocolError;
     var off: usize = common.RESPONSE_HEADER_SIZE;
-    const ITEM_BYTES: usize = 10; // [u8 status][u8 sub_status][u64 id]
+    const ITEM_BYTES: usize = 10;
     var i: u16 = 0;
     while (i < count) : (i += 1) {
         if (off + ITEM_BYTES > resp.len) return error.ProtocolError;
@@ -582,10 +520,6 @@ fn checkBatchResponse(resp: []const u8, expected_count: u16, id_min: *u64, id_ma
         off += ITEM_BYTES;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Argument parsing + utility
-// ─────────────────────────────────────────────────────────────────
 
 fn parseColdOpts(leftovers: []const []const u8) !ColdOpts {
     var opts = ColdOpts{};

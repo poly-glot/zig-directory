@@ -2,11 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench mixed` — RW workload with --read-pct controlling the
-// get_link / create_link split. Reads draw random IDs from the seeded
-// link range; writes use a per-worker monotonic counter (offset by
-// worker id) so concurrent workers never collide on URL.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const Opts = struct {
@@ -38,12 +33,10 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     };
     if (read_pct > 100) return error.InvalidReadPct;
 
-    // ── Load seed.json ───────────────────────────────────────────
     const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
     defer allocator.free(seed_path);
     const seed = try loadSeed(allocator, seed_path);
 
-    // ── Spawn worker threads ─────────────────────────────────────
     const ctxs = try allocator.alloc(WorkerCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
@@ -72,7 +65,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Merge ────────────────────────────────────────────────────
     var merged = common.Histogram{};
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
@@ -118,10 +110,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     try emitRecord(allocator, common_opts.output_path, record);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Worker
-// ─────────────────────────────────────────────────────────────────
-
 const WorkerCtx = struct {
     id: u32,
     host: []const u8,
@@ -162,20 +150,18 @@ fn workerRun(ctx: *WorkerCtx) !void {
     while (ctx.ops_completed < ctx.ops_per_worker) {
         const die = rand.intRangeAtMost(u32, 1, 100);
         const frame = if (die <= ctx.read_pct) blk: {
-            // Read: get_link
             const link_id = ctx.link_id_min + rand.uintLessThan(u64, span);
             var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.get_link));
             fb.writeU64(link_id);
             break :blk fb.finalize(1);
         } else blk: {
-            // Write: create_link batch=1
             write_counter += 1;
             var url_buf: [64]u8 = undefined;
             var title_buf: [32]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://b{d}.t", .{write_counter}) catch unreachable;
             const title = std.fmt.bufPrint(&title_buf, "L{d}", .{write_counter}) catch unreachable;
             var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.create_link));
-            fb.writeU64(1); // category_id = top
+            fb.writeU64(1);
             fb.writeU16LenPrefixed(url);
             fb.writeU16LenPrefixed(title);
             fb.writeU16LenPrefixed("");
@@ -200,10 +186,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
         ctx.ops_completed += 1;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
 
 fn parseOpts(leftovers: []const []const u8) !Opts {
     var opts = Opts{};

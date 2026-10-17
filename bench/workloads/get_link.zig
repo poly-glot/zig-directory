@@ -2,9 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench get_link` — point-read workload. Each worker draws random link
-// IDs from the seeded range and issues op=3 round-trips.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const Opts = struct {
@@ -29,12 +26,10 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
 
     if (common_opts.workers == 0) return error.InvalidWorkers;
 
-    // ── Load seed.json ───────────────────────────────────────────
     const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
     defer allocator.free(seed_path);
     const seed = try loadSeed(allocator, seed_path);
 
-    // ── Spawn worker threads ─────────────────────────────────────
     const ctxs = try allocator.alloc(WorkerCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
@@ -62,7 +57,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Merge ────────────────────────────────────────────────────
     var merged = common.Histogram{};
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
@@ -107,10 +101,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
 
     try emitRecord(allocator, common_opts.output_path, record);
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Worker
-// ─────────────────────────────────────────────────────────────────
 
 const WorkerCtx = struct {
     id: u32,
@@ -171,10 +161,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
         ctx.ops_completed += 1;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
 
 fn parseOpts(leftovers: []const []const u8) !Opts {
     var opts = Opts{};

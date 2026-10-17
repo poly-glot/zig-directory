@@ -2,11 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench seed` — populate a fresh dmozdb instance with a deterministic
-// fixture (balanced category tree + round-robin links) so subsequent read
-// workloads have stable IDs/slugs to reference. Writes a sidecar
-// `seed.json` next to the data dir; emits a single JSONL bench record.
-
 const SeedOpts = struct {
     data_dir: []const u8 = "/var/lib/dmozdb",
     categories: u32 = 1000,
@@ -27,7 +22,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     if (seed_opts.depth == 0) return error.InvalidDepth;
     if (seed_opts.categories == 0) return error.InvalidCategories;
 
-    // ── Optional: spawn the server ────────────────────────────────
     var maybe_child: ?std.process.Child = null;
     var argv_storage: std.ArrayList([]const u8) = .{};
     defer argv_storage.deinit(allocator);
@@ -38,7 +32,7 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         if (argv_storage.items.len == 0) return error.EmptyServerCmd;
 
         var child = std.process.Child.init(argv_storage.items, allocator);
-        child.stderr_behavior = .Inherit; // simpler: dmozdb logs go to our stderr
+        child.stderr_behavior = .Inherit;
         try child.spawn();
         maybe_child = child;
     }
@@ -46,7 +40,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         _ = c.kill() catch {};
     };
 
-    // ── RSS sampler (only if we own the server) ───────────────────
     var rss = common.RssSampler{
         .pid = if (maybe_child) |c| c.id else 0,
         .interval_ms = if (maybe_child != null) common_opts.rss_sample_ms else 0,
@@ -56,30 +49,22 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     }
     defer if (maybe_child != null and common_opts.rss_sample_ms > 0) rss.stop();
 
-    // ── Connect (with retries while server warms up) ──────────────
     const stream_fd = try connectWithRetry(common_opts.connect_host, common_opts.port, 5_000);
     defer posix.close(stream_fd);
     try ping(stream_fd);
 
-    // ── Plan the tree: per-level fanout ───────────────────────────
     const level_sizes = try planLevels(allocator, seed_opts.categories, seed_opts.depth);
     defer allocator.free(level_sizes);
 
     const t_start = std.time.nanoTimestamp();
 
-    // ── Buffers for protocol I/O ──────────────────────────────────
-    var resp_buf = try allocator.alloc(u8, 1 << 20); // 1 MiB
+    var resp_buf = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(resp_buf);
     const req_buf = try allocator.alloc(u8, 1 << 20);
     defer allocator.free(req_buf);
 
-    // dmozdb's migration auto-creates synthetic Top at id=1 and
-    // Lost+Found at id=2 on first boot. We treat Top as a given
-    // and build user categories under it.
     const top_id: u64 = 1;
 
-    // ── BFS-create category levels ────────────────────────────────
-    // level_ids[L] holds the IDs at level L (L=0 => first level under Top).
     var level_ids = try allocator.alloc([]u64, seed_opts.depth);
     defer {
         for (level_ids) |ids| allocator.free(ids);
@@ -107,11 +92,10 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         }
     }
 
-    const total_cats = cat_counter; // user categories (excludes Top)
-    const cat_id_min: u64 = top_id; // includes Top in the range
+    const total_cats = cat_counter;
+    const cat_id_min: u64 = top_id;
     const cat_id_max: u64 = level_ids[seed_opts.depth - 1][level_ids[seed_opts.depth - 1].len - 1];
 
-    // ── Create links round-robin across leaves ────────────────────
     const leaves = level_ids[seed_opts.depth - 1];
     const BATCH: usize = 100;
     var link_counter: u64 = 0;
@@ -147,15 +131,12 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Build sample paths (first 10 leaves) ──────────────────────
     var paths_arena = std.heap.ArenaAllocator.init(allocator);
     defer paths_arena.deinit();
     const sample_paths = try buildSamplePaths(paths_arena.allocator(), level_ids, seed_opts.depth);
 
-    // ── Write seed.json ───────────────────────────────────────────
     try writeSeedJson(allocator, seed_opts, total_cats, cat_id_min, cat_id_max, link_id_min, link_id_max, leaves, sample_paths);
 
-    // ── Emit bench record ─────────────────────────────────────────
     const ops_total: u64 = @as(u64, total_cats) + seed_opts.links;
     const ops_per_sec: u64 = if (duration_ms > 0) ops_total * 1000 / duration_ms else 0;
 
@@ -202,10 +183,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Argument parsing
-// ─────────────────────────────────────────────────────────────────
-
 fn parseSeedOpts(leftovers: []const []const u8) !SeedOpts {
     var opts = SeedOpts{};
     var i: usize = 0;
@@ -251,10 +228,6 @@ fn ensureDir(path: []const u8) !void {
     };
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Server lifecycle helpers
-// ─────────────────────────────────────────────────────────────────
-
 fn connectWithRetry(host: []const u8, port: u16, total_timeout_ms: u64) !i32 {
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(total_timeout_ms));
     var backoff_ms: u64 = 50;
@@ -281,17 +254,9 @@ fn ping(stream_fd: i32) !void {
     var resp_buf: [64]u8 = undefined;
     const n = try common.sendAndReceive(stream_fd, frame, &resp_buf);
     if (n < common.RESPONSE_HEADER_SIZE) return error.ProtocolError;
-    if (resp_buf[5] != 0) return error.PingFailed; // status=ok=0 in response byte 5
+    if (resp_buf[5] != 0) return error.PingFailed;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Tree planning
-// ─────────────────────────────────────────────────────────────────
-
-/// Plan per-level sizes for a balanced tree of `total` categories at `depth`.
-/// Levels grow geometrically with a fanout ≈ total^(1/depth), ceil-rounded so
-/// the sum is at least `total`. The deepest level absorbs any rounding excess
-/// so the actual total is exactly `total`.
 fn planLevels(allocator: std.mem.Allocator, total: u32, depth: u32) ![]u32 {
     const sizes = try allocator.alloc(u32, depth);
     errdefer allocator.free(sizes);
@@ -309,12 +274,8 @@ fn planLevels(allocator: std.mem.Allocator, total: u32, depth: u32) ![]u32 {
         sizes[i] = n;
         running += n;
     }
-    // Last level absorbs the remainder so the sum is exactly `total`.
     if (running >= total) {
-        // Fanout overshot: shrink the last interior level to make room for ≥1 leaf.
         sizes[depth - 1] = 1;
-        // Trim back the prior level so the overall sum hits `total`.
-        // (This branch is hit only for tiny totals.)
         if (depth >= 2) {
             sizes[depth - 2] -|= (running + 1 - total);
             if (sizes[depth - 2] == 0) sizes[depth - 2] = 1;
@@ -324,10 +285,6 @@ fn planLevels(allocator: std.mem.Allocator, total: u32, depth: u32) ![]u32 {
     }
     return sizes;
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Wire-protocol helpers
-// ─────────────────────────────────────────────────────────────────
 
 const Op = enum(u8) {
     create_link = 1,
@@ -339,9 +296,6 @@ const Status = enum(u8) {
     ok = 0,
 };
 
-/// Single create_category round-trip; returns the new ID. The protocol
-/// supports batching here too, but per-call latency is fine for ≤1000
-/// categories and keeping it simple makes the failure path cleaner.
 fn createCategory(
     stream_fd: i32,
     req_buf: []u8,
@@ -358,7 +312,6 @@ fn createCategory(
     fb.writeU16LenPrefixed(desc);
     const frame = fb.finalize(1);
     const resp_len = try common.sendAndReceive(stream_fd, frame, resp_buf);
-    // Response: 10-byte header + per-item [u8 status][u8 sub_status][u64 id] = 10 bytes.
     if (resp_len < common.RESPONSE_HEADER_SIZE + 10) return error.ProtocolError;
     if (resp_buf[5] != @intFromEnum(Status.ok)) {
         std.debug.print("create_category failed: server status={d} sub={d}\n", .{ resp_buf[5], resp_buf[6] });
@@ -370,21 +323,16 @@ fn createCategory(
         std.debug.print("create_category item failed: status={d} sub={d}\n", .{ item_status, item_sub });
         return error.CreateCategoryFailed;
     }
-    // ID follows the [u8 status][u8 sub_status] pair.
     return std.mem.readInt(u64, resp_buf[common.RESPONSE_HEADER_SIZE + 2 ..][0..8], .little);
 }
 
-/// Walk a batched create response, asserting all items succeeded and
-/// updating the running min/max link IDs. Per-item layout is now
-/// [u8 status][u8 sub_status][u64 id] = 10 bytes (sub_status was added
-/// in the operations-surface uplift).
 fn checkBatchResponse(resp: []const u8, expected_count: u16, id_min: *u64, id_max: *u64) !void {
     if (resp.len < common.RESPONSE_HEADER_SIZE) return error.ProtocolError;
     if (resp[5] != @intFromEnum(Status.ok)) return error.ProtocolError;
     const count = std.mem.readInt(u16, resp[8..10], .little);
     if (count != expected_count) return error.ProtocolError;
     var off: usize = common.RESPONSE_HEADER_SIZE;
-    const ITEM_BYTES: usize = 10; // [u8 status][u8 sub_status][u64 id]
+    const ITEM_BYTES: usize = 10;
     var i: u16 = 0;
     while (i < count) : (i += 1) {
         if (off + ITEM_BYTES > resp.len) return error.ProtocolError;
@@ -397,17 +345,11 @@ fn checkBatchResponse(resp: []const u8, expected_count: u16, id_min: *u64, id_ma
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// seed.json output
-// ─────────────────────────────────────────────────────────────────
-
 fn buildSamplePaths(
     arena: std.mem.Allocator,
     level_ids: []const []u64,
     depth: u32,
 ) ![]const []const u8 {
-    // For the first 10 leaves, build "top/cA/cB/.../cZ" by walking
-    // back up the round-robin parent chain we constructed.
     const leaves = level_ids[depth - 1];
     const sample_n = @min(@as(usize, 10), leaves.len);
     const paths = try arena.alloc([]const u8, sample_n);
@@ -418,37 +360,17 @@ fn buildSamplePaths(
         defer slugs.deinit(arena);
         try slugs.append(arena, "top");
 
-        // Walk down: at level L, the index in that level for this leaf is
-        // (leaf_idx_in_level) % parents_at_level_L. We reconstruct the
-        // round-robin chain by tracking the index at each level.
         const idx_at_level: usize = i;
         var L: u32 = 0;
         while (L < depth) : (L += 1) {
             const this_level = level_ids[L];
-            // At construction, child i in level L+1 had parent = parents[i % parents.len].
-            // For the leaf at index i in the deepest level, its slug at this level is
-            // the BFS-allocated category at index (idx_at_level) of `this_level`...
-            // but only when L == depth - 1 (the leaf itself). For intermediate
-            // levels, idx_at_level shrinks via modulus.
             if (L == depth - 1) {
-                // This is the leaf itself.
                 const cat_id = this_level[idx_at_level];
                 var buf: [32]u8 = undefined;
                 const slug = try std.fmt.bufPrint(&buf, "c{d}", .{slugIndexFor(level_ids, L, cat_id)});
                 const owned = try arena.dupe(u8, slug);
                 try slugs.append(arena, owned);
             } else {
-                // Walk up: this leaf's parent at level L is at index
-                // (i % this_level.len). But we want the chain from root down,
-                // so we recompute: at construction, level L's category j had
-                // parent = level L-1's category at index j % parents.len.
-                // For our leaf at deepest level index i, its level-L ancestor
-                // is reached by reverse-mapping: the leaf was created with
-                // parent at level depth-2's index (i % size[depth-2]),
-                // which was created with parent at level depth-3's index
-                // ((i % size[depth-2]) % size[depth-3]), etc. Simpler:
-                // ancestor index at level L = i % this_level.len, since
-                // each level wraps independently from i.
                 const anc_idx = i % this_level.len;
                 const cat_id = this_level[anc_idx];
                 var buf: [32]u8 = undefined;
@@ -464,10 +386,6 @@ fn buildSamplePaths(
     return paths;
 }
 
-/// Map a category ID back to its 1-based slug index. We assigned slugs
-/// "c1", "c2", ... in BFS order, so the slug index is the count of all
-/// categories created at or before this one. Equivalently:
-///   sum(level_sizes[0..L]) + position_in_level + 1
 fn slugIndexFor(level_ids: []const []u64, level: u32, cat_id: u64) u32 {
     var prior: u32 = 0;
     var i: u32 = 0;
@@ -475,7 +393,7 @@ fn slugIndexFor(level_ids: []const []u64, level: u32, cat_id: u64) u32 {
     for (level_ids[level], 0..) |id, pos| {
         if (id == cat_id) return prior + @as(u32, @intCast(pos)) + 1;
     }
-    return 0; // unreachable in practice
+    return 0;
 }
 
 fn writeSeedJson(

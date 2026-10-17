@@ -2,11 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench search` — full-text search workload. Builds a small query
-// corpus from seed.json sample tokens (singletons + pairs) and picks
-// one per op. `--target` is recorded as metadata; the server returns
-// both categories and links per request regardless.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const Target = enum { links, categories };
@@ -36,7 +31,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    // ── Load seed.json + build corpus ────────────────────────────
     const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
     defer allocator.free(seed_path);
     const tokens = try loadTokens(arena.allocator(), seed_path);
@@ -46,7 +40,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         return error.EmptyCorpus;
     }
 
-    // ── Spawn worker threads ─────────────────────────────────────
     const ctxs = try allocator.alloc(WorkerCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
@@ -73,7 +66,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Merge ────────────────────────────────────────────────────
     var merged = common.Histogram{};
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
@@ -125,10 +117,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     try emitRecord(allocator, common_opts.output_path, record);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Worker
-// ─────────────────────────────────────────────────────────────────
-
 const WorkerCtx = struct {
     id: u32,
     host: []const u8,
@@ -166,7 +154,7 @@ fn workerRun(ctx: *WorkerCtx) !void {
         const query = ctx.corpus[rand.uintLessThan(usize, ctx.corpus.len)];
         var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.search));
         fb.writeU16LenPrefixed(query);
-        fb.writeU32(50); // limit
+        fb.writeU32(50);
         const frame = fb.finalize(1);
 
         const t0 = std.time.nanoTimestamp();
@@ -187,10 +175,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
         ctx.ops_completed += 1;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
 
 fn parseOpts(leftovers: []const []const u8) !Opts {
     var opts = Opts{};
@@ -233,8 +217,6 @@ fn loadTokens(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     return parsed.sample_query_tokens;
 }
 
-/// Up to ~20 single-token queries + ~10 two-token combinations.
-/// All slices are arena-owned and stable for the bench's lifetime.
 fn buildCorpus(arena: std.mem.Allocator, tokens: []const []const u8) ![]const []const u8 {
     const max_singletons: usize = @min(tokens.len, 20);
     const max_pairs: usize = if (tokens.len < 2) 0 else 10;

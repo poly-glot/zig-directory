@@ -1,31 +1,19 @@
 const std = @import("std");
 const posix = std.posix;
 
-// Shared bench infrastructure. Tasks 2-5 of the implementation plan.
-
-/// Request frames carry an 8-byte header — request format is unchanged.
 pub const REQUEST_HEADER_SIZE: usize = 8;
 
-/// Response frames carry a 10-byte header (status + sub_status + reserved + count).
 pub const RESPONSE_HEADER_SIZE: usize = 10;
 
-/// Back-compat alias used by the FrameBuilder (which constructs request
-/// frames). All request-side callers should treat HEADER_SIZE as the
-/// request header width.
 pub const HEADER_SIZE: usize = REQUEST_HEADER_SIZE;
-
-// ────────────────────────────────────────────────────────────────────────────
-// Task 2 — TCP framing helpers
-// ────────────────────────────────────────────────────────────────────────────
 
 pub const FrameBuilder = struct {
     buf: []u8,
     pos: usize,
 
     pub fn init(buf: []u8, op: u8) FrameBuilder {
-        // Reserve header; finalize() back-patches length.
         buf[4] = op;
-        buf[5] = 0; // flags
+        buf[5] = 0;
         return .{ .buf = buf, .pos = HEADER_SIZE };
     }
 
@@ -61,12 +49,6 @@ pub const FrameBuilder = struct {
     }
 };
 
-/// Send a frame and read the full response. Returns the response length.
-///
-/// First reads the 10-byte response header (so workloads that index into
-/// `resp_buf[5]` for status, `resp_buf[6]` for sub_status, etc. observe a
-/// fully-populated header), then keeps reading until the full frame is
-/// drained. Response length includes the 10-byte header.
 pub fn sendAndReceive(stream_fd: i32, frame: []const u8, resp_buf: []u8) !usize {
     var sent: usize = 0;
     while (sent < frame.len) {
@@ -89,12 +71,6 @@ pub fn sendAndReceive(stream_fd: i32, frame: []const u8, resp_buf: []u8) !usize 
     return resp_len;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Task 3 — HDR-lite Histogram
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Log-linear histogram: 32 octaves × 64 sub-buckets covers 1 ns
-/// to ~4 s with ±1.5% resolution. ~7.5 KB per histogram.
 const NUM_OCTAVES: usize = 32;
 const SUB_BUCKETS: usize = 64;
 
@@ -112,10 +88,8 @@ pub const Histogram = struct {
             self.buckets[0][0] += 1;
             return;
         }
-        // Octave = log2(ns); sub-bucket interpolates within the octave.
         const octave = @as(usize, @intCast(63 - @clz(ns)));
         const o = @min(octave, NUM_OCTAVES - 1);
-        // Linear sub-bucket within [2^octave, 2^(octave+1)).
         const base: u64 = @as(u64, 1) << @intCast(o);
         const offset = ns - base;
         const sub = @min(@as(usize, @intCast((offset * SUB_BUCKETS) / base)), SUB_BUCKETS - 1);
@@ -160,10 +134,6 @@ pub const Histogram = struct {
     }
 };
 
-// ────────────────────────────────────────────────────────────────────────────
-// Task 4 — JSON Lines writer + BenchRecord schema
-// ────────────────────────────────────────────────────────────────────────────
-
 pub const LatencyStats = struct {
     p50: u64,
     p95: u64,
@@ -186,9 +156,6 @@ pub const ErrorCounts = struct {
     protocol_error: u64,
 };
 
-/// Tagged union of workload-specific parameters. Custom `jsonStringify`
-/// flattens the active variant to a plain object (so the JSON shape is
-/// `"params": { workers: ... }`, not `"params": { "create_link": {...} }`).
 pub const WorkloadParams = union(enum) {
     seed: struct { categories: u32, links: u64, depth: u32 },
     create_link: struct { workers: u32, batch_size: u32, ops_per_worker: u64 },
@@ -199,8 +166,6 @@ pub const WorkloadParams = union(enum) {
     cold: struct { kind: []const u8, iterations: u32, server_cmd: []const u8 },
 
     pub fn jsonStringify(self: WorkloadParams, jw: *std.json.Stringify) !void {
-        // Emit the active variant's payload struct directly, without the
-        // tag-name wrapper that std.json's default union encoder produces.
         switch (self) {
             inline else => |payload| try jw.write(payload),
         }
@@ -228,7 +193,6 @@ pub const JsonLineWriter = struct {
     mutex: std.Thread.Mutex = .{},
 
     pub fn open(path: []const u8) !JsonLineWriter {
-        // Create-or-open without truncation; seek to end so we append.
         const file = try std.fs.cwd().createFile(path, .{ .read = false, .truncate = false });
         try file.seekFromEnd(0);
         return .{ .file = file };
@@ -247,10 +211,6 @@ pub const JsonLineWriter = struct {
         self.file.close();
     }
 };
-
-// ────────────────────────────────────────────────────────────────────────────
-// Task 5 — RSS sampler + WorkerCtx + CommonOpts parsing
-// ────────────────────────────────────────────────────────────────────────────
 
 pub const RssSampler = struct {
     pid: i32,
@@ -278,7 +238,6 @@ pub const RssSampler = struct {
                 std.log.warn("rss sample failed: {s}", .{@errorName(err)});
                 continue;
             };
-            // Update peak with a CAS retry loop.
             while (true) {
                 const cur = self.peak.load(.monotonic);
                 if (rss <= cur) break;
@@ -299,7 +258,7 @@ pub const RssSampler = struct {
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "VmRSS:")) {
                 var parts = std.mem.tokenizeAny(u8, line, " \t");
-                _ = parts.next(); // "VmRSS:"
+                _ = parts.next();
                 const kb_str = parts.next() orelse return error.ParseError;
                 const kb = try std.fmt.parseInt(u64, kb_str, 10);
                 return kb * 1024;
@@ -330,10 +289,6 @@ pub const CommonOpts = struct {
     git_rev: ?[]const u8 = null,
 };
 
-/// Parse common bench flags from `args`. Unknown flags (and any value paired
-/// with them) are appended to `leftovers` for the workload-specific parser to
-/// handle. The caller owns `leftovers` and is responsible for freeing it; the
-/// stored slices are owned by `args`'s iterator and live as long as it does.
 pub fn parseCommonOpts(
     args: *std.process.ArgIterator,
     leftovers: *std.ArrayList([]const u8),
@@ -371,18 +326,14 @@ pub fn parseCommonOpts(
     return opts;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
-
 test "FrameBuilder: round-trip a create_link frame" {
     var buf: [256]u8 = undefined;
-    var fb = FrameBuilder.init(&buf, 1); // op = create_link
-    fb.writeU64(42); // category_id
+    var fb = FrameBuilder.init(&buf, 1);
+    fb.writeU64(42);
     fb.writeU16LenPrefixed("https://example.com");
     fb.writeU16LenPrefixed("Example");
     fb.writeU16LenPrefixed("");
-    const frame = fb.finalize(1); // count = 1
+    const frame = fb.finalize(1);
 
     const len = std.mem.readInt(u32, frame[0..4], .little);
     try std.testing.expectEqual(frame.len, len);
@@ -392,15 +343,12 @@ test "FrameBuilder: round-trip a create_link frame" {
 
 test "Histogram: percentile resolution within 2% of true value" {
     var h = Histogram{};
-    // Insert 1000 samples uniformly from 1us to 1ms.
     var i: u64 = 0;
     while (i < 1000) : (i += 1) {
-        h.recordValue(1_000 + i * 1_000); // 1us..1ms in 1us steps
+        h.recordValue(1_000 + i * 1_000);
     }
-    // True p50 ≈ 500us = 500_000 ns.
     const p50 = h.percentile(50.0);
     try std.testing.expect(p50 > 490_000 and p50 < 510_000);
-    // True p99 ≈ 990us = 990_000 ns.
     const p99 = h.percentile(99.0);
     try std.testing.expect(p99 > 970_000 and p99 < 1_010_000);
 }
@@ -444,7 +392,6 @@ test "JsonLineWriter: appends valid JSONL lines" {
     try w.appendRecord(rec);
     try w.appendRecord(rec);
 
-    // Read back and verify two valid JSON lines.
     const f = try std.fs.cwd().openFile(file, .{});
     defer f.close();
     const contents = try f.readToEndAlloc(std.testing.allocator, 1 << 20);
