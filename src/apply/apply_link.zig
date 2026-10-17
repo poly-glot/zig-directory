@@ -4,6 +4,7 @@ const schema = @import("../schema.zig");
 const changeset = @import("../changeset.zig");
 const Directory = @import("../directory.zig").Directory;
 const apply = @import("apply.zig");
+const test_support = @import("../test_support.zig");
 
 fn linkStatusCounter(db: *Directory, status: u8) ?*std.atomic.Value(u64) {
     return switch (status) {
@@ -154,16 +155,13 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
     const aa = arena.allocator();
 
     const link_id: u64 = 100;
-    const link = schema.Link{
+    const link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice("https://x.example"),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("World"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = "https://x.example",
+        .title = "Hello",
+        .description = "World",
+    });
     const ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
         .{ .cat_id = top_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
@@ -185,28 +183,16 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
 
     const cl_key = schema.CategoryLinkKey.encode(.{ cat_id, link_id });
     var v_buf: [64]u8 = undefined;
-    const cl_in_mt = db.mt_link_by_category().get(&cl_key);
-    const cl_present = switch (cl_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_category().search(&cl_key, &v_buf)) != null,
-    };
+    const cl_present = try test_support.isPresent(db.mt_link_by_category(), db.link_by_category(), &cl_key);
     try std.testing.expect(cl_present);
 
     const hash_key = codec.encodeU64(codec.hash("https://x.example"));
-    const hash_in_mt = db.mt_link_by_url_hash().get(&hash_key);
-    const hash_present = switch (hash_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_url_hash().search(&hash_key, &v_buf)) != null,
-    };
+    const hash_present = try test_support.isPresent(db.mt_link_by_url_hash(), db.link_by_url_hash(), &hash_key);
     try std.testing.expect(hash_present);
 
     var token_key_buf: [32]u8 = undefined;
-    @memcpy(token_key_buf[0..5], "hello");
-    const link_id_be = codec.encodeU64(link_id);
-    @memcpy(token_key_buf[5..13], &link_id_be);
-    try std.testing.expect((try db.links_index_tree().search(token_key_buf[0..13], &v_buf)) != null);
+    const token_key = test_support.tokenKey(&token_key_buf, "hello", link_id);
+    try std.testing.expect((try db.links_index_tree().search(token_key, &v_buf)) != null);
 
     const got_cat = (try ops.getCategory(db, cat_id)).?;
     const got_top = (try ops.getCategory(db, top_id)).?;
@@ -235,16 +221,13 @@ test "applyLinkInserted: retry is index-idempotent; recount reconciles delta dou
     const aa = arena.allocator();
 
     const link_id: u64 = 200;
-    const link = schema.Link{
+    const link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice("https://idempotent.example"),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("World"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = "https://idempotent.example",
+        .title = "Hello",
+        .description = "World",
+    });
     const ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
         .{ .cat_id = top_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
@@ -294,16 +277,13 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
     const aa = arena.allocator();
 
     const link_id: u64 = 300;
-    const link = schema.Link{
+    const link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice("https://reverse.example"),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("World"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = "https://reverse.example",
+        .title = "Hello",
+        .description = "World",
+    });
 
     const insert_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
@@ -337,28 +317,16 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
 
     const cl_key = schema.CategoryLinkKey.encode(.{ cat_id, link_id });
     var v_buf: [64]u8 = undefined;
-    const cl_in_mt = db.mt_link_by_category().get(&cl_key);
-    const cl_present = switch (cl_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_category().search(&cl_key, &v_buf)) != null,
-    };
+    const cl_present = try test_support.isPresent(db.mt_link_by_category(), db.link_by_category(), &cl_key);
     try std.testing.expect(!cl_present);
 
     const hash_key = codec.encodeU64(codec.hash("https://reverse.example"));
-    const hash_in_mt = db.mt_link_by_url_hash().get(&hash_key);
-    const hash_present = switch (hash_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_url_hash().search(&hash_key, &v_buf)) != null,
-    };
+    const hash_present = try test_support.isPresent(db.mt_link_by_url_hash(), db.link_by_url_hash(), &hash_key);
     try std.testing.expect(!hash_present);
 
     var token_key_buf: [32]u8 = undefined;
-    @memcpy(token_key_buf[0..5], "hello");
-    const link_id_be = codec.encodeU64(link_id);
-    @memcpy(token_key_buf[5..13], &link_id_be);
-    try std.testing.expect((try db.links_index_tree().search(token_key_buf[0..13], &v_buf)) == null);
+    const token_key = test_support.tokenKey(&token_key_buf, "hello", link_id);
+    try std.testing.expect((try db.links_index_tree().search(token_key, &v_buf)) == null);
 
     const got_cat = (try ops.getCategory(db, cat_id)).?;
     const got_top = (try ops.getCategory(db, top_id)).?;
@@ -385,16 +353,13 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
 
     const link_id: u64 = 400;
     const url = "https://text-update.example";
-    const old_link = schema.Link{
+    const old_link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice(url),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("Old desc"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = url,
+        .title = "Hello",
+        .description = "Old desc",
+    });
 
     const insert_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
@@ -410,16 +375,14 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
     } };
     try db.commit(insert_cs);
 
-    const new_link = schema.Link{
+    const new_link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice(url),
-        .title = codec.FixedString(128).fromSlice("World"),
-        .description = codec.FixedString(256).fromSlice("New desc"),
-        .sort_order = 0,
-        .created_at = 1000,
+        .url = url,
+        .title = "World",
+        .description = "New desc",
         .updated_at = 2000,
-    };
+    });
     const old_tokens = try aa.dupe(changeset.Token, &.{
         .{ .text = try aa.dupe(u8, "hello"), .field = .title },
     });
@@ -439,24 +402,16 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
     try std.testing.expectEqualStrings("New desc", got_link.description.slice());
 
     var v_buf: [64]u8 = undefined;
-    var old_token_key: [32]u8 = undefined;
-    @memcpy(old_token_key[0..5], "hello");
-    const link_id_be = codec.encodeU64(link_id);
-    @memcpy(old_token_key[5..13], &link_id_be);
-    try std.testing.expect((try db.links_index_tree().search(old_token_key[0..13], &v_buf)) == null);
+    var old_token_key_buf: [32]u8 = undefined;
+    const old_token_key = test_support.tokenKey(&old_token_key_buf, "hello", link_id);
+    try std.testing.expect((try db.links_index_tree().search(old_token_key, &v_buf)) == null);
 
-    var new_token_key: [32]u8 = undefined;
-    @memcpy(new_token_key[0..5], "world");
-    @memcpy(new_token_key[5..13], &link_id_be);
-    try std.testing.expect((try db.links_index_tree().search(new_token_key[0..13], &v_buf)) != null);
+    var new_token_key_buf: [32]u8 = undefined;
+    const new_token_key = test_support.tokenKey(&new_token_key_buf, "world", link_id);
+    try std.testing.expect((try db.links_index_tree().search(new_token_key, &v_buf)) != null);
 
     const hash_key = codec.encodeU64(codec.hash(url));
-    const hash_in_mt = db.mt_link_by_url_hash().get(&hash_key);
-    const hash_present = switch (hash_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_url_hash().search(&hash_key, &v_buf)) != null,
-    };
+    const hash_present = try test_support.isPresent(db.mt_link_by_url_hash(), db.link_by_url_hash(), &hash_key);
     try std.testing.expect(hash_present);
 
     const got_cat = (try ops.getCategory(db, cat_id)).?;
@@ -484,16 +439,13 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     const link_id: u64 = 401;
     const old_url = "https://old.example";
     const new_url = "https://new.example";
-    const old_link = schema.Link{
+    const old_link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice(old_url),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("Old desc"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = old_url,
+        .title = "Hello",
+        .description = "Old desc",
+    });
 
     const insert_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
@@ -509,16 +461,14 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     } };
     try db.commit(insert_cs);
 
-    const new_link = schema.Link{
+    const new_link = test_support.link(.{
         .id = link_id,
         .category_id = cat_id,
-        .url = codec.FixedString(64).fromSlice(new_url),
-        .title = codec.FixedString(128).fromSlice("World"),
-        .description = codec.FixedString(256).fromSlice("New desc"),
-        .sort_order = 0,
-        .created_at = 1000,
+        .url = new_url,
+        .title = "World",
+        .description = "New desc",
         .updated_at = 2000,
-    };
+    });
     const old_tokens = try aa.dupe(changeset.Token, &.{
         .{ .text = try aa.dupe(u8, "hello"), .field = .title },
     });
@@ -540,33 +490,20 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     var v_buf: [64]u8 = undefined;
 
     const old_hash_key = codec.encodeU64(codec.hash(old_url));
-    const old_hash_in_mt = db.mt_link_by_url_hash().get(&old_hash_key);
-    const old_hash_present = switch (old_hash_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_url_hash().search(&old_hash_key, &v_buf)) != null,
-    };
+    const old_hash_present = try test_support.isPresent(db.mt_link_by_url_hash(), db.link_by_url_hash(), &old_hash_key);
     try std.testing.expect(!old_hash_present);
 
     const new_hash_key = codec.encodeU64(codec.hash(new_url));
-    const new_hash_in_mt = db.mt_link_by_url_hash().get(&new_hash_key);
-    const new_hash_present = switch (new_hash_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_url_hash().search(&new_hash_key, &v_buf)) != null,
-    };
+    const new_hash_present = try test_support.isPresent(db.mt_link_by_url_hash(), db.link_by_url_hash(), &new_hash_key);
     try std.testing.expect(new_hash_present);
 
-    const link_id_be = codec.encodeU64(link_id);
-    var old_token_key: [32]u8 = undefined;
-    @memcpy(old_token_key[0..5], "hello");
-    @memcpy(old_token_key[5..13], &link_id_be);
-    try std.testing.expect((try db.links_index_tree().search(old_token_key[0..13], &v_buf)) == null);
+    var old_token_key_buf: [32]u8 = undefined;
+    const old_token_key = test_support.tokenKey(&old_token_key_buf, "hello", link_id);
+    try std.testing.expect((try db.links_index_tree().search(old_token_key, &v_buf)) == null);
 
-    var new_token_key: [32]u8 = undefined;
-    @memcpy(new_token_key[0..5], "world");
-    @memcpy(new_token_key[5..13], &link_id_be);
-    try std.testing.expect((try db.links_index_tree().search(new_token_key[0..13], &v_buf)) != null);
+    var new_token_key_buf: [32]u8 = undefined;
+    const new_token_key = test_support.tokenKey(&new_token_key_buf, "world", link_id);
+    try std.testing.expect((try db.links_index_tree().search(new_token_key, &v_buf)) != null);
 
     try std.testing.expect(db.url_bloom.mayContain(new_url));
 }
@@ -590,16 +527,13 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     const aa = arena.allocator();
 
     const link_id: u64 = 500;
-    const link_in_a = schema.Link{
+    const link_in_a = test_support.link(.{
         .id = link_id,
         .category_id = cat_a_id,
-        .url = codec.FixedString(64).fromSlice("https://recat.example"),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("World"),
-        .sort_order = 0,
-        .created_at = 1000,
-        .updated_at = 1000,
-    };
+        .url = "https://recat.example",
+        .title = "Hello",
+        .description = "World",
+    });
 
     const insert_ancestors = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_a_id, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
@@ -615,16 +549,14 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     } };
     try db.commit(insert_cs);
 
-    const link_in_b = schema.Link{
+    const link_in_b = test_support.link(.{
         .id = link_id,
         .category_id = cat_b_id,
-        .url = codec.FixedString(64).fromSlice("https://recat.example"),
-        .title = codec.FixedString(128).fromSlice("Hello"),
-        .description = codec.FixedString(256).fromSlice("World"),
-        .sort_order = 0,
-        .created_at = 1000,
+        .url = "https://recat.example",
+        .title = "Hello",
+        .description = "World",
         .updated_at = 2000,
-    };
+    });
     const old_chain = try aa.dupe(changeset.AncestorUpdate, &.{
         .{ .cat_id = cat_a_id, .link_count_subtree_delta = -1, .child_count_subtree_delta = 0 },
         .{ .cat_id = top_id, .link_count_subtree_delta = -1, .child_count_subtree_delta = 0 },
@@ -641,24 +573,12 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     } };
     try db.commit(recat_cs);
 
-    var v_buf: [64]u8 = undefined;
-
     const old_cl_key = schema.CategoryLinkKey.encode(.{ cat_a_id, link_id });
-    const old_cl_in_mt = db.mt_link_by_category().get(&old_cl_key);
-    const old_cl_present = switch (old_cl_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_category().search(&old_cl_key, &v_buf)) != null,
-    };
+    const old_cl_present = try test_support.isPresent(db.mt_link_by_category(), db.link_by_category(), &old_cl_key);
     try std.testing.expect(!old_cl_present);
 
     const new_cl_key = schema.CategoryLinkKey.encode(.{ cat_b_id, link_id });
-    const new_cl_in_mt = db.mt_link_by_category().get(&new_cl_key);
-    const new_cl_present = switch (new_cl_in_mt) {
-        .found => true,
-        .deleted => false,
-        .not_found => (try db.link_by_category().search(&new_cl_key, &v_buf)) != null,
-    };
+    const new_cl_present = try test_support.isPresent(db.mt_link_by_category(), db.link_by_category(), &new_cl_key);
     try std.testing.expect(new_cl_present);
 
     const got_link = (try ops.getLink(db, link_id)).?;

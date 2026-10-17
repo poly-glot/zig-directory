@@ -6,6 +6,7 @@ const shared = @import("operations_shared.zig");
 const compute = @import("operations_changeset_compute.zig");
 const link_mod = @import("operations_link.zig");
 const slug_mod = @import("operations_slug.zig");
+const test_support = @import("../test_support.zig");
 
 const OperationError = shared.OperationError;
 const MAX_NAME_LEN = shared.MAX_NAME_LEN;
@@ -818,21 +819,11 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
     var v_buf: [64]u8 = undefined;
     {
         const old_pc_key = schema.ParentChildKey.encode(.{ a_id, c_id });
-        const mt_old = db.mt_cat_by_parent().get(&old_pc_key);
-        const old_present = switch (mt_old) {
-            .found => true,
-            .deleted => false,
-            .not_found => (try db.cat_by_parent().search(&old_pc_key, &v_buf)) != null,
-        };
+        const old_present = try test_support.isPresent(db.mt_cat_by_parent(), db.cat_by_parent(), &old_pc_key);
         try std.testing.expect(!old_present);
 
         const new_pc_key = schema.ParentChildKey.encode(.{ b_id, c_id });
-        const mt_new = db.mt_cat_by_parent().get(&new_pc_key);
-        const new_present = switch (mt_new) {
-            .found => true,
-            .deleted => false,
-            .not_found => (try db.cat_by_parent().search(&new_pc_key, &v_buf)) != null,
-        };
+        const new_present = try test_support.isPresent(db.mt_cat_by_parent(), db.cat_by_parent(), &new_pc_key);
         try std.testing.expect(new_present);
     }
 
