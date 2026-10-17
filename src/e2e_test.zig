@@ -282,14 +282,14 @@ test "E2E: snapshot create and load meta" {
 
     const dir = db.config.data_dir;
     var snap_mgr = zigstore.snapshot.SnapshotManager.init(dir, 3600);
-    try snap_mgr.createSnapshot(db.store.snapshotHost(), 42);
+    try snap_mgr.createSnapshot(db.store.snapshotHost());
 
     const meta = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(dir)).?;
     try testing.expectEqual(@as(u32, 0x534E4150), meta.magic);
-    try testing.expectEqual(@as(u64, 42), meta.wal_sequence);
+    try testing.expectEqual(db.store.header.seq, meta.wal_sequence);
 
     const seq = try zigstore.snapshot.SnapshotManager.getWalSequence(dir);
-    try testing.expectEqual(@as(u64, 42), seq);
+    try testing.expectEqual(meta.wal_sequence, seq);
 }
 
 test "E2E: data persists across database close and reopen" {
@@ -303,8 +303,7 @@ test "E2E: data persists across database close and reopen" {
         var db = try Directory.openTestInstance(testing.allocator, &tmp);
         cat_id = try ops.createCategory(db, 0, "Persistent", "persistent", "This should survive restart");
         link_id = try ops.createLink(db, cat_id, "https://persist.com", "Persist Link", "Persistent link");
-        try db.flushHeader();
-        try db.store.cache.flushAll();
+        try db.checkpoint();
         db.deinitTestInstance();
     }
 
@@ -393,8 +392,8 @@ test "e2e: > threshold rename enqueues task, worker drains, queue empties" {
         const slug = std.fmt.bufPrint(&slug_buf, "c{d}", .{i}) catch unreachable;
         _ = try ops.createCategory(db, parent_id, "x", slug, "");
     }
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try ops.updateCategory(db, parent_id, null, "new", null);
     try std.testing.expect(db.slug_path_repair_queue().entry_count > 0);
@@ -469,7 +468,7 @@ test "H1: a snapshot persists the page-0 header so data survives a later crash" 
         const top = try ops.createCategory(a, 0, "Top", "top", "");
         const child = try ops.createCategory(a, top, "Child", "child", "");
         const link = try ops.createLink(a, child, "https://snap.example", "Snap", "");
-        a.drainAllMemtables();
+        try a.drainAllMemtables();
         _ = try zigstore.snapshot.forceSnapshot(a.store.snapshotHost());
         a.deinitCrashTestInstance();
         break :blk .{ child, link };

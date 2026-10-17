@@ -75,11 +75,11 @@ pub const VerifierState = struct {
 pub fn runOnce(db: *Directory, state: *VerifierState) !void {
     const t0 = std.time.milliTimestamp();
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
-    db.drainOneMemtable(db.mt_link_by_url_hash(), db.link_by_url_hash());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drainOneMemtable(db.mt_link_by_url_hash(), db.link_by_url_hash());
 
     const cat_count = try countTree(db.categories_by_id(), codec.encodeU64(0)[0..]);
     const link_count = try countTree(db.links_by_id(), codec.encodeU64(0)[0..]);
@@ -329,7 +329,7 @@ test "verifier: detects subtree count drift without repairing (WARN-only)" {
     }
     _ = try ops.createLink(db, sibling_ids[0], "https://x.example", "x", "");
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     {
         var cat = (try ops.getCategory(db, sibling_ids[0])).?;
@@ -360,7 +360,7 @@ test "verifier: tampered link_count surfaces drift on link_by_category invariant
     _ = try ops.createLink(db, top, "https://a.example", "a", "");
     _ = try ops.createLink(db, top, "https://b.example", "b", "");
 
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     {
         var key_copy: [16]u8 = undefined;
@@ -396,7 +396,7 @@ test "verifier: tampered child_count_subtree surfaces drift" {
     _ = try ops.createCategory(db, top, "A", "a", "");
     _ = try ops.createCategory(db, top, "B", "b", "");
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     {
         var cat = (try ops.getCategory(db, top)).?;
@@ -444,8 +444,8 @@ test "verifier: runOnce does not mutate categories_by_id count" {
     _ = try ops.createCategory(db, top, "A", "a", "");
     _ = try ops.createLink(db, top, "https://x.example", "x", "");
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const before_cats = db.categories_by_id().entry_count;
     const before_links = db.links_by_id().entry_count;
@@ -590,7 +590,7 @@ test "verifier reports a link whose category no longer exists" {
     const doomed = try ops.createCategory(db, top, "Doomed", "doomed", "");
     _ = try ops.createLink(db, doomed, "https://orphan.example", "Orphan", "");
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
     const doomed_key = codec.encodeU64(doomed);
     _ = try db.categories_by_id().delete(&doomed_key);
 

@@ -202,7 +202,7 @@ pub fn countsByStatus(db: *Directory) !StatusCounts {
 }
 
 pub fn recountLinkStatuses(db: *Directory) !void {
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const bloom_capacity = @max(db.links_by_id().entry_count *| 2, URL_BLOOM_INITIAL_CAPACITY);
     if (zigstore.BloomFilter.init(db.allocator, bloom_capacity)) |new_bloom| {
@@ -333,7 +333,7 @@ pub fn listLinks(
     status_filter: ?u8,
     after_id: u64,
 ) !LinkPage {
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
     const seek_id: u64 = if (after_id > 0) after_id +| 1 else 0;
     const start_key = schema.CategoryLinkKey.encode(.{ category_id, seek_id });
     const end_key = schema.CategoryLinkKey.encode(.{ category_id, std.math.maxInt(u64) });
@@ -350,7 +350,7 @@ pub fn listLinksBySubmitter(
     status_filter: ?u8,
     after_id: u64,
 ) !LinkPage {
-    db.drainOneMemtable(db.mt_link_by_submitter(), db.link_by_submitter());
+    try db.drainOneMemtable(db.mt_link_by_submitter(), db.link_by_submitter());
     const seek_id: u64 = if (after_id > 0) after_id +| 1 else 0;
     const start_key = schema.SubmitterLinkKey.encode(.{ submitter_id, seek_id });
     const end_key = schema.SubmitterLinkKey.encode(.{ submitter_id, std.math.maxInt(u64) });
@@ -366,7 +366,7 @@ pub fn listAllLinks(
     status_filter: ?u8,
     after_id: u64,
 ) !LinkPage {
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
     const seek_id: u64 = if (after_id > 0) after_id +| 1 else 0;
     const start_key = codec.encodeU64(seek_id);
     var iter = try db.links_by_id().rangeScan(&start_key, null);
@@ -815,12 +815,12 @@ test "moveLink: happy path swaps category + updates both chains" {
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "A", "a", "");
     const b_id = try ops.createCategory(db, top_id, "B", "b", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const link_id = try ops.createLink(db, a_id, "https://move.test/x", "Move Me", "");
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     try ops.moveLink(db, link_id, b_id);
 
@@ -845,10 +845,10 @@ test "moveLink: same category is a no-op success" {
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "A", "a", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     const link_id = try ops.createLink(db, a_id, "https://noop.test/x", "Noop", "");
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     try ops.moveLink(db, link_id, a_id);
 
@@ -865,7 +865,7 @@ test "moveLink: missing link returns LinkNotFound" {
 
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     const result = ops.moveLink(db, 9999, top_id);
     try std.testing.expectError(OperationError.LinkNotFound, result);
@@ -881,10 +881,10 @@ test "moveLink: missing target category returns CategoryNotFound" {
     const ops = @import("operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "A", "a", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
 
     const link_id = try ops.createLink(db, a_id, "https://x.test/x", "X", "");
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     const result = ops.moveLink(db, link_id, 99999);
     try std.testing.expectError(OperationError.CategoryNotFound, result);
@@ -935,7 +935,7 @@ test "a committed link stays visible while its memtable shard is draining" {
 
     const mt = db.mt_links_by_id();
     mt.lockAll();
-    for (0..zigstore.MEMTABLE_SHARDS) |i| _ = mt.swapShardLocked(i);
+    for (0..zigstore.MEMTABLE_SHARDS) |i| _ = try mt.swapShardLocked(i);
     mt.unlockAll();
 
     const link = (try getLink(db, id)) orelse return error.CommittedLinkInvisibleDuringDrain;

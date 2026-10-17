@@ -338,8 +338,8 @@ test "computeCategoryRenameChangeSet: <= threshold populates descendant_swaps" {
     const parent_id = try category.createCategory(db, top_id, "Parent", "old", "");
     _ = try category.createCategory(db, parent_id, "C1", "c1", "");
     _ = try category.createCategory(db, parent_id, "C2", "c2", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const old_cat = (try category.getCategory(db, parent_id)).?;
     var new_cat = old_cat;
@@ -370,8 +370,8 @@ test "computeCategoryRenameChangeSet: > threshold sets above_threshold + populat
         const slug = std.fmt.bufPrint(&slug_buf, "c{d}", .{i}) catch unreachable;
         _ = try category.createCategory(db, parent_id, "x", slug, "");
     }
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const old_cat = (try category.getCategory(db, parent_id)).?;
     var new_cat = old_cat;
@@ -406,8 +406,8 @@ test "computeCategoryRenameChangeSet: descendant walk silently caps at depth 64"
         deepest_id = child_id;
         built += 1;
     }
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try std.testing.expectEqual(@as(u32, 64), built);
 
@@ -448,8 +448,8 @@ test "computeCategoryMoveChangeSet: <= threshold populates descendant_swaps" {
     const b_id = try category.createCategory(db, top_id, "B", "b", "");
     _ = try category.createCategory(db, a_id, "X", "x", "");
     _ = try category.createCategory(db, a_id, "Y", "y", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const cat_a = (try category.getCategory(db, a_id)).?;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -477,8 +477,8 @@ test "computeCategoryMoveChangeSet: > threshold sets above_threshold + populates
         const slug = std.fmt.bufPrint(&slug_buf, "x{d}", .{i}) catch unreachable;
         _ = try category.createCategory(db, a_id, "x", slug, "");
     }
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const cat_a = (try category.getCategory(db, a_id)).?;
     var arena = std.heap.ArenaAllocator.init(allocator);

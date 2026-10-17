@@ -64,6 +64,7 @@ pub const Directory = struct {
     repair_worker_last_tick_ms: std.atomic.Value(i64),
 
     mt_flusher: ?*zigstore.Worker,
+    checkpointer: ?*zigstore.Worker,
 
     subtree_cache: subtree_mod.SubtreeCache,
 
@@ -95,14 +96,14 @@ pub const Directory = struct {
         return .{
             .process_frames = &Directory.processFrames,
             .header_size = zigstore.protocol.HEADER_SIZE,
-            .on_shutdown = &Directory.flushHeaderOnShutdown,
+            .on_shutdown = &Directory.checkpointOnShutdown,
         };
     }
 
-    fn flushHeaderOnShutdown(ctx: *anyopaque) void {
+    fn checkpointOnShutdown(ctx: *anyopaque) void {
         const dir = asDir(ctx);
-        dir.flushHeader() catch |err| {
-            log.err("Failed to flush database header on shutdown: {}", .{err});
+        dir.checkpoint() catch |err| {
+            log.err("checkpoint on shutdown failed: {} — recovery will replay on next boot", .{err});
         };
     }
 
@@ -218,6 +219,7 @@ pub const Directory = struct {
             .repair_worker_chunks_processed = std.atomic.Value(u64).init(0),
             .repair_worker_last_tick_ms = std.atomic.Value(i64).init(0),
             .mt_flusher = null,
+            .checkpointer = null,
             .subtree_cache = subtree_mod.SubtreeCache.init(allocator),
             .url_bloom = url_bloom,
             .next_category_id = std.atomic.Value(u64).init(store.counter("next_category_id").*),
@@ -254,6 +256,10 @@ pub const Directory = struct {
             .interval_ns = @as(u64, self.config.repair_worker_interval_ms) * std.time.ns_per_ms,
             .tick = &repairTick,
         }) catch null;
+        self.checkpointer = self.store.spawnCheckpointer(self.config.server.snapshot_interval_s) catch blk: {
+            log.warn("Checkpointer thread failed to start — only shutdown checkpoints will run", .{});
+            break :blk null;
+        };
     }
 
     fn asDir(ctx: *anyopaque) *Self {
@@ -261,7 +267,7 @@ pub const Directory = struct {
     }
 
     fn flushTick(ctx: *anyopaque) anyerror!void {
-        asDir(ctx).drainAllMemtables();
+        try asDir(ctx).drainAllMemtables();
     }
 
     fn verifyTick(ctx: *anyopaque) anyerror!void {
@@ -274,7 +280,13 @@ pub const Directory = struct {
     }
 
     pub fn commit(self: *Self, cs: changeset.ChangeSet) !void {
-        try zigstore.commit(changeset.ChangeSet, self.store, changeset.CHANGESET_OP, cs, self, &serializeChangeSet, &applyChangeSet);
+        zigstore.commit(changeset.ChangeSet, self.store, changeset.CHANGESET_OP, cs, self, &serializeChangeSet, &applyChangeSet) catch |err| switch (err) {
+            error.WalFlushFailed => {
+                log.err("WAL flush failed after apply — aborting so recovery serves only what is durable", .{});
+                @panic("WAL flush failed");
+            },
+            else => return err,
+        };
     }
 
     fn serializeChangeSet(allocator: std.mem.Allocator, cs: changeset.ChangeSet) anyerror![]u8 {
@@ -290,50 +302,15 @@ pub const Directory = struct {
             log.err("changeset apply failed after its WAL append: {} — aborting so recovery replays it whole", .{err});
             @panic("changeset apply failed after WAL append");
         };
+        dir.syncPersistedCounters();
     }
 
-    pub fn drainAllMemtables(self: *Self) void {
-        self.store.drainMemtables() catch |err| {
-            log.err("memtable drain failed: {} — aborting to preserve WAL/B+Tree consistency", .{err});
-            @panic("memtable drain failure");
-        };
+    pub fn drainAllMemtables(self: *Self) !void {
+        try self.store.drainMemtables();
     }
 
-    pub fn drainOneMemtable(self: *Self, mt: *zigstore.MemTable, tree: *zigstore.BPlusTree) void {
-        self.store.mt_drain_mutex.lock();
-        defer self.store.mt_drain_mutex.unlock();
-        drainOneInner(mt, tree);
-    }
-
-    fn drainOneInner(mt: *zigstore.MemTable, tree: *zigstore.BPlusTree) void {
-        const NUM_SHARDS = zigstore.MEMTABLE_SHARDS;
-        mt.lockAll();
-        var backs: [NUM_SHARDS]*zigstore.MemTable.Buffer = undefined;
-        for (0..NUM_SHARDS) |i| backs[i] = mt.swapShardLocked(i);
-        mt.unlockAll();
-
-        for (0..NUM_SHARDS) |i| {
-            var it = backs[i].map.iterator();
-            while (it.next()) |entry| {
-                const key = entry.key_ptr.*;
-                const val = entry.value_ptr.*;
-                if (val.tombstone) {
-                    _ = tree.delete(key) catch |err| {
-                        log.err("memtable drain: delete failed: {} — aborting to preserve WAL/B+Tree consistency", .{err});
-                        @panic("memtable drain delete failure");
-                    };
-                } else {
-                    tree.insert(key, val.value) catch |err| {
-                        log.err("memtable drain: insert failed: {} — aborting to preserve WAL/B+Tree consistency", .{err});
-                        @panic("memtable drain insert failure");
-                    };
-                }
-            }
-        }
-
-        mt.lockAll();
-        for (0..NUM_SHARDS) |i| mt.resetShardBackLocked(i);
-        mt.unlockAll();
+    pub fn drainOneMemtable(self: *Self, mt: *zigstore.MemTable, tree: *zigstore.BPlusTree) !void {
+        try self.store.drainMemtableInto(mt, tree);
     }
 
     pub fn deinit(self: *Self) void {
@@ -348,33 +325,15 @@ pub const Directory = struct {
     }
 
     fn shutdown(self: *Self, persist: bool) void {
+        if (self.checkpointer) |w| w.stop();
         if (self.repair_worker) |w| w.stop();
         if (self.verifier_worker) |w| w.stop();
         if (self.mt_flusher) |w| w.stop();
 
         if (persist) {
-            self.drainAllMemtables();
-
-            var data_durable = true;
-            self.store.cache.flushAll() catch |err| {
-                log.err("Failed to flush page cache on shutdown: {}", .{err});
-                data_durable = false;
+            self.checkpoint() catch |err| {
+                log.err("checkpoint on shutdown failed: {} — recovery will replay on next boot", .{err});
             };
-
-            self.flushHeader() catch |err| {
-                log.err("Failed to flush header on shutdown: {}", .{err});
-                data_durable = false;
-            };
-
-            if (self.store.wal_writer) |*w| {
-                if (data_durable) {
-                    w.truncateAfterCheckpoint() catch |err| {
-                        log.warn("WAL truncate on shutdown failed: {} — recovery will replay on next boot", .{err});
-                    };
-                } else {
-                    log.warn("Skipping WAL truncate: data flush failed — recovery will replay on next boot", .{});
-                }
-            }
         } else {
             if (self.store.wal_writer) |*w| w.deinit();
         }
@@ -387,6 +346,7 @@ pub const Directory = struct {
             self.store.deinit();
         } else {
             self.store.cache.deinit();
+            self.store.journal.close();
             self.store.file.close();
             inline for (Store.schema_def.memtable_indexes) |name| {
                 self.store.memtable(name).deinit();
@@ -460,16 +420,20 @@ pub const Directory = struct {
         log.info("bootstrap: created canonical Top (id={d}) + Lost-and-Found", .{top_id});
     }
 
-    pub fn flushHeader(self: *Self) !void {
+    fn syncPersistedCounters(self: *Self) void {
         self.store.counter("next_category_id").* = self.next_category_id.load(.monotonic);
         self.store.counter("next_link_id").* = self.next_link_id.load(.monotonic);
         self.store.counter("next_repair_seq").* = self.next_repair_seq.load(.monotonic);
-        try self.store.flushHeader();
+    }
+
+    pub fn checkpoint(self: *Self) !void {
+        self.syncPersistedCounters();
+        _ = try self.store.checkpoint();
     }
 
     pub fn getStats(self: *Self) Stats {
-        self.drainOneMemtable(self.mt_categories_by_id(), self.categories_by_id());
-        self.drainOneMemtable(self.mt_links_by_id(), self.links_by_id());
+        self.drainOneMemtable(self.mt_categories_by_id(), self.categories_by_id()) catch |err| log.warn("stats: category drain skipped: {}", .{err});
+        self.drainOneMemtable(self.mt_links_by_id(), self.links_by_id()) catch |err| log.warn("stats: link drain skipped: {}", .{err});
 
         const hits = self.store.cache.hit_count.load(.monotonic);
         const misses = self.store.cache.miss_count.load(.monotonic);
@@ -499,7 +463,7 @@ pub const Directory = struct {
     }
 };
 
-test "openTestInstance: round-trips entry_count through flushHeader/init" {
+test "openTestInstance: round-trips entry_count through checkpoint/init" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -510,7 +474,7 @@ test "openTestInstance: round-trips entry_count through flushHeader/init" {
         const ops = @import("operations/operations.zig");
         const cat_id = try ops.createCategory(dir, 0, "Test", "test", "");
         try std.testing.expect(cat_id > 0);
-        dir.drainOneMemtable(dir.mt_categories_by_id(), dir.categories_by_id());
+        try dir.drainOneMemtable(dir.mt_categories_by_id(), dir.categories_by_id());
         try std.testing.expect(dir.categories_by_id().entryCount() >= 1);
     }
 
@@ -542,7 +506,7 @@ test "next_repair_seq: persists across reopen" {
         _ = dir.next_repair_seq.fetchAdd(1, .monotonic);
         _ = dir.next_repair_seq.fetchAdd(1, .monotonic);
         _ = dir.next_repair_seq.fetchAdd(1, .monotonic);
-        try dir.flushHeader();
+        try dir.checkpoint();
     }
     {
         var dir = try Directory.openTestInstance(allocator, &tmp);
