@@ -696,6 +696,7 @@ zig-directory/
 │   ├── subtree.zig                       Descendant collection and cache for browse_path / list_subtree_links
 │   ├── verifier.zig                      Background invariant verifier (warn-only)
 │   ├── e2e_test.zig                      End-to-end tests against a temp data dir
+│   ├── test_support.zig                  Test-only fixtures: category/link builders, isPresent, tokenKey
 │   ├── gen_client_ts.zig                 Driver for `zig build gen-client-ts`
 │   ├── import_main.zig                   dmoz_import: TSV importer (snapshot + WAL truncate at the end)
 │   ├── apply/
