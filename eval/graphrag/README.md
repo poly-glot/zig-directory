@@ -56,3 +56,20 @@ real-world entity; the rest are homonyms.
 
 LLM entity extraction matched spaCy on retrieval and cost 42 minutes per
 5,000 links (about 13 hours for the full corpus).
+
+## Hybrid design check (`hybrid_design_check.py`)
+
+Decides the native hybrid search design: whether the existing postings, int8
+vectors and the transformers.js ONNX model are good enough. Keyword side emulates dmozdb's tokenizer over title, URL and description with
+binary postings; vectors from the ONNX int8 bge-small that transformers.js runs.
+
+| Retrieval | Lookup recall@10 | Coverage@20 | Multi-hop both@10 |
+|---|---|---|---|
+| AND (today) | 0.077 | 0.000 | 0.000 |
+| IDF-weighted OR | 0.853 | 0.058 | 0.073 |
+| BM25 | 0.863 | 0.077 | 0.120 |
+| BM25 + MLX f32 | 0.890 | 0.167 | 0.193 |
+| IDF-OR + ONNX f32 | 0.913 | 0.171 | 0.187 |
+| IDF-OR + ONNX int8 | 0.913 | 0.171 | 0.187 |
+
+ONNX int8 vs MLX embeddings: mean cosine 0.996 (documents and queries).
