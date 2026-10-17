@@ -437,7 +437,7 @@ test "C1: an acked commit survives an unclean crash via WAL replay" {
     try testing.expectEqualStrings("Survivor", link.title.slice());
 }
 
-test "C4: a duplicate URL is rejected after a restart (bloom reseeded from disk)" {
+test "C4: a duplicate URL is rejected after a restart, before and after the url bloom is seeded" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -454,8 +454,86 @@ test "C4: a duplicate URL is rejected after a restart (bloom reseeded from disk)
     try b.recover();
 
     const top = (try ops.resolveSlugPath(b, "top")) orelse return error.TopLost;
-    const retry = ops.createLink(b, top, "https://dup.example", "Second", "");
-    try testing.expectError(error.DuplicateUrl, retry);
+    try testing.expect(!b.url_bloom_ready.load(.acquire));
+    try testing.expectError(error.DuplicateUrl, ops.createLink(b, top, "https://dup.example", "Second", ""));
+
+    try ops.seedUrlBloom(b);
+    try testing.expect(b.url_bloom_ready.load(.acquire));
+    try testing.expectError(error.DuplicateUrl, ops.createLink(b, top, "https://dup.example", "Third", ""));
+}
+
+test "seeding the url bloom in chunks covers every link already on disk" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const urls = [_][]const u8{ "https://a.example", "https://b.example", "https://c.example", "https://d.example", "https://e.example" };
+    {
+        const a = try Directory.openTestInstance(allocator, &tmp);
+        defer a.deinitTestInstance();
+        const top = try ops.createCategory(a, 0, "Top", "top", "");
+        for (urls) |url| _ = try ops.createLink(a, top, url, "Seeded", "");
+    }
+
+    const b = try Directory.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try b.recover();
+
+    try ops.seedUrlBloomInChunks(b, 2);
+    try testing.expect(b.url_bloom_ready.load(.acquire));
+    for (urls) |url| try testing.expect(b.url_bloom.mayContain(url));
+}
+
+test "a checkpointed store restores its status counts on reopen without recounting" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const a = try Directory.openTestInstance(allocator, &tmp);
+        defer a.deinitTestInstance();
+        try a.recover();
+        const top = (try ops.resolveSlugPath(a, "top")) orelse return error.TopLost;
+        const pending: schema.LinkStatus = .pending;
+        const approved = try ops.createLinkWithOpts(a, top, "https://approved.example", "A", "", .{ .status = @intFromEnum(pending) });
+        _ = try ops.createLinkWithOpts(a, top, "https://pending.example", "P", "", .{ .status = @intFromEnum(pending) });
+        try ops.updateLinkStatus(a, approved, @intFromEnum(schema.LinkStatus.approved));
+        try testing.expect(a.derivedCountsCheckpointed());
+    }
+
+    const b = try Directory.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try testing.expect(b.derivedCountsCheckpointed());
+    try b.recover();
+
+    const counts = try ops.countsByStatus(b);
+    try testing.expectEqual(@as(u64, 1), counts.approved);
+    try testing.expectEqual(@as(u64, 1), counts.pending);
+    try testing.expectEqual(@as(u64, 0), counts.rejected);
+}
+
+test "a store without checkpointed derived counts is recounted once on boot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const a = try Directory.openTestInstance(allocator, &tmp);
+        defer a.deinitTestInstance();
+        try a.recover();
+        const top = (try ops.resolveSlugPath(a, "top")) orelse return error.TopLost;
+        _ = try ops.createLinkWithOpts(a, top, "https://legacy.example", "L", "", .{ .status = @intFromEnum(schema.LinkStatus.pending) });
+        a.store.counter("derived_counts_version").* = 0;
+        a.links_pending_count.store(0, .monotonic);
+    }
+
+    const b = try Directory.openTestInstance(allocator, &tmp);
+    defer b.deinitTestInstance();
+    try testing.expect(!b.derivedCountsCheckpointed());
+    try b.recover();
+
+    try testing.expect(b.derivedCountsCheckpointed());
+    try testing.expectEqual(@as(u64, 1), (try ops.countsByStatus(b)).pending);
 }
 
 test "H1: a snapshot persists the page-0 header so data survives a later crash" {

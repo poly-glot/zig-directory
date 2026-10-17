@@ -3,7 +3,6 @@ const zigstore = @import("zigstore");
 const codec = zigstore.codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
-const URL_BLOOM_INITIAL_CAPACITY = @import("../directory.zig").URL_BLOOM_INITIAL_CAPACITY;
 const shared = @import("operations_shared.zig");
 const compute = @import("operations_changeset_compute.zig");
 const category = @import("operations_category.zig");
@@ -59,7 +58,7 @@ fn createLinkWithOptsLocked(
 
     const url_hash = codec.hash(url);
     const hash_key = codec.encodeU64(url_hash);
-    if (db.url_bloom.mayContain(url)) {
+    if (!db.url_bloom_ready.load(.acquire) or db.url_bloom.mayContain(url)) {
         const mt_hash = db.mt_link_by_url_hash().get(&hash_key);
         var hash_buf: [8]u8 = undefined;
         const tree_hash = switch (mt_hash) {
@@ -201,16 +200,41 @@ pub fn countsByStatus(db: *Directory) !StatusCounts {
     };
 }
 
+pub const URL_BLOOM_SEED_CHUNK: usize = 4096;
+
+pub fn seedUrlBloom(db: *Directory) !void {
+    try seedUrlBloomInChunks(db, URL_BLOOM_SEED_CHUNK);
+}
+
+pub fn seedUrlBloomInChunks(db: *Directory, chunk: usize) !void {
+    var next_id: u64 = 0;
+    while (!db.url_bloom_seeder_stop.load(.acquire)) {
+        const scanned = try seedUrlBloomChunk(db, &next_id, chunk);
+        if (scanned < chunk) {
+            db.url_bloom_ready.store(true, .release);
+            return;
+        }
+    }
+}
+
+fn seedUrlBloomChunk(db: *Directory, next_id: *u64, chunk: usize) !usize {
+    const start_key = codec.encodeU64(next_id.*);
+    var iter = try db.links_by_id().rangeScan(&start_key, null);
+    defer iter.deinit();
+
+    var scanned: usize = 0;
+    while (scanned < chunk) : (scanned += 1) {
+        const entry = (try iter.next()) orelse return scanned;
+        next_id.* = codec.decodeU64(entry.key[0..8]) + 1;
+        if (entry.value.len != @sizeOf(schema.Link)) continue;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
+        db.url_bloom.add(link.url.slice());
+    }
+    return scanned;
+}
+
 pub fn recountLinkStatuses(db: *Directory) !void {
     try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
-
-    const bloom_capacity = @max(db.links_by_id().entry_count *| 2, URL_BLOOM_INITIAL_CAPACITY);
-    if (zigstore.BloomFilter.init(db.allocator, bloom_capacity)) |new_bloom| {
-        db.url_bloom.deinit();
-        db.url_bloom = new_bloom;
-    } else |err| {
-        std.log.scoped(.operations).warn("url bloom reseed skipped: {} — keeping the current filter", .{err});
-    }
 
     var pending: u64 = 0;
     var approved: u64 = 0;
@@ -221,7 +245,6 @@ pub fn recountLinkStatuses(db: *Directory) !void {
     while (try iter.next()) |entry| {
         if (entry.value.len != @sizeOf(schema.Link)) continue;
         const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
-        db.url_bloom.add(link.url.slice());
         switch (link.status) {
             @intFromEnum(schema.LinkStatus.pending) => pending += 1,
             @intFromEnum(schema.LinkStatus.approved) => approved += 1,

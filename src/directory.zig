@@ -29,7 +29,7 @@ pub const schema = zigstore.schema(.{
         .{ .name = "slug_path_repair_queue", .key = .u64 },
     },
     .memtable_indexes = &.{ "categories_by_id", "cat_by_parent", "links_by_id", "link_by_category", "link_by_url_hash", "link_by_submitter" },
-    .counters = &.{ "next_category_id", "next_link_id", "next_repair_seq" },
+    .counters = &.{ "next_category_id", "next_link_id", "next_repair_seq", "links_pending", "links_approved", "links_rejected", "derived_counts_version" },
 });
 
 pub const Store = zigstore.Engine(schema);
@@ -44,6 +44,7 @@ pub const Stats = struct {
 };
 
 pub const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
+pub const DERIVED_COUNTS_VERSION: u64 = 1;
 const MEMTABLE_FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
 
 pub const Directory = struct {
@@ -70,6 +71,9 @@ pub const Directory = struct {
     subtree_cache: subtree_mod.SubtreeCache,
 
     url_bloom: zigstore.BloomFilter,
+    url_bloom_ready: std.atomic.Value(bool),
+    url_bloom_seeder: ?std.Thread,
+    url_bloom_seeder_stop: std.atomic.Value(bool),
 
     next_category_id: std.atomic.Value(u64),
     next_link_id: std.atomic.Value(u64),
@@ -196,7 +200,8 @@ pub const Directory = struct {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        var url_bloom = try zigstore.BloomFilter.init(allocator, URL_BLOOM_INITIAL_CAPACITY);
+        const bloom_capacity = @max(store.tree("links_by_id").entryCount() *| 2, URL_BLOOM_INITIAL_CAPACITY);
+        var url_bloom = try zigstore.BloomFilter.init(allocator, bloom_capacity);
         errdefer url_bloom.deinit();
 
         const op_latency = blk: {
@@ -226,12 +231,15 @@ pub const Directory = struct {
             .checkpointer = null,
             .subtree_cache = subtree_mod.SubtreeCache.init(io, allocator),
             .url_bloom = url_bloom,
+            .url_bloom_ready = std.atomic.Value(bool).init(false),
+            .url_bloom_seeder = null,
+            .url_bloom_seeder_stop = std.atomic.Value(bool).init(false),
             .next_category_id = std.atomic.Value(u64).init(store.counter("next_category_id").*),
             .next_link_id = std.atomic.Value(u64).init(store.counter("next_link_id").*),
             .next_repair_seq = std.atomic.Value(u64).init(store.counter("next_repair_seq").*),
-            .links_pending_count = std.atomic.Value(u64).init(0),
-            .links_approved_count = std.atomic.Value(u64).init(0),
-            .links_rejected_count = std.atomic.Value(u64).init(0),
+            .links_pending_count = std.atomic.Value(u64).init(store.counter("links_pending").*),
+            .links_approved_count = std.atomic.Value(u64).init(store.counter("links_approved").*),
+            .links_rejected_count = std.atomic.Value(u64).init(store.counter("links_rejected").*),
             .op_latency = op_latency,
         };
 
@@ -264,6 +272,21 @@ pub const Directory = struct {
             log.warn("Checkpointer thread failed to start — only shutdown checkpoints will run", .{});
             break :blk null;
         };
+        self.url_bloom_seeder = std.Thread.spawn(.{}, seedUrlBloomInBackground, .{self}) catch blk: {
+            log.warn("url bloom seeder failed to start — duplicate checks keep reading the url index", .{});
+            break :blk null;
+        };
+    }
+
+    fn seedUrlBloomInBackground(self: *Self) void {
+        const started = std.Io.Clock.awake.now(self.io);
+        @import("operations/operations.zig").seedUrlBloom(self) catch |err| {
+            log.warn("url bloom seeding stopped: {} — duplicate checks keep reading the url index", .{err});
+            return;
+        };
+        if (self.url_bloom_ready.load(.acquire)) {
+            log.info("url bloom seeded in {d} ms", .{started.untilNow(self.io, .awake).toMilliseconds()});
+        }
     }
 
     fn asDir(ctx: *anyopaque) *Self {
@@ -329,6 +352,8 @@ pub const Directory = struct {
     }
 
     fn shutdown(self: *Self, persist: bool) void {
+        self.url_bloom_seeder_stop.store(true, .release);
+        if (self.url_bloom_seeder) |t| t.join();
         if (self.checkpointer) |w| w.stop();
         if (self.repair_worker) |w| w.stop();
         if (self.verifier_worker) |w| w.stop();
@@ -365,13 +390,9 @@ pub const Directory = struct {
     pub fn recover(self: *Self) !void {
         try self.store.recover(self, .{
             .apply_entry = &applyEntry,
-            .on_replayed = &recomputeCounts,
+            .on_replayed = &restoreDerivedCounts,
             .bootstrap = &bootstrapRoots,
         });
-
-        @import("operations/operations.zig").recountLinkStatuses(self) catch |err| {
-            log.warn("recountLinkStatuses failed: {} — counts_by_status may read stale until next boot", .{err});
-        };
 
         log.info("recover: complete; ready to listen", .{});
     }
@@ -382,15 +403,27 @@ pub const Directory = struct {
         try applier.apply(entry);
     }
 
-    fn recomputeCounts(ctx: *anyopaque) anyerror!void {
+    fn restoreDerivedCounts(ctx: *anyopaque) anyerror!void {
         const self = asDir(ctx);
         syncCounterUp(&self.next_category_id, self.store.counter("next_category_id").*);
         syncCounterUp(&self.next_link_id, self.store.counter("next_link_id").*);
         syncCounterUp(&self.next_repair_seq, self.store.counter("next_repair_seq").*);
 
-        @import("operations/operations.zig").recomputeCategoryCounts(self) catch |err| {
-            log.warn("recomputeCategoryCounts failed: {} — category counts may be off until reconciled", .{err});
-        };
+        if (self.derivedCountsCheckpointed()) return;
+        try self.recountDerivedCounts();
+    }
+
+    pub fn derivedCountsCheckpointed(self: *Self) bool {
+        return self.store.counter("derived_counts_version").* == DERIVED_COUNTS_VERSION;
+    }
+
+    fn recountDerivedCounts(self: *Self) !void {
+        const ops = @import("operations/operations.zig");
+        try ops.recomputeCategoryCounts(self);
+        try ops.recountLinkStatuses(self);
+        self.syncPersistedCounters();
+        self.store.counter("derived_counts_version").* = DERIVED_COUNTS_VERSION;
+        log.info("recover: derived counts recounted once; later boots restore them from the checkpoint", .{});
     }
 
     fn syncCounterUp(atomic: *std.atomic.Value(u64), persisted: u64) void {
@@ -428,6 +461,9 @@ pub const Directory = struct {
         self.store.counter("next_category_id").* = self.next_category_id.load(.monotonic);
         self.store.counter("next_link_id").* = self.next_link_id.load(.monotonic);
         self.store.counter("next_repair_seq").* = self.next_repair_seq.load(.monotonic);
+        self.store.counter("links_pending").* = self.links_pending_count.load(.monotonic);
+        self.store.counter("links_approved").* = self.links_approved_count.load(.monotonic);
+        self.store.counter("links_rejected").* = self.links_rejected_count.load(.monotonic);
     }
 
     pub fn nowSeconds(self: *Self) i64 {
