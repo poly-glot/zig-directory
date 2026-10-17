@@ -53,6 +53,11 @@ jobs:
       - name: zig build test
         run: zig build test
 
+      # The bench client and the importer are gated behind -Dtools and are not in
+      # the test graph, so this is the only thing that keeps them compiling.
+      - name: zig build -Dtools=true
+        run: zig build -Dtools=true
+
   web:
     name: deno check + test
     runs-on: ubuntu-24.04-arm

@@ -183,10 +183,12 @@ pub fn main() !void {
 
     const config = Config{
         .data_dir = abs_data_dir,
-        .cache_size_mb = 64,
-        .thread_count = 1,
-        .wal_batch_size = 1024,
-        .snapshot_interval_s = 3600,
+        .server = .{
+            .cache_size_mb = 64,
+            .thread_count = 1,
+            .wal_batch_size = 1024,
+            .snapshot_interval_s = 3600,
+        },
     };
 
     const db = try Directory.init(allocator, config);
