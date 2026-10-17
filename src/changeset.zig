@@ -146,7 +146,6 @@ pub const DecodeError = error{
     BufferTooShort,
     UnknownOpTag,
     UnsupportedSchemaVersion,
-    InvalidEnumValue,
     OutOfMemory,
 };
 
