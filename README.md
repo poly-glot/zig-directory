@@ -165,8 +165,12 @@ Writes follow the WAL-first protocol via the ChangeSet pipeline:
    commit path flush pages early (same journal, no WAL truncation) so a write burst cannot exhaust the cache.
 
 On boot, recovery redoes a complete `checkpoint.journal` if one is present, replays every `wal.bin` entry above the
-superblock's `seq` through the same `apply()` path, checkpoints, then recomputes category counts and link-status counts
-(which also reseeds the URL bloom filter from `links_by_id`). `snapshot.meta` is written by op 22 and `dmoz_import` for
+superblock's `seq` through the same `apply()` path and checkpoints. Category counts live in the records and the three
+link-status counts live in superblock counters, both checkpointed with the tree, so replay leaves them exact and boot
+reads nothing else before the port opens. A store that has never checkpointed them (`derived_counts_version` = 0, as on
+the first boot after upgrading) is recounted once. The URL bloom filter is seeded after the port opens by a background
+thread in 4,096-link chunks; until it finishes, duplicate checks skip the filter and read the url-hash index, so a
+duplicate is never missed. `snapshot.meta` is written by op 22 and `dmoz_import` for
 operators; the WAL sequence resumes from the superblock. A WAL that fails to open, a WAL whose `fdatasync` has failed
 (further commits are refused and the process restarts), and a WAL with valid records more than one batch beyond a corrupt
 record all refuse to start rather than serve or silently drop data.
@@ -588,7 +592,8 @@ This compiles the test graph rooted at `src/main.zig`, which pulls in every modu
 - **Directory**: header round-trips, counters across reopen, recovery boot path
 - **Verifier and repair worker**: drift detection, queue drain
 - **E2E** (`src/e2e_test.zig`): full workflows against a temp data dir, crash-and-replay (an acked commit survives an
-  unclean crash), bloom reseed after restart, snapshot persistence
+  unclean crash), duplicate refusal before and after the bloom is seeded, status counts restored from the checkpoint
+  and recounted once on a legacy store, snapshot persistence
 
 The engine's own tests (page format, B+Tree, page cache, free list, WAL, connection, framing) live and run in the
 zigstore repository.
@@ -1059,8 +1064,9 @@ the B+Tree on miss, so reads always see the latest write. Handlers that need a c
 URL deduplication uses a bloom filter with seven probes derived from two Wyhash seeds. The filter provides lock-free
 reads via atomic bit operations, so duplicate checks on the hot path do not contend with writers. False positives are
 acceptable because a bloom filter hit triggers a secondary lookup in the `link_by_url_hash` index, which is
-authoritative. The filter is reseeded from `links_by_id` on every boot, sized to the larger of 1,000,000 and twice the
-stored link count.
+authoritative. The filter is sized at startup to the larger of 1,000,000 and twice the stored link count and seeded from
+`links_by_id` by a background thread after the port opens; until `url_bloom_ready` is set every duplicate check goes to
+the index.
 
 #### Hybrid in-line / queued slug-path repair
 
