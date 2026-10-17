@@ -457,12 +457,12 @@ test "C4: a duplicate URL is rejected after a restart, before and after the url 
     try testing.expect(!b.url_bloom_ready.load(.acquire));
     try testing.expectError(error.DuplicateUrl, ops.createLink(b, top, "https://dup.example", "Second", ""));
 
-    try ops.seedUrlBloom(b);
+    try ops.seedUrlBloom(b, .full_speed);
     try testing.expect(b.url_bloom_ready.load(.acquire));
     try testing.expectError(error.DuplicateUrl, ops.createLink(b, top, "https://dup.example", "Third", ""));
 }
 
-test "seeding the url bloom in chunks covers every link already on disk" {
+test "paced seeding of the url bloom in chunks covers every link already on disk" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -479,7 +479,7 @@ test "seeding the url bloom in chunks covers every link already on disk" {
     defer b.deinitTestInstance();
     try b.recover();
 
-    try ops.seedUrlBloomInChunks(b, 2);
+    try ops.seedUrlBloomInChunks(b, 2, .yield_half_the_disk);
     try testing.expect(b.url_bloom_ready.load(.acquire));
     for (urls) |url| try testing.expect(b.url_bloom.mayContain(url));
 }

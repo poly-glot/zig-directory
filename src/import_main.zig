@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
     const db = try Directory.init(io, allocator, config);
     defer db.deinit();
     try db.recover();
-    try operations.seedUrlBloom(db);
+    try operations.seedUrlBloom(db, .full_speed);
 
     var path_to_id = std.StringHashMap(u64).init(allocator);
     defer {
