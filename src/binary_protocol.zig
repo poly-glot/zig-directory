@@ -1556,6 +1556,34 @@ test "create_link: duplicate URL produces status=duplicate, sub_status=duplicate
     try std.testing.expectEqual(SubStatus.duplicate_url, item_sub);
 }
 
+test "a dispatched create_link frame is durable before it is acknowledged and shares fsyncs across its items" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const cat_id = try operations.createCategory(db, 0, "Cat", "cat", "");
+    const items = 50;
+    var payload: [items * 64]u8 = undefined;
+    var off: usize = 0;
+    var url_buf: [32]u8 = undefined;
+    for (0..items) |i| {
+        const url = try std.fmt.bufPrint(&url_buf, "https://g{d}.example", .{i});
+        off = appendBulkItem(&payload, off, cat_id, url, "T", "");
+    }
+
+    const fsyncs_before = db.store.walFsyncCount();
+    var resp: [4096]u8 = undefined;
+    var gate: zigstore.protocol.FrameGate = undefined;
+    _ = Directory.dispatch(db, @intFromEnum(Op.create_link), payload[0..off], items, &resp, &gate);
+
+    const wal = &db.store.wal_writer.?;
+    try std.testing.expectEqual(wal.getSequence(), db.store.durableSeqPublished());
+    try std.testing.expect(db.store.walFsyncCount() - fsyncs_before < items);
+    try std.testing.expectEqual(@as(u64, items), (try operations.countsByStatus(db)).approved);
+}
+
 fn appendBulkItem(
     buf: []u8,
     off_in: usize,

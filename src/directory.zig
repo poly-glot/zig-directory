@@ -47,6 +47,8 @@ pub const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
 pub const DERIVED_COUNTS_VERSION: u64 = 1;
 const MEMTABLE_FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
 
+threadlocal var deferred_durable_seq: ?u64 = null;
+
 pub const Directory = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -89,7 +91,12 @@ pub const Directory = struct {
 
     pub fn dispatch(ctx: *anyopaque, op_byte: u8, payload: []const u8, count: u16, resp: []u8, _: *zigstore.protocol.FrameGate) usize {
         const dir = asDir(ctx);
-        return binary_protocol.dispatch(dir, op_byte, payload, count, resp);
+        deferred_durable_seq = 0;
+        defer deferred_durable_seq = null;
+
+        const written = binary_protocol.dispatch(dir, op_byte, payload, count, resp);
+        dir.awaitDurable(deferred_durable_seq.?);
+        return written;
     }
 
     pub fn processFrames(ctx: *anyopaque, conn: *zigstore.connection.Connection) void {
@@ -307,13 +314,29 @@ pub const Directory = struct {
     }
 
     pub fn commit(self: *Self, cs: changeset.ChangeSet) !void {
-        zigstore.commit(changeset.ChangeSet, self.store, changeset.CHANGESET_OP, cs, self, &serializeChangeSet, &applyChangeSet) catch |err| switch (err) {
-            error.WalFlushFailed => {
-                log.err("WAL flush failed after apply — aborting so recovery serves only what is durable", .{});
-                @panic("WAL flush failed");
-            },
+        var applied: zigstore.CommitCompletion = .{};
+        const seq = zigstore.commitSeq(changeset.ChangeSet, self.store, changeset.CHANGESET_OP, cs, self, &serializeChangeSet, &applyChangeSet, .{ .completion = &applied }) catch |err| switch (err) {
+            error.WalFlushFailed => abortOnWalFlushFailure(),
             else => return err,
         };
+
+        if (deferred_durable_seq) |pending| {
+            deferred_durable_seq = @max(pending, seq);
+            return;
+        }
+        self.awaitDurable(seq);
+    }
+
+    fn awaitDurable(self: *Self, seq: u64) void {
+        if (seq == 0) return;
+        if (self.store.wal_writer) |*wal| {
+            wal.awaitDurable(seq) catch abortOnWalFlushFailure();
+        }
+    }
+
+    fn abortOnWalFlushFailure() noreturn {
+        log.err("WAL flush failed after apply — aborting so recovery serves only what is durable", .{});
+        @panic("WAL flush failed");
     }
 
     fn serializeChangeSet(allocator: std.mem.Allocator, cs: changeset.ChangeSet) anyerror![]u8 {
@@ -585,6 +608,19 @@ test "recover boot path: clean DB reopens cleanly" {
         const id = try ops.resolveSlugPath(dir, "arts");
         try std.testing.expect(id != null);
     }
+}
+
+test "a commit made outside a dispatched request is durable when it returns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer dir.deinitTestInstance();
+
+    const ops = @import("operations/operations.zig");
+    _ = try ops.createCategory(dir, 0, "Top", "top", "");
+
+    const wal = &dir.store.wal_writer.?;
+    try std.testing.expectEqual(wal.getSequence(), dir.store.durableSeqPublished());
 }
 
 test "a changeset that reached the WAL is applied or the process aborts, never acked as failed" {
