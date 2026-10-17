@@ -67,7 +67,7 @@ pub fn main() !void {
 
     log.info("Database ready. Starting server on port {d}...", .{config.server.port});
 
-    try zigstore.run(directory.Store, db, Directory.handler(), config.server);
+    try zigstore.run(directory.Store, db, Directory.handler(), config.server, .{});
 }
 
 test {

@@ -6,8 +6,8 @@ The Zig backend (`dmozdb`) speaks a binary protocol. The Deno client's typed vie
 - DO: **Regenerate after any protocol change.** When you add or change an op or field in the Zig server, run:
   ```bash
   zig build gen-client-ts
-  cd web && deno check
+  cd web && deno fmt lib/dmoz-protocol.gen.ts && deno check
   ```
-  Commit the regenerated file in the same commit as the server change.
+  The generator emits unformatted TypeScript and the committed file is `deno fmt` output, so a "zero diff" check is only meaningful after the fmt step. Commit the regenerated file in the same commit as the server change.
 - DO: **Extend ops with optional trailing bytes.** To extend an op without breaking older callers, append an optional trailing byte or field (the status filter and the cursor `after_id` both do this). Follow that pattern instead of forking a new op number.
 - DO: **Keep hierarchy semantics on the server** (see [architecture.md](architecture.md)). New recursive or aggregate needs are new ops, not client fan-out.
