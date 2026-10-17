@@ -4,15 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Dev-only tools (the bench client and the one-shot DMOZ importer) build
-    // only under `-Dtools=true`. The default build — and the release image —
-    // produces just the dmozdb server, so a compile error in a tool can never
-    // break a deploy, and the image needn't copy their sources.
     const build_tools = b.option(bool, "tools", "Also build dev tools: bench, dmoz_import") orelse false;
 
     const zigstore = b.dependency("zigstore", .{ .target = target, .optimize = optimize }).module("zigstore");
 
-    // Main executable
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -25,7 +20,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // Run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -34,7 +28,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run dmozdb server");
     run_step.dependOn(&run_cmd.step);
 
-    // Tests
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -49,7 +42,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     if (build_tools) {
-        // Benchmark client for binary protocol
         const bench_mod = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
@@ -62,7 +54,6 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(bench);
 
-        // One-shot DMOZ importer (build-once tool, not a long-running server).
         const import_mod = b.createModule(.{
             .root_source_file = b.path("src/import_main.zig"),
             .target = target,
@@ -76,12 +67,6 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(import_exe);
     }
 
-    // Codegen: emit the TS protocol layer from the Zig source of truth.
-    // Run with `zig build gen-client-ts` to refresh
-    // web/lib/dmoz-protocol.gen.ts after changing the Op enum or any
-    // Category/Link layout. The tool root pulls binary_protocol.zig +
-    // types.zig in via relative path so the module graph stays flat —
-    // no separate `types`/`binary_protocol` modules needed.
     const gen_client_mod = b.createModule(.{
         .root_source_file = b.path("src/gen_client_ts.zig"),
         .target = target,

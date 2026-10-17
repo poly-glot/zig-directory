@@ -2,23 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench bulk_import` — exercises op=24 bulk_import.
-//
-// Each frame packs `--batch-size` items in a single bulk_import frame and
-// the worker iterates until `--count` items have been imported. The frame
-// builder reuses the per-link layout from the existing op=1 create_link
-// path: `[u64 cat_id][u16 url_len][url][u16 title_len][title][u16 desc_len][desc]`.
-//
-// Bounds:
-//   * batch-size is capped client-side at 4000 — a 4000-item batch with
-//     short URLs comfortably fits in the server-side BULK_IMPORT_MAX_BYTES
-//     cap (60 KB) and in the request_buf (64 KB). Larger batches trip the
-//     server's reject path, which is interesting behaviour but not what a
-//     throughput bench is measuring.
-//   * count is capped at 10_000_000 — past that the wall-clock duration
-//     dominates everything else; users wanting more should run multiple
-//     bench invocations.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const OP_BULK_IMPORT: u8 = 24;
@@ -54,13 +37,11 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         return error.CountTooLarge;
     }
 
-    // ── Spawn worker threads ─────────────────────────────────────
     const ctxs = try allocator.alloc(WorkerCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
     defer allocator.free(threads);
 
-    // Split count across workers, rounding up so the total is at least `count`.
     const per_worker = (opts.count + common_opts.workers - 1) / common_opts.workers;
 
     const t_start = std.time.nanoTimestamp();
@@ -83,7 +64,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Merge histograms / errors ────────────────────────────────
     var merged = common.Histogram{};
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
@@ -97,8 +77,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         items_total += ctx.items_inserted;
     }
 
-    // For bulk_import, throughput is item-rate — that's the user-visible
-    // metric. Frames-per-sec is bookkept separately as histogram samples.
     const ops_per_sec: u64 = if (duration_ms > 0) items_total * 1000 / duration_ms else 0;
 
     const host = std.posix.getenv("HOSTNAME") orelse "unknown";
@@ -134,10 +112,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     try emitRecord(allocator, common_opts.output_path, record);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Worker
-// ─────────────────────────────────────────────────────────────────
-
 const WorkerCtx = struct {
     id: u32,
     host: []const u8,
@@ -163,15 +137,11 @@ fn workerRun(ctx: *WorkerCtx) !void {
     };
     defer posix.close(fd);
 
-    // 64 KB request buffer matches the server's per-connection cap; anything
-    // larger would be rejected by the server-side BULK_IMPORT_MAX_BYTES check.
     const req_buf_storage = std.heap.page_allocator.alloc(u8, 1 << 16) catch return error.OutOfMemory;
     defer std.heap.page_allocator.free(req_buf_storage);
     const resp_buf_storage = std.heap.page_allocator.alloc(u8, 1 << 16) catch return error.OutOfMemory;
     defer std.heap.page_allocator.free(resp_buf_storage);
 
-    // Each worker's URLs are namespaced by id to avoid duplicate-URL collisions
-    // when multiple workers run concurrently.
     var counter: u64 = @as(u64, ctx.id) * 100_000_000;
     var items_remaining: u64 = ctx.total_items;
 
@@ -186,7 +156,7 @@ fn workerRun(ctx: *WorkerCtx) !void {
             var title_buf: [32]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://bi{d}.t", .{counter}) catch unreachable;
             const title = std.fmt.bufPrint(&title_buf, "L{d}", .{counter}) catch unreachable;
-            fb.writeU64(1); // category_id = top
+            fb.writeU64(1);
             fb.writeU16LenPrefixed(url);
             fb.writeU16LenPrefixed(title);
             fb.writeU16LenPrefixed("");
@@ -205,7 +175,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
             return;
         }
 
-        // Pull `inserted` (first u64 of payload) so we measure real DB writes.
         const inserted = std.mem.readInt(
             u64,
             resp_buf_storage[common.RESPONSE_HEADER_SIZE..][0..8],
@@ -218,10 +187,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
         items_remaining -|= this_batch;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
 
 fn parseOpts(leftovers: []const []const u8) !Opts {
     var opts = Opts{};

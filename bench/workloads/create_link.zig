@@ -2,11 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench create_link` — write-hammer workload. Each worker holds an
-// independent TCP connection and pushes batched create_link frames as
-// fast as the server will accept them. Records per-frame latency into
-// an HDR-lite histogram and emits a single JSONL bench record.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const Opts = struct {
@@ -28,7 +23,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     if (common_opts.workers == 0) return error.InvalidWorkers;
     if (opts.batch == 0) return error.InvalidBatch;
 
-    // ── Spawn worker threads ─────────────────────────────────────
     const ctxs = try allocator.alloc(WorkerCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
@@ -55,7 +49,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Merge histograms / errors ────────────────────────────────
     var merged = common.Histogram{};
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
@@ -102,10 +95,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     try emitRecord(allocator, common_opts.output_path, record);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Worker
-// ─────────────────────────────────────────────────────────────────
-
 const WorkerCtx = struct {
     id: u32,
     host: []const u8,
@@ -147,7 +136,7 @@ fn workerRun(ctx: *WorkerCtx) !void {
             var title_buf: [32]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://b{d}.t", .{counter}) catch unreachable;
             const title = std.fmt.bufPrint(&title_buf, "L{d}", .{counter}) catch unreachable;
-            fb.writeU64(1); // category_id = top
+            fb.writeU64(1);
             fb.writeU16LenPrefixed(url);
             fb.writeU16LenPrefixed(title);
             fb.writeU16LenPrefixed("");
@@ -172,10 +161,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
         ctx.ops_completed += ctx.batch;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
 
 fn parseOpts(leftovers: []const []const u8) !Opts {
     var opts = Opts{};

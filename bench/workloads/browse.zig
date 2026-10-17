@@ -2,10 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-// `bench browse` — three sub-modes (path / children / subtree-links).
-// Workers draw inputs from seed.json (sample paths or random IDs in the
-// seeded category-id range) and issue the matching op.
-
 const HEADER_SIZE = common.HEADER_SIZE;
 
 const Kind = enum { path, children, subtree_links };
@@ -40,7 +36,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         return error.MissingKind;
     };
 
-    // ── Load seed.json ───────────────────────────────────────────
     const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
     defer allocator.free(seed_path);
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -52,7 +47,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         return error.NoSamplePaths;
     }
 
-    // ── Spawn worker threads ─────────────────────────────────────
     const ctxs = try allocator.alloc(WorkerCtx, common_opts.workers);
     defer allocator.free(ctxs);
     const threads = try allocator.alloc(std.Thread, common_opts.workers);
@@ -82,7 +76,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     const duration_ns: u64 = @intCast(t_end - t_start);
     const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
 
-    // ── Merge ────────────────────────────────────────────────────
     var merged = common.Histogram{};
     var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
     var ops_total: u64 = 0;
@@ -135,10 +128,6 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     try emitRecord(allocator, common_opts.output_path, record);
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Worker
-// ─────────────────────────────────────────────────────────────────
-
 const WorkerCtx = struct {
     id: u32,
     host: []const u8,
@@ -188,19 +177,18 @@ fn workerRun(ctx: *WorkerCtx) !void {
                 const parent_id = ctx.cat_id_min + rand.uintLessThan(u64, span);
                 var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.list_children));
                 fb.writeU64(parent_id);
-                fb.writeU32(0); // offset
-                fb.writeU32(20); // limit
+                fb.writeU32(0);
+                fb.writeU32(20);
                 break :blk fb.finalize(1);
             },
             .subtree_links => blk: {
                 const root_id = ctx.cat_id_min + rand.uintLessThan(u64, span);
                 var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.list_subtree_links));
                 fb.writeU64(root_id);
-                // ListSubtreeLinksRequest expects [u64 cat_id][u8 order][u32 offset][u32 limit]
-                req_buf[fb.pos] = 0; // order_code
+                req_buf[fb.pos] = 0;
                 fb.pos += 1;
-                fb.writeU32(0); // offset
-                fb.writeU32(100); // limit
+                fb.writeU32(0);
+                fb.writeU32(100);
                 break :blk fb.finalize(1);
             },
         };
@@ -223,10 +211,6 @@ fn workerRun(ctx: *WorkerCtx) !void {
         ctx.ops_completed += 1;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
 
 fn parseOpts(leftovers: []const []const u8) !Opts {
     var opts = Opts{};
