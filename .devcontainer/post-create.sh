@@ -8,8 +8,9 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
   curl wget jq htop xz-utils unzip wrk
 
-# Install Zig 0.15.2
-ZIG_VERSION="0.15.2"
+# Install Zig 0.16.0 (ZLS is coupled to Zig by minor version; bump both together)
+ZIG_VERSION="0.16.0"
+ZLS_VERSION="0.16.0"
 ZIG_ARCH="$(uname -m)"
 if [ "$ZIG_ARCH" = "x86_64" ]; then
   ZIG_TARGET="x86_64-linux"
@@ -25,8 +26,8 @@ curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_TARGET}-${ZIG_VE
 sudo ln -sf "/usr/local/zig-${ZIG_TARGET}-${ZIG_VERSION}/zig" /usr/local/bin/zig
 
 # Install ZLS (Zig Language Server)
-echo "Installing ZLS..."
-ZLS_URL="https://github.com/zigtools/zls/releases/latest/download/zls-${ZIG_TARGET}.tar.xz"
+echo "Installing ZLS ${ZLS_VERSION}..."
+ZLS_URL="https://github.com/zigtools/zls/releases/download/${ZLS_VERSION}/zls-${ZIG_TARGET}.tar.xz"
 curl -sL "$ZLS_URL" | sudo tar -xJ -C /usr/local/bin
 
 # Upgrade Claude Code to the latest release (the devcontainer feature may pin an
