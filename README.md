@@ -171,8 +171,8 @@ superblock's `seq` through the same `apply()` path and checkpoints. Category cou
 link-status counts live in superblock counters, both checkpointed with the tree, so replay leaves them exact and boot
 reads nothing else before the port opens. A store that has never checkpointed them (`derived_counts_version` = 0, as on
 the first boot after upgrading) is recounted once. The URL bloom filter is seeded after the port opens by a background
-thread in 512-link chunks, pausing after each chunk for as long as it took so request reads get at least half the disk;
-until it finishes, duplicate checks skip the filter and read the url-hash index, so a duplicate is never missed. `snapshot.meta` is written by op 22 and `dmoz_import` for
+thread in 4,096-link chunks; until it finishes, duplicate checks skip the filter and read the url-hash index, so a
+duplicate is never missed. `snapshot.meta` is written by op 22 and `dmoz_import` for
 operators; the WAL sequence resumes from the superblock. A WAL that fails to open, a WAL whose `fdatasync` has failed
 (further commits are refused and the process restarts), and a WAL with valid records more than one batch beyond a corrupt
 record all refuse to start rather than serve or silently drop data.

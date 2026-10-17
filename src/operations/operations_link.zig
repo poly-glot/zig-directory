@@ -200,24 +200,20 @@ pub fn countsByStatus(db: *Directory) !StatusCounts {
     };
 }
 
-pub const URL_BLOOM_SEED_CHUNK: usize = 512;
+pub const URL_BLOOM_SEED_CHUNK: usize = 4096;
 
-pub const SeedPace = enum { full_speed, yield_half_the_disk };
-
-pub fn seedUrlBloom(db: *Directory, pace: SeedPace) !void {
-    try seedUrlBloomInChunks(db, URL_BLOOM_SEED_CHUNK, pace);
+pub fn seedUrlBloom(db: *Directory) !void {
+    try seedUrlBloomInChunks(db, URL_BLOOM_SEED_CHUNK);
 }
 
-pub fn seedUrlBloomInChunks(db: *Directory, chunk: usize, pace: SeedPace) !void {
+pub fn seedUrlBloomInChunks(db: *Directory, chunk: usize) !void {
     var next_id: u64 = 0;
     while (!db.url_bloom_seeder_stop.load(.acquire)) {
-        const started = std.Io.Clock.awake.now(db.io);
         const scanned = try seedUrlBloomChunk(db, &next_id, chunk);
         if (scanned < chunk) {
             db.url_bloom_ready.store(true, .release);
             return;
         }
-        if (pace == .yield_half_the_disk) try std.Io.sleep(db.io, started.untilNow(db.io, .awake), .awake);
     }
 }
 

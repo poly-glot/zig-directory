@@ -31,7 +31,6 @@ pub const countsByStatus = link_mod.countsByStatus;
 pub const recountLinkStatuses = link_mod.recountLinkStatuses;
 pub const seedUrlBloom = link_mod.seedUrlBloom;
 pub const seedUrlBloomInChunks = link_mod.seedUrlBloomInChunks;
-pub const SeedPace = link_mod.SeedPace;
 pub const StatusCounts = link_mod.StatusCounts;
 pub const deleteLink = link_mod.deleteLink;
 pub const listLinks = link_mod.listLinks;

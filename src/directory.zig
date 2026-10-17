@@ -287,7 +287,7 @@ pub const Directory = struct {
 
     fn seedUrlBloomInBackground(self: *Self) void {
         const started = std.Io.Clock.awake.now(self.io);
-        @import("operations/operations.zig").seedUrlBloom(self, .yield_half_the_disk) catch |err| {
+        @import("operations/operations.zig").seedUrlBloom(self) catch |err| {
             log.warn("url bloom seeding stopped: {} — duplicate checks keep reading the url index", .{err});
             return;
         };
