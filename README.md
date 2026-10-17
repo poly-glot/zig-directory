@@ -620,8 +620,7 @@ Subcommands: `seed`, `create_link`, `bulk_import`, `get_link`, `browse --kind {p
 
 ## Kubernetes Deployment
 
-The live deployment is `deployment/`, applied with kustomize. `k8s/` holds the
-earlier single-workload manifests and is not what runs.
+The live deployment is `deployment/`, applied with kustomize.
 
 ```bash
 kubectl apply -k deployment/overlays/main
@@ -728,7 +727,6 @@ zig-directory/
 ├── k6/                                   k6 stress script
 ├── scripts/                              migrate-kv.ts
 ├── deployment/                           Live kustomize manifests (base/, overlays/main, metrics-server/)
-├── k8s/                                  Earlier single-workload manifests, not what runs
 ├── diagrams/                             Architecture diagrams (SVG + Mermaid sources)
 ├── data/                                 Sample store (store.dat.zip)
 ├── .devcontainer/                        Dev Container configuration
