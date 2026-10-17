@@ -2,11 +2,11 @@
     .name = .dmozdb,
     .version = "0.6.0",
     .fingerprint = 0xdb0bfb17443efa77,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zigstore = .{
-            .url = "https://github.com/poly-glot/zigstore/archive/refs/tags/v2.0.0.tar.gz",
-            .hash = "zigstore-2.0.0-Lu5Gj60iCADQQF-VpBOfEdmPJ3MefRNVDfrIj4bsdK4_",
+            .url = "https://github.com/poly-glot/zigstore/archive/refs/tags/v3.0.0.tar.gz",
+            .hash = "zigstore-3.0.0-Lu5GjzFoCAB_frBpaYKulg3lG_lgorZenRofiPh17mmX",
         },
     },
     .paths = .{
