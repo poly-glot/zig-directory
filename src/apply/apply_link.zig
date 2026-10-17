@@ -147,8 +147,8 @@ test "applyLinkInserted: writes primary + secondaries + tokens + ancestor counts
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const cat_id = try ops.createCategory(db, top_id, "Test", "test", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -213,8 +213,8 @@ test "applyLinkInserted: retry is index-idempotent; recount reconciles delta dou
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const cat_id = try ops.createCategory(db, top_id, "Test", "test", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -269,8 +269,8 @@ test "applyLinkDeleted: reverses link_inserted (primary + secondaries + tokens +
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const cat_id = try ops.createCategory(db, top_id, "Test", "test", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -344,8 +344,8 @@ test "applyLinkTextUpdated: same URL — primary rewritten, tokens swapped, hash
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const cat_id = try ops.createCategory(db, top_id, "Test", "test", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -429,8 +429,8 @@ test "applyLinkTextUpdated: URL changed — link_by_url_hash rewritten, bloom up
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const cat_id = try ops.createCategory(db, top_id, "Test", "test", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -519,8 +519,8 @@ test "applyLinkRecategorized: swaps link_by_category and cascades both ancestor 
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const cat_a_id = try ops.createCategory(db, top_id, "A", "a", "");
     const cat_b_id = try ops.createCategory(db, top_id, "B", "b", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

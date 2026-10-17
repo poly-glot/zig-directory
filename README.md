@@ -151,19 +151,25 @@ Writes follow the WAL-first protocol via the ChangeSet pipeline:
 3. **Apply**: `apply/*.zig` walks the ChangeSet variants. Effects on the six memtable-backed indexes go to that index's
    32-shard memtable; token entries and repair-queue writes go straight to their B+Trees; ancestor counts are rewritten
    synchronously in the same apply.
-4. **Background drain**: the memtable flusher worker drains memtables into the B+Trees every 5 ms. Dirty pages sit in
-   the page cache until a snapshot, an eviction or shutdown flushes them.
+4. **Background drain**: the memtable flusher worker drains memtables into the B+Trees every 5 ms. Dirty pages stay in
+   the page cache until a checkpoint: the cache never evicts a dirty page, so `store.dat` changes only at checkpoints.
 5. **Group commit**: the WAL flusher wakes every 2 ms or when `DMOZDB_WAL_BATCH_SIZE` entries (default 256) are
    pending, writes the batch and `fdatasync`s once.
 
-There is no periodic snapshot scheduler. A snapshot (page-cache flush, header flush, then an atomic rewrite of the
-64-byte `snapshot.meta` superblock recording the WAL sequence) happens only on op 22 `snapshot` or at the end of
-`dmoz_import`.
+6. **Checkpoint**: every `DMOZDB_SNAPSHOT_INTERVAL_S` seconds (and on shutdown, after recovery, and on op 22 `snapshot`)
+   the engine pauses WAL appends until every appended entry has applied, drains the memtables, writes every dirty page
+   plus the superblock to `checkpoint.journal` (fsync), then in place into `store.dat` (fsync), truncates the journal and
+   `wal.bin`, and records the checkpointed WAL sequence in the superblock's `seq`. A crash between the two phases is
+   repaired on the next open by redoing the journal; a crash before the journal is complete leaves `store.dat` exactly
+   as the previous checkpoint left it. When more than half the page cache is dirty, the checkpointer, the drain and the
+   commit path flush pages early (same journal, no WAL truncation) so a write burst cannot exhaust the cache.
 
-On a clean shutdown the memtables are drained, the cache and header are flushed and `wal.bin` is truncated. On boot,
-recovery replays the whole `wal.bin` from sequence 0 through the same `apply()` path, drains and flushes, then recomputes
-category counts and link-status counts (which also reseeds the URL bloom filter from `links_by_id`). `snapshot.meta` is
-only consulted to resume WAL sequence numbering after a truncate.
+On boot, recovery redoes a complete `checkpoint.journal` if one is present, replays every `wal.bin` entry above the
+superblock's `seq` through the same `apply()` path, checkpoints, then recomputes category counts and link-status counts
+(which also reseeds the URL bloom filter from `links_by_id`). `snapshot.meta` is written by op 22 and `dmoz_import` for
+operators; the WAL sequence resumes from the superblock. A WAL that fails to open, a WAL whose `fdatasync` has failed
+(further commits are refused and the process restarts), and a WAL with valid records more than one batch beyond a corrupt
+record all refuse to start rather than serve or silently drop data.
 
 ---
 
@@ -260,7 +266,7 @@ are read by `zigstore.ServerConfig.fromEnv("DMOZDB_")`; the rest by `src/main.zi
 | `DMOZDB_TRUSTED`                          | string | (none)            | Comma-separated IPv4 addresses and/or CIDRs (`10.0.0.5,10.244.0.0/16`) allowed to connect |
 | `DMOZDB_CACHE_SIZE_MB`                    | u32    | `256`             | Page cache size in megabytes                                                |
 | `DMOZDB_THREAD_COUNT`                     | u32    | auto              | 0 = CPU count (capped at 32); the server runs `max(n / 2, 1)` reactors      |
-| `DMOZDB_SNAPSHOT_INTERVAL_S`              | u32    | `300`             | Parsed, currently unused: there is no periodic snapshot                     |
+| `DMOZDB_SNAPSHOT_INTERVAL_S`              | u32    | `300`             | Seconds between periodic checkpoints (drain, journal, `wal.bin` truncate)   |
 | `DMOZDB_WAL_SYNC_INTERVAL_MS`             | u32    | `50`              | Parsed, currently unused: the WAL flusher timer is a fixed 2 ms             |
 | `DMOZDB_WAL_BATCH_SIZE`                   | u32    | `256`             | WAL entries that trigger an immediate group flush                           |
 | `DMOZDB_DATA_DIR`                         | string | `/var/lib/dmozdb` | Directory for `store.dat`, `wal.bin`, `snapshot.meta`                       |
@@ -316,7 +322,7 @@ Response: [u32 len][u8 op][u8 status][u8 sub_status][u8 pad][u16 count][payload.
 | 18     | `index_health`            | no      | Verifier snapshot + slug-path repair queue depth + worker counters        |
 | 19     | `run_verifier`            | no      | Run the verifier inline, then return the `index_health` frame            |
 | 20     | `rebuild_index`           | no      | Rebuild the category and link secondary indexes, drain the repair queue  |
-| 22     | `snapshot`                | no      | Flush cache + header and write `snapshot.meta`                           |
+| 22     | `snapshot`                | no      | Checkpoint (journaled page + header flush, WAL truncate), write `snapshot.meta` |
 | 23     | `op_latency_stats`        | no      | Per-op latency percentiles since boot                                    |
 | 24     | `bulk_import`             | yes     | Insert up to 50,000 links from one frame (importer path)                 |
 | 25     | `create_submission`       | no      | Create a link with status `pending` and a submitter ID                   |
@@ -769,7 +775,8 @@ The page cache (`page_cache.zig` in zigstore) keeps frequently accessed pages in
 
 - **Configurable size**: default 256 MB = 16,384 pages
 - **Eviction policy**: LRU per shard with pin counting; pinned pages cannot be evicted
-- **Dirty tracking**: pages fetched for mutation are marked dirty and written back on snapshot, eviction or shutdown
+- **No-steal dirty tracking**: pages fetched for mutation are marked dirty and never evicted; they reach `store.dat`
+  only through a checkpoint (journal, then in place), and a pressure valve checkpoints early once half the cache is dirty
 - **Thread-safe**: 64 shards keyed by page ID, each behind its own `std.Thread.Mutex`
 - **Atomic stats**: `hit_count` and `miss_count` use `std.atomic.Value` for lock-free reads
 
@@ -794,8 +801,13 @@ tags (`link_inserted`, `link_deleted`, `link_text_updated`, `link_recategorized`
 
 **Group commit**: the flusher thread wakes when the batch reaches `DMOZDB_WAL_BATCH_SIZE` (default 256) or after a
 fixed 2 ms, writes every pending entry and issues one `fdatasync`. Each committing handler waits in `awaitDurable` for
-its sequence to pass that fsync. If an fsync fails, `fsync_failed` is set and stays set: every later commit returns
-`error.WalFlushFailed` until the process restarts.
+its sequence to pass that fsync. If an fsync fails, `fsync_failed` is set and stays set: every later commit is refused
+with `error.WalFlushFailed` before it is appended, and `Directory.commit` aborts the process on it, because the entry
+whose fsync failed is already applied in memory and only a restart makes what is served match what is durable.
+
+**Recovery scan**: on open the WAL is scanned for the last valid record. A torn tail of at most one group-commit batch
+is trimmed; valid records more than one batch beyond a corrupt record mean the damage is not a torn write, so the store
+refuses to start (`error.WalCorrupt`) instead of silently discarding them.
 
 ### Slug Path Resolution
 
@@ -910,7 +922,8 @@ The server creates these files in `DMOZDB_DATA_DIR`:
 | File            | Purpose                                                                 |
 |-----------------|-------------------------------------------------------------------------|
 | `store.dat`     | Main data file (16 KB pages: header + B+Tree nodes)                     |
-| `wal.bin`       | Write-ahead log (append-only; truncated on clean shutdown)              |
+| `wal.bin`       | Write-ahead log (append-only; truncated at every checkpoint)            |
+| `checkpoint.journal` | Page images of the checkpoint in progress; empty between checkpoints, redone on open if a crash left it complete |
 | `snapshot.meta` | 64-byte superblock written by op 22 / `dmoz_import`; records the WAL sequence at that point |
 
 ### Monitoring
@@ -930,16 +943,16 @@ The server handles `SIGINT` and `SIGTERM` via a self-pipe that wakes the epoll l
 
 1. Signal handler sets an atomic flag and writes a byte to the self-pipe
 2. Epoll loop wakes, detects the shutdown fd, and exits
-3. Background workers (memtable flusher, verifier, repair worker) are stopped
-4. Memtables are drained into the B+Trees and all dirty cache pages are flushed
-5. File header is persisted (page count, root page pointers, entry counts, ID counters)
-6. `wal.bin` is truncated, but only if steps 4 and 5 succeeded; otherwise it is kept for replay on the next boot
-7. All connections are closed
+3. Background workers (checkpointer, memtable flusher, verifier, repair worker) are stopped
+4. A final checkpoint runs: memtables drain into the B+Trees, every dirty page and the header go through
+   `checkpoint.journal` into `store.dat`, and `wal.bin` is truncated only after the header is durable; if any step
+   fails the WAL is kept for replay on the next boot
+5. All connections are closed
 
 ### Backup
 
-There is no online backup. Either stop the server, or take a snapshot (op 22) and copy immediately after it returns;
-`snapshot.meta` on its own is not a backup.
+There is no online backup. Either stop the server, or take a snapshot (op 22, a full checkpoint) and copy `store.dat`
+immediately after it returns, before the next checkpoint starts; `snapshot.meta` on its own is not a backup.
 
 ```bash
 # Stop the server for a consistent backup

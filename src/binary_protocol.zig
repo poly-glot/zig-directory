@@ -561,8 +561,8 @@ fn handleBrowsePath(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
     const cat = (operations.getCategory(db, cat_id) catch null) orelse
         return writeErrorResp(resp, op_byte, .not_found);
 
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent()) catch |err| log.warn("drain skipped before read: {}", .{err});
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category()) catch |err| log.warn("drain skipped before read: {}", .{err});
 
     const MIN_FRAME = RESPONSE_HEADER_SIZE + @sizeOf(schema.Category) + 2 + 2 + 8;
     if (resp.len < MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
@@ -722,9 +722,9 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
         .after_id = extras.after_id,
     };
 
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent()) catch |err| log.warn("drain skipped before read: {}", .{err});
+    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category()) catch |err| log.warn("drain skipped before read: {}", .{err});
+    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id()) catch |err| log.warn("drain skipped before read: {}", .{err});
 
     const descendants = subtree.collectDescendantsCached(
         db.cat_by_parent(),
@@ -1355,10 +1355,10 @@ test "list_subtree_links: the sequential scan above subtree_scan_threshold and t
         const url = std.fmt.bufPrint(&url_buf, "https://x{d}.t", .{i}) catch unreachable;
         _ = try ops.createLink(db, cat_ids[i], url, "L", "");
     }
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
-    db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
 
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], top_id, .little);

@@ -182,7 +182,7 @@ test "resolveSlugPath: returns id for queue-empty fast path (steady state)" {
     var db = try Directory.openTestInstance(allocator, &tmp);
     defer db.deinitTestInstance();
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
     try std.testing.expectEqual(top_id, (try resolveSlugPath(db, "top")).?);
     try std.testing.expectEqual(@as(u64, 0), db.slug_path_repair_queue().entry_count);
 }
@@ -196,8 +196,8 @@ test "resolveSlugPath: validation gate hides orphans during repair window" {
 
     const top_id = try category.createCategory(db, 0, "Top", "top", "");
     const a_id = try category.createCategory(db, top_id, "A", "a", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var v: [8]u8 = codec.encodeU64(a_id);
     try db.categories_by_slug_path().insert("top/old-a", &v);

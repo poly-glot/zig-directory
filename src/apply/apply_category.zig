@@ -143,8 +143,8 @@ test "applyCategoryInserted: writes primary + secondaries + slug paths + tokens 
 
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -210,8 +210,8 @@ test "applyCategoryDeleted: reverses category_inserted (primary + secondaries + 
 
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -283,8 +283,8 @@ test "applyCategoryTextUpdated: rewrites primary, swaps token entries; slug+coun
 
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

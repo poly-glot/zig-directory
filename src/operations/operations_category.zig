@@ -192,7 +192,7 @@ pub fn listChildren(
     limit: u32,
     buf: []schema.Category,
 ) ![]schema.Category {
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     const start_key = schema.ParentChildKey.encode(.{ parent_id, 0 });
     const end_key = schema.ParentChildKey.encode(.{ parent_id, std.math.maxInt(u64) });
@@ -295,9 +295,9 @@ pub const CategoryCounts = struct {
 pub fn computeCategoryCounts(db: *Directory) !CategoryCounts {
     const allocator = db.allocator;
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
-    db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
 
     var counts = CategoryCounts{
         .allocator = allocator,
@@ -448,7 +448,7 @@ test "recomputeCategoryCounts: rebuilds drifted counts from indexes" {
     _ = try link_mod.createLink(db, b_id, "https://x2.example", "X2", "");
     _ = try link_mod.createLink(db, a_id, "https://x3.example", "X3", "");
 
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
     {
         var tampered = (try getCategory(db, top_id)).?;
         tampered.link_count = 99;

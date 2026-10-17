@@ -138,15 +138,11 @@ fn importLinks(
         };
         n_created += 1;
         if (n_created % 5000 == 0) {
-            db.drainAllMemtables();
             const snap = zigstore.snapshot.forceSnapshot(db.store.snapshotHost()) catch |e| blk: {
                 log.warn("forceSnapshot failed: {}", .{e});
                 break :blk zigstore.SnapshotResult{ .wal_sequence = 0, .duration_ms = 0 };
             };
-            if (db.store.wal_writer) |*w| {
-                w.truncateAfterCheckpoint() catch |e| log.warn("wal truncate failed: {}", .{e});
-            }
-            log.info("  inserted {d} links (snapshot wal_seq={d} dur={d}ms)", .{ n_created, snap.wal_sequence, snap.duration_ms });
+            log.info("  inserted {d} links (checkpoint wal_seq={d} dur={d}ms)", .{ n_created, snap.wal_sequence, snap.duration_ms });
         }
     }
     log.info("Links: created={d} skipped={d}", .{ n_created, n_skipped });

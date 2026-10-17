@@ -183,8 +183,8 @@ test "repair_worker: drains a single queued task end-to-end" {
     const parent_id = try ops.createCategory(db, top_id, "P", "old", "");
     _ = try ops.createCategory(db, parent_id, "C1", "c1", "");
     _ = try ops.createCategory(db, parent_id, "C2", "c2", "");
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try ops.updateCategory(db, parent_id, null, "new", null);
     try std.testing.expect(db.slug_path_repair_queue().entry_count > 0);
@@ -231,8 +231,8 @@ test "repair_worker: idempotent across simulated mid-walk crash" {
         const parent_id = try ops.createCategory(db, top_id, "P", "old", "");
         _ = try ops.createCategory(db, parent_id, "C1", "c1", "");
         _ = try ops.createCategory(db, parent_id, "C2", "c2", "");
-        db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-        db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+        try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+        try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
         try ops.updateCategory(db, parent_id, null, "new", null);
         try processOneChunk(db);
@@ -265,8 +265,8 @@ test "repair_worker: multi-chunk resumable walk repairs every descendant" {
         const child = try ops.createCategory(db, parent_id, "x", slug, "");
         if (i == 0) _ = try ops.createCategory(db, child, "GC", "gc", "");
     }
-    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
+    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
 
     try ops.updateCategory(db, parent_id, null, "new", null);
     try std.testing.expect(db.slug_path_repair_queue().entryCount() > 0);

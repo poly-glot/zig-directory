@@ -26,10 +26,15 @@ pub fn rebuildAllIndices(db: *Directory) !RebuildStats {
     };
 
     {
+        db.write_mutex.lock();
+        defer db.write_mutex.unlock();
+
+        try db.drainAllMemtables();
+
+        db.store.mt_drain_mutex.lock();
+        defer db.store.mt_drain_mutex.unlock();
         db.store.apply_mutex.lock();
         defer db.store.apply_mutex.unlock();
-
-        db.drainAllMemtables();
 
         stats.categories_rebuilt = try rebuildCategoryIndices(db);
 
@@ -185,7 +190,7 @@ test "rebuildAllIndices: tampered slug-path entry is restored" {
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     const a_id = try ops.createCategory(db, top_id, "Arts", "arts", "");
-    db.drainAllMemtables();
+    try db.drainAllMemtables();
 
     var v_buf: [16]u8 = undefined;
     try std.testing.expect((try db.categories_by_slug_path().search("top/arts", &v_buf)) != null);
@@ -211,7 +216,7 @@ test "rebuildAllIndices: stale token entry removed and re-added" {
     const ops = @import("../operations/operations.zig");
     const top_id = try ops.createCategory(db, 0, "Top", "top", "");
     _ = try ops.createCategory(db, top_id, "Programming", "programming", "");
-    db.drainAllMemtables();
+    try db.drainAllMemtables();
 
     const stale_tok = "programming";
     var stale_key: [stale_tok.len + 8]u8 = undefined;
@@ -251,7 +256,7 @@ test "rebuildAllIndices: drains queued slug-path repair task" {
     const parent_id = try ops.createCategory(db, top_id, "P", "old", "");
     _ = try ops.createCategory(db, parent_id, "C1", "c1", "");
     _ = try ops.createCategory(db, parent_id, "C2", "c2", "");
-    db.drainAllMemtables();
+    try db.drainAllMemtables();
 
     try ops.updateCategory(db, parent_id, null, "new", null);
     try std.testing.expect(db.slug_path_repair_queue().entry_count > 0);
