@@ -2,8 +2,6 @@ const std = @import("std");
 const posix = std.posix;
 const common = @import("../common.zig");
 
-const HEADER_SIZE = common.HEADER_SIZE;
-
 const Kind = enum { cache, boot };
 
 const ColdOpts = struct {
@@ -13,12 +11,8 @@ const ColdOpts = struct {
     reseed: bool = false,
 };
 
-const Op = enum(u8) {
-    create_link = 1,
-    create_category = 2,
-    get_link = 3,
-    ping = 255,
-};
+const INLINE_SEED_CATEGORIES: u32 = 200;
+const INLINE_SEED_LINKS: u64 = 2000;
 
 pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
     var leftovers: std.ArrayList([]const u8) = .{};
@@ -36,13 +30,46 @@ pub fn run(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !void {
         return error.MissingServerCmd;
     };
 
-    try ensureDir(opts.data_dir);
+    try common.ensureDir(opts.data_dir);
 
     switch (kind) {
         .cache => try runCache(allocator, common_opts, opts, server_cmd),
         .boot => try runBoot(allocator, common_opts, opts, server_cmd),
     }
 }
+
+const CacheCtx = struct {
+    link_ids: common.IdRange,
+    op_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    window_a: common.AtomicHistogram = .{},
+    window_b: common.AtomicHistogram = .{},
+    window_c: common.AtomicHistogram = .{},
+
+    pub const REQ_BUF_SIZE: usize = 64;
+    pub const RESP_BUF_SIZE: usize = 1 << 14;
+
+    pub fn prngSeed(id: u32) u64 {
+        return @as(u64, id) *% 0x9E37_79B9_7F4A_7C15;
+    }
+
+    pub fn nextFrame(self: *CacheCtx, w: *common.Worker) !common.Frame {
+        var fb = common.FrameBuilder.init(w.req_buf, .get_link);
+        fb.writeU64(self.link_ids.pick(w.rand));
+        return .{ .bytes = fb.finalize(1) };
+    }
+
+    pub fn onResponse(self: *CacheCtx, _: []const u8, latency_ns: u64) bool {
+        const idx = self.op_counter.fetchAdd(1, .monotonic);
+        if (idx < 1000) {
+            self.window_a.recordValue(latency_ns);
+        } else if (idx < 5000) {
+            self.window_b.recordValue(latency_ns);
+        } else {
+            self.window_c.recordValue(latency_ns);
+        }
+        return true;
+    }
+};
 
 fn runCache(
     allocator: std.mem.Allocator,
@@ -52,9 +79,10 @@ fn runCache(
 ) !void {
     try ensureSeed(allocator, opts, server_cmd, common_opts);
 
-    const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
+    const seed_path = try common.seedPath(allocator, opts.data_dir);
     defer allocator.free(seed_path);
-    const seed = try loadSeed(allocator, seed_path);
+    const seed = try common.loadSeed(allocator, seed_path);
+    defer seed.deinit();
 
     var child = try spawnServer(allocator, server_cmd, opts.data_dir);
     defer killChild(&child);
@@ -64,51 +92,12 @@ fn runCache(
     const total_ops: u64 = @as(u64, common_opts.workers) * common_opts.ops_per_worker;
     if (total_ops == 0) return error.NoOps;
 
-    var window_a = common.Histogram{};
-    var window_b = common.Histogram{};
-    var window_c = common.Histogram{};
-    var overall = common.Histogram{};
+    var run_opts = common_opts;
+    run_opts.warmup_ops = 0;
 
-    const ctxs = try allocator.alloc(CacheCtx, common_opts.workers);
-    defer allocator.free(ctxs);
-    const threads = try allocator.alloc(std.Thread, common_opts.workers);
-    defer allocator.free(threads);
-
-    var op_counter = std.atomic.Value(u64).init(0);
-    const t_start = std.time.nanoTimestamp();
-
-    for (ctxs, 0..) |*ctx, i| {
-        ctx.* = .{
-            .id = @intCast(i),
-            .host = common_opts.connect_host,
-            .port = common_opts.port,
-            .ops_per_worker = common_opts.ops_per_worker,
-            .link_id_min = seed.link_id_min,
-            .link_id_max = seed.link_id_max,
-            .global_op_counter = &op_counter,
-        };
-    }
-    for (ctxs, threads) |*ctx, *th| {
-        th.* = try std.Thread.spawn(.{}, cacheWorkerMain, .{ctx});
-    }
-    for (threads) |th| th.join();
-
-    const t_end = std.time.nanoTimestamp();
-    const duration_ns: u64 = @intCast(t_end - t_start);
-    const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
-
-    var errors = common.ErrorCounts{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 };
-    var ops_total: u64 = 0;
-    for (ctxs) |*ctx| {
-        window_a.merge(&ctx.window_a);
-        window_b.merge(&ctx.window_b);
-        window_c.merge(&ctx.window_c);
-        overall.merge(&ctx.overall);
-        errors.connect_failed += ctx.errors.connect_failed;
-        errors.timeout += ctx.errors.timeout;
-        errors.protocol_error += ctx.errors.protocol_error;
-        ops_total += ctx.ops_completed;
-    }
+    var ctx = CacheCtx{ .link_ids = seed.value.linkIds() };
+    var bench = common.Run.init(allocator, run_opts);
+    try bench.runWorkers(CacheCtx, &ctx);
 
     std.debug.print(
         "cold-cache curve (n={d}): " ++
@@ -116,124 +105,27 @@ fn runCache(
             "                  win[1000..5000]   p50={d}us p95={d}us p99={d}us samples={d}\n" ++
             "                  win[5000..end]    p50={d}us p95={d}us p99={d}us samples={d}\n",
         .{
-            ops_total,
-            window_a.percentile(50.0) / 1000,
-            window_a.percentile(95.0) / 1000,
-            window_a.percentile(99.0) / 1000,
-            window_a.total_count,
-            window_b.percentile(50.0) / 1000,
-            window_b.percentile(95.0) / 1000,
-            window_b.percentile(99.0) / 1000,
-            window_b.total_count,
-            window_c.percentile(50.0) / 1000,
-            window_c.percentile(95.0) / 1000,
-            window_c.percentile(99.0) / 1000,
-            window_c.total_count,
+            bench.opsCompleted(),
+            ctx.window_a.percentile(50.0) / 1000,
+            ctx.window_a.percentile(95.0) / 1000,
+            ctx.window_a.percentile(99.0) / 1000,
+            ctx.window_a.samples(),
+            ctx.window_b.percentile(50.0) / 1000,
+            ctx.window_b.percentile(95.0) / 1000,
+            ctx.window_b.percentile(99.0) / 1000,
+            ctx.window_b.samples(),
+            ctx.window_c.percentile(50.0) / 1000,
+            ctx.window_c.percentile(95.0) / 1000,
+            ctx.window_c.percentile(99.0) / 1000,
+            ctx.window_c.samples(),
         },
     );
 
-    const ops_per_sec: u64 = if (duration_ms > 0) ops_total * 1000 / duration_ms else 0;
-    const host = std.posix.getenv("HOSTNAME") orelse "unknown";
-    const git_rev: []const u8 = common_opts.git_rev orelse "unknown";
-
-    const record = common.BenchRecord{
-        .ts = std.time.milliTimestamp(),
-        .host = host,
-        .git_rev = git_rev,
-        .profile = common_opts.profile,
-        .workload = "cold",
-        .params = .{ .cold = .{
-            .kind = "cache",
-            .iterations = 1,
-            .server_cmd = server_cmd,
-        } },
-        .duration_ms = duration_ms,
-        .ops_total = ops_total,
-        .ops_per_sec = ops_per_sec,
-        .latency_ns = .{
-            .p50 = overall.percentile(50.0),
-            .p95 = overall.percentile(95.0),
-            .p99 = overall.percentile(99.0),
-            .p99_9 = overall.percentile(99.9),
-            .max = overall.max_recorded,
-            .mean = overall.mean(),
-            .samples = overall.total_count,
-        },
-        .rss_bytes = .{ .peak = 0, .final = 0, .note = "rss_unavailable" },
-        .errors = errors,
-    };
-
-    try emitRecord(allocator, common_opts.output_path, record);
-}
-
-const CacheCtx = struct {
-    id: u32,
-    host: []const u8,
-    port: u16,
-    ops_per_worker: u64,
-    link_id_min: u64,
-    link_id_max: u64,
-    global_op_counter: *std.atomic.Value(u64),
-    window_a: common.Histogram = .{},
-    window_b: common.Histogram = .{},
-    window_c: common.Histogram = .{},
-    overall: common.Histogram = .{},
-    errors: common.ErrorCounts = .{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 },
-    ops_completed: u64 = 0,
-};
-
-fn cacheWorkerMain(ctx: *CacheCtx) void {
-    cacheWorkerRun(ctx) catch |err| {
-        std.log.warn("cold-cache worker {d} fatal: {s}", .{ ctx.id, @errorName(err) });
-    };
-}
-
-fn cacheWorkerRun(ctx: *CacheCtx) !void {
-    const fd = tcpConnect(ctx.host, ctx.port) catch {
-        ctx.errors.connect_failed += 1;
-        return;
-    };
-    defer posix.close(fd);
-
-    const req_buf = std.heap.page_allocator.alloc(u8, 64) catch return error.OutOfMemory;
-    defer std.heap.page_allocator.free(req_buf);
-    const resp_buf = std.heap.page_allocator.alloc(u8, 1 << 14) catch return error.OutOfMemory;
-    defer std.heap.page_allocator.free(resp_buf);
-
-    var prng = std.Random.DefaultPrng.init(@as(u64, ctx.id) * 0x9E37_79B9_7F4A_7C15);
-    const rand = prng.random();
-    const span: u64 = ctx.link_id_max - ctx.link_id_min + 1;
-
-    while (ctx.ops_completed < ctx.ops_per_worker) {
-        const link_id = ctx.link_id_min + rand.uintLessThan(u64, span);
-        var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.get_link));
-        fb.writeU64(link_id);
-        const frame = fb.finalize(1);
-
-        const t0 = std.time.nanoTimestamp();
-        const resp_len = common.sendAndReceive(fd, frame, resp_buf) catch {
-            ctx.errors.protocol_error += 1;
-            return;
-        };
-        const t1 = std.time.nanoTimestamp();
-
-        if (resp_len < common.RESPONSE_HEADER_SIZE) {
-            ctx.errors.protocol_error += 1;
-            return;
-        }
-
-        const dt: u64 = @intCast(t1 - t0);
-        ctx.overall.recordValue(dt);
-        const idx = ctx.global_op_counter.fetchAdd(1, .monotonic);
-        if (idx < 1000) {
-            ctx.window_a.recordValue(dt);
-        } else if (idx < 5000) {
-            ctx.window_b.recordValue(dt);
-        } else {
-            ctx.window_c.recordValue(dt);
-        }
-        ctx.ops_completed += 1;
-    }
+    try bench.emit("cold", .{ .cold = .{
+        .kind = "cache",
+        .iterations = 1,
+        .server_cmd = server_cmd,
+    } }, bench.opsCompleted());
 }
 
 fn runBoot(
@@ -247,7 +139,7 @@ fn runBoot(
 
     try ensureSeed(allocator, opts, server_cmd, common_opts);
 
-    var hist = common.Histogram{};
+    var bench = common.Run.init(allocator, common_opts);
     var per_iter = try allocator.alloc(u64, iterations);
     defer allocator.free(per_iter);
 
@@ -257,17 +149,14 @@ fn runBoot(
         const t0 = std.time.nanoTimestamp();
         var child = try spawnServer(allocator, server_cmd, opts.data_dir);
         try waitForPing(common_opts.connect_host, common_opts.port, 60_000);
-        const t1 = std.time.nanoTimestamp();
-        const dt_ns: u64 = @intCast(t1 - t0);
+        const dt_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
         per_iter[i] = dt_ns;
-        hist.recordValue(dt_ns);
+        bench.histogram.recordValue(dt_ns);
         killChild(&child);
 
         std.Thread.sleep(200 * std.time.ns_per_ms);
     }
-    const t_end_all = std.time.nanoTimestamp();
-    const duration_ns: u64 = @intCast(t_end_all - t_start_all);
-    const duration_ms: u64 = duration_ns / std.time.ns_per_ms;
+    bench.duration_ms = common.elapsedMs(t_start_all);
 
     std.debug.print("cold-boot iterations (ms): ", .{});
     for (per_iter, 0..) |ns, idx| {
@@ -276,38 +165,11 @@ fn runBoot(
     }
     std.debug.print("\n", .{});
 
-    const ops_per_sec: u64 = if (duration_ms > 0) iterations * 1000 / duration_ms else 0;
-    const host = std.posix.getenv("HOSTNAME") orelse "unknown";
-    const git_rev: []const u8 = common_opts.git_rev orelse "unknown";
-
-    const record = common.BenchRecord{
-        .ts = std.time.milliTimestamp(),
-        .host = host,
-        .git_rev = git_rev,
-        .profile = common_opts.profile,
-        .workload = "cold",
-        .params = .{ .cold = .{
-            .kind = "boot",
-            .iterations = @intCast(iterations),
-            .server_cmd = server_cmd,
-        } },
-        .duration_ms = duration_ms,
-        .ops_total = iterations,
-        .ops_per_sec = ops_per_sec,
-        .latency_ns = .{
-            .p50 = hist.percentile(50.0),
-            .p95 = hist.percentile(95.0),
-            .p99 = hist.percentile(99.0),
-            .p99_9 = hist.percentile(99.9),
-            .max = hist.max_recorded,
-            .mean = hist.mean(),
-            .samples = hist.total_count,
-        },
-        .rss_bytes = .{ .peak = 0, .final = 0, .note = "rss_unavailable" },
-        .errors = .{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 },
-    };
-
-    try emitRecord(allocator, common_opts.output_path, record);
+    try bench.emit("cold", .{ .cold = .{
+        .kind = "boot",
+        .iterations = @intCast(iterations),
+        .server_cmd = server_cmd,
+    } }, iterations);
 }
 
 fn ensureSeed(
@@ -316,7 +178,7 @@ fn ensureSeed(
     server_cmd: []const u8,
     common_opts: common.CommonOpts,
 ) !void {
-    const seed_path = try std.fmt.allocPrint(allocator, "{s}/seed.json", .{opts.data_dir});
+    const seed_path = try common.seedPath(allocator, opts.data_dir);
     defer allocator.free(seed_path);
 
     if (fileExists(seed_path)) return;
@@ -335,7 +197,7 @@ fn ensureSeed(
     defer killChild(&child);
     try waitForPing(common_opts.connect_host, common_opts.port, 10_000);
 
-    const fd = try tcpConnect(common_opts.connect_host, common_opts.port);
+    const fd = try common.tcpConnect(common_opts.connect_host, common_opts.port);
     defer posix.close(fd);
 
     const req_buf = try allocator.alloc(u8, 1 << 20);
@@ -344,50 +206,20 @@ fn ensureSeed(
     defer allocator.free(resp_buf);
 
     const top_id: u64 = 1;
-    const N_CATS: u32 = 200;
-    const N_LINKS: u64 = 2000;
 
-    const cat_ids = try allocator.alloc(u64, N_CATS);
+    const cat_ids = try allocator.alloc(u64, INLINE_SEED_CATEGORIES);
     defer allocator.free(cat_ids);
 
     var ci: u32 = 0;
-    while (ci < N_CATS) : (ci += 1) {
+    while (ci < INLINE_SEED_CATEGORIES) : (ci += 1) {
         var name_buf: [32]u8 = undefined;
         var slug_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "C{d}", .{ci + 1});
         const slug = try std.fmt.bufPrint(&slug_buf, "c{d}", .{ci + 1});
-        cat_ids[ci] = try createCategory(fd, req_buf, resp_buf, top_id, name, slug, "");
+        cat_ids[ci] = try common.createCategory(fd, req_buf, resp_buf, top_id, name, slug, "");
     }
 
-    const cat_id_min: u64 = top_id;
-    const cat_id_max: u64 = cat_ids[cat_ids.len - 1];
-
-    const BATCH: usize = 100;
-    var counter: u64 = 0;
-    var link_id_min: u64 = 0;
-    var link_id_max: u64 = 0;
-    while (counter < N_LINKS) {
-        const remaining = N_LINKS - counter;
-        const batch = @min(@as(u64, BATCH), remaining);
-        var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.create_link));
-        var bi: u64 = 0;
-        while (bi < batch) : (bi += 1) {
-            const idx = counter + bi + 1;
-            const cat_id = cat_ids[@intCast((counter + bi) % cat_ids.len)];
-            var url_buf: [64]u8 = undefined;
-            var title_buf: [32]u8 = undefined;
-            const url = try std.fmt.bufPrint(&url_buf, "https://b{d}.t", .{idx});
-            const title = try std.fmt.bufPrint(&title_buf, "L{d}", .{idx});
-            fb.writeU64(cat_id);
-            fb.writeU16LenPrefixed(url);
-            fb.writeU16LenPrefixed(title);
-            fb.writeU16LenPrefixed("");
-        }
-        const frame = fb.finalize(@intCast(batch));
-        const resp_len = try common.sendAndReceive(fd, frame, resp_buf);
-        try checkBatchResponse(resp_buf[0..resp_len], @intCast(batch), &link_id_min, &link_id_max);
-        counter += batch;
-    }
+    const link_ids = try common.createLinksRoundRobin(fd, req_buf, resp_buf, cat_ids, INLINE_SEED_LINKS);
 
     const SeedJson = struct {
         schema_version: u32,
@@ -401,13 +233,13 @@ fn ensureSeed(
     };
     const payload = SeedJson{
         .schema_version = 1,
-        .categories = N_CATS,
-        .links = N_LINKS,
+        .categories = INLINE_SEED_CATEGORIES,
+        .links = INLINE_SEED_LINKS,
         .depth = 1,
-        .category_id_min = cat_id_min,
-        .category_id_max = cat_id_max,
-        .link_id_min = link_id_min,
-        .link_id_max = link_id_max,
+        .category_id_min = top_id,
+        .category_id_max = cat_ids[cat_ids.len - 1],
+        .link_id_min = link_ids.min,
+        .link_id_max = link_ids.max,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
@@ -416,7 +248,7 @@ fn ensureSeed(
     try f.writeAll(json);
     try f.writeAll("\n");
 
-    std.debug.print("cold: inline seed complete ({d} cats, {d} links)\n", .{ N_CATS, N_LINKS });
+    std.debug.print("cold: inline seed complete ({d} cats, {d} links)\n", .{ INLINE_SEED_CATEGORIES, INLINE_SEED_LINKS });
 }
 
 fn spawnServer(
@@ -460,65 +292,9 @@ fn waitForPing(host: []const u8, port: u16, total_timeout_ms: u64) !void {
 }
 
 fn tryPing(host: []const u8, port: u16) !void {
-    const fd = try tcpConnect(host, port);
+    const fd = try common.tcpConnect(host, port);
     defer posix.close(fd);
-    var req: [HEADER_SIZE]u8 = undefined;
-    var fb = common.FrameBuilder.init(&req, @intFromEnum(Op.ping));
-    const frame = fb.finalize(0);
-    var resp_buf: [64]u8 = undefined;
-    const n = try common.sendAndReceive(fd, frame, &resp_buf);
-    if (n < common.RESPONSE_HEADER_SIZE) return error.ProtocolError;
-    if (resp_buf[5] != 0) return error.PingFailed;
-}
-
-fn tcpConnect(host: []const u8, port: u16) !i32 {
-    const addr = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &addr.any, addr.getOsSockLen());
-    return fd;
-}
-
-fn createCategory(
-    stream_fd: i32,
-    req_buf: []u8,
-    resp_buf: []u8,
-    parent_id: u64,
-    name: []const u8,
-    slug: []const u8,
-    desc: []const u8,
-) !u64 {
-    var fb = common.FrameBuilder.init(req_buf, @intFromEnum(Op.create_category));
-    fb.writeU64(parent_id);
-    fb.writeU16LenPrefixed(name);
-    fb.writeU16LenPrefixed(slug);
-    fb.writeU16LenPrefixed(desc);
-    const frame = fb.finalize(1);
-    const resp_len = try common.sendAndReceive(stream_fd, frame, resp_buf);
-    if (resp_len < common.RESPONSE_HEADER_SIZE + 10) return error.ProtocolError;
-    if (resp_buf[5] != 0) return error.CreateCategoryFailed;
-    const item_status = resp_buf[common.RESPONSE_HEADER_SIZE];
-    if (item_status != 0) return error.CreateCategoryFailed;
-    return std.mem.readInt(u64, resp_buf[common.RESPONSE_HEADER_SIZE + 2 ..][0..8], .little);
-}
-
-fn checkBatchResponse(resp: []const u8, expected_count: u16, id_min: *u64, id_max: *u64) !void {
-    if (resp.len < common.RESPONSE_HEADER_SIZE) return error.ProtocolError;
-    if (resp[5] != 0) return error.ProtocolError;
-    const count = std.mem.readInt(u16, resp[8..10], .little);
-    if (count != expected_count) return error.ProtocolError;
-    var off: usize = common.RESPONSE_HEADER_SIZE;
-    const ITEM_BYTES: usize = 10;
-    var i: u16 = 0;
-    while (i < count) : (i += 1) {
-        if (off + ITEM_BYTES > resp.len) return error.ProtocolError;
-        const status = resp[off];
-        if (status != 0) return error.BatchItemFailed;
-        const id = std.mem.readInt(u64, resp[off + 2 ..][0..8], .little);
-        if (id_min.* == 0 or id < id_min.*) id_min.* = id;
-        if (id > id_max.*) id_max.* = id;
-        off += ITEM_BYTES;
-    }
+    try common.ping(fd);
 }
 
 fn parseColdOpts(leftovers: []const []const u8) !ColdOpts {
@@ -556,54 +332,7 @@ fn parseColdOpts(leftovers: []const []const u8) !ColdOpts {
     return opts;
 }
 
-fn ensureDir(path: []const u8) !void {
-    std.fs.cwd().makePath(path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-}
-
 fn fileExists(path: []const u8) bool {
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
-}
-
-const SeedInfo = struct {
-    link_id_min: u64,
-    link_id_max: u64,
-};
-
-fn loadSeed(allocator: std.mem.Allocator, path: []const u8) !SeedInfo {
-    const f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
-    const data = try f.readToEndAlloc(allocator, 1 << 24);
-    defer allocator.free(data);
-
-    const Parsed = struct {
-        link_id_min: u64,
-        link_id_max: u64,
-    };
-    const parsed = try std.json.parseFromSlice(Parsed, allocator, data, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    return .{
-        .link_id_min = parsed.value.link_id_min,
-        .link_id_max = parsed.value.link_id_max,
-    };
-}
-
-fn emitRecord(allocator: std.mem.Allocator, output_path: ?[]const u8, record: common.BenchRecord) !void {
-    if (output_path) |path| {
-        var w = try common.JsonLineWriter.open(path);
-        defer w.close();
-        try w.appendRecord(record);
-    } else {
-        const json = try std.json.Stringify.valueAlloc(allocator, record, .{});
-        defer allocator.free(json);
-        var stdout_buf: [4096]u8 = undefined;
-        var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-        const w = &stdout_writer.interface;
-        try w.writeAll(json);
-        try w.writeAll("\n");
-        try w.flush();
-    }
 }

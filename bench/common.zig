@@ -1,20 +1,44 @@
 const std = @import("std");
 const posix = std.posix;
+const zigstore = @import("zigstore");
+
+pub const AtomicHistogram = zigstore.histogram.AtomicHistogram;
 
 pub const REQUEST_HEADER_SIZE: usize = 8;
 
 pub const RESPONSE_HEADER_SIZE: usize = 10;
 
-pub const HEADER_SIZE: usize = REQUEST_HEADER_SIZE;
+const STATUS_OK: u8 = 0;
+
+const LINK_BATCH: u64 = 100;
+
+const BATCH_ITEM_BYTES: usize = 10;
+
+pub const Op = enum(u8) {
+    create_link = 1,
+    create_category = 2,
+    get_link = 3,
+    browse_path = 11,
+    list_children = 12,
+    search = 14,
+    list_subtree_links = 17,
+    bulk_import = 24,
+    ping = 255,
+};
 
 pub const FrameBuilder = struct {
     buf: []u8,
     pos: usize,
 
-    pub fn init(buf: []u8, op: u8) FrameBuilder {
-        buf[4] = op;
+    pub fn init(buf: []u8, op: Op) FrameBuilder {
+        buf[4] = @intFromEnum(op);
         buf[5] = 0;
-        return .{ .buf = buf, .pos = HEADER_SIZE };
+        return .{ .buf = buf, .pos = REQUEST_HEADER_SIZE };
+    }
+
+    pub fn writeU8(self: *FrameBuilder, v: u8) void {
+        self.buf[self.pos] = v;
+        self.pos += 1;
     }
 
     pub fn writeU16(self: *FrameBuilder, v: u16) void {
@@ -49,6 +73,17 @@ pub const FrameBuilder = struct {
     }
 };
 
+pub fn writeLinkItem(fb: *FrameBuilder, cat_id: u64, comptime url_fmt: []const u8, idx: u64) !void {
+    var url_buf: [64]u8 = undefined;
+    var title_buf: [32]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, url_fmt, .{idx});
+    const title = try std.fmt.bufPrint(&title_buf, "L{d}", .{idx});
+    fb.writeU64(cat_id);
+    fb.writeU16LenPrefixed(url);
+    fb.writeU16LenPrefixed(title);
+    fb.writeU16LenPrefixed("");
+}
+
 pub fn sendAndReceive(stream_fd: i32, frame: []const u8, resp_buf: []u8) !usize {
     var sent: usize = 0;
     while (sent < frame.len) {
@@ -71,68 +106,143 @@ pub fn sendAndReceive(stream_fd: i32, frame: []const u8, resp_buf: []u8) !usize 
     return resp_len;
 }
 
-const NUM_OCTAVES: usize = 32;
-const SUB_BUCKETS: usize = 64;
+pub fn tcpConnect(host: []const u8, port: u16) !i32 {
+    const addr = try std.net.Address.parseIp(host, port);
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(fd);
+    try posix.connect(fd, &addr.any, addr.getOsSockLen());
+    return fd;
+}
 
-pub const Histogram = struct {
-    buckets: [NUM_OCTAVES][SUB_BUCKETS]u32 = [_][SUB_BUCKETS]u32{[_]u32{0} ** SUB_BUCKETS} ** NUM_OCTAVES,
-    total_count: u64 = 0,
-    max_recorded: u64 = 0,
-    sum: u64 = 0,
+pub fn ping(stream_fd: i32) !void {
+    var req: [REQUEST_HEADER_SIZE]u8 = undefined;
+    var fb = FrameBuilder.init(&req, .ping);
+    const frame = fb.finalize(0);
+    var resp_buf: [64]u8 = undefined;
+    const n = try sendAndReceive(stream_fd, frame, &resp_buf);
+    if (n < RESPONSE_HEADER_SIZE) return error.ProtocolError;
+    if (resp_buf[5] != STATUS_OK) return error.PingFailed;
+}
 
-    pub fn recordValue(self: *Histogram, ns: u64) void {
-        self.total_count += 1;
-        self.sum += ns;
-        if (ns > self.max_recorded) self.max_recorded = ns;
-        if (ns == 0) {
-            self.buckets[0][0] += 1;
-            return;
-        }
-        const octave = @as(usize, @intCast(63 - @clz(ns)));
-        const o = @min(octave, NUM_OCTAVES - 1);
-        const base: u64 = @as(u64, 1) << @intCast(o);
-        const offset = ns - base;
-        const sub = @min(@as(usize, @intCast((offset * SUB_BUCKETS) / base)), SUB_BUCKETS - 1);
-        self.buckets[o][sub] += 1;
+pub fn createCategory(
+    stream_fd: i32,
+    req_buf: []u8,
+    resp_buf: []u8,
+    parent_id: u64,
+    name: []const u8,
+    slug: []const u8,
+    desc: []const u8,
+) !u64 {
+    var fb = FrameBuilder.init(req_buf, .create_category);
+    fb.writeU64(parent_id);
+    fb.writeU16LenPrefixed(name);
+    fb.writeU16LenPrefixed(slug);
+    fb.writeU16LenPrefixed(desc);
+    const frame = fb.finalize(1);
+    const resp_len = try sendAndReceive(stream_fd, frame, resp_buf);
+    if (resp_len < RESPONSE_HEADER_SIZE + BATCH_ITEM_BYTES) return error.ProtocolError;
+    if (resp_buf[5] != STATUS_OK) {
+        std.debug.print("create_category failed: server status={d} sub={d}\n", .{ resp_buf[5], resp_buf[6] });
+        return error.CreateCategoryFailed;
     }
-
-    pub fn percentile(self: *const Histogram, pct: f64) u64 {
-        if (self.total_count == 0) return 0;
-        const target = @as(u64, @intFromFloat(@as(f64, @floatFromInt(self.total_count)) * pct / 100.0));
-        var cum: u64 = 0;
-        var o: usize = 0;
-        while (o < NUM_OCTAVES) : (o += 1) {
-            var s: usize = 0;
-            while (s < SUB_BUCKETS) : (s += 1) {
-                cum += self.buckets[o][s];
-                if (cum >= target) {
-                    const base: u64 = if (o == 0) 0 else @as(u64, 1) << @intCast(o);
-                    const span: u64 = if (o == 0) SUB_BUCKETS else @as(u64, 1) << @intCast(o);
-                    return base + (@as(u64, s) * span) / SUB_BUCKETS;
-                }
-            }
-        }
-        return self.max_recorded;
+    const item_status = resp_buf[RESPONSE_HEADER_SIZE];
+    if (item_status != STATUS_OK) {
+        const item_sub = resp_buf[RESPONSE_HEADER_SIZE + 1];
+        std.debug.print("create_category item failed: status={d} sub={d}\n", .{ item_status, item_sub });
+        return error.CreateCategoryFailed;
     }
+    return std.mem.readInt(u64, resp_buf[RESPONSE_HEADER_SIZE + 2 ..][0..8], .little);
+}
 
-    pub fn merge(self: *Histogram, other: *const Histogram) void {
-        self.total_count += other.total_count;
-        self.sum += other.sum;
-        if (other.max_recorded > self.max_recorded) self.max_recorded = other.max_recorded;
-        var o: usize = 0;
-        while (o < NUM_OCTAVES) : (o += 1) {
-            var s: usize = 0;
-            while (s < SUB_BUCKETS) : (s += 1) {
-                self.buckets[o][s] += other.buckets[o][s];
-            }
-        }
-    }
+pub const IdRange = struct {
+    min: u64 = 0,
+    max: u64 = 0,
 
-    pub fn mean(self: *const Histogram) u64 {
-        if (self.total_count == 0) return 0;
-        return self.sum / self.total_count;
+    pub fn pick(self: IdRange, rand: std.Random) u64 {
+        return self.min + rand.uintLessThan(u64, self.max - self.min + 1);
     }
 };
+
+pub fn createLinksRoundRobin(
+    stream_fd: i32,
+    req_buf: []u8,
+    resp_buf: []u8,
+    cat_ids: []const u64,
+    count: u64,
+) !IdRange {
+    var range = IdRange{};
+    var sent: u64 = 0;
+    while (sent < count) {
+        const batch = @min(LINK_BATCH, count - sent);
+        var fb = FrameBuilder.init(req_buf, .create_link);
+        var bi: u64 = 0;
+        while (bi < batch) : (bi += 1) {
+            const cat_id = cat_ids[@intCast((sent + bi) % cat_ids.len)];
+            try writeLinkItem(&fb, cat_id, "https://b{d}.t", sent + bi + 1);
+        }
+        const frame = fb.finalize(@intCast(batch));
+        const resp_len = try sendAndReceive(stream_fd, frame, resp_buf);
+        try collectBatchIds(resp_buf[0..resp_len], @intCast(batch), &range);
+        sent += batch;
+    }
+    return range;
+}
+
+fn collectBatchIds(resp: []const u8, expected_count: u16, range: *IdRange) !void {
+    if (resp.len < RESPONSE_HEADER_SIZE) return error.ProtocolError;
+    if (resp[5] != STATUS_OK) return error.ProtocolError;
+    const count = std.mem.readInt(u16, resp[8..10], .little);
+    if (count != expected_count) return error.ProtocolError;
+    var off: usize = RESPONSE_HEADER_SIZE;
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        if (off + BATCH_ITEM_BYTES > resp.len) return error.ProtocolError;
+        if (resp[off] != STATUS_OK) return error.BatchItemFailed;
+        const id = std.mem.readInt(u64, resp[off + 2 ..][0..8], .little);
+        if (range.min == 0 or id < range.min) range.min = id;
+        if (id > range.max) range.max = id;
+        off += BATCH_ITEM_BYTES;
+    }
+}
+
+pub fn ensureDir(path: []const u8) !void {
+    std.fs.cwd().makePath(path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+pub fn seedPath(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/seed.json", .{data_dir});
+}
+
+pub const SeedInfo = struct {
+    category_id_min: u64,
+    category_id_max: u64,
+    link_id_min: u64,
+    link_id_max: u64,
+    sample_paths: []const []const u8 = &.{},
+    sample_query_tokens: []const []const u8 = &.{},
+
+    pub fn linkIds(self: SeedInfo) IdRange {
+        return .{ .min = self.link_id_min, .max = self.link_id_max };
+    }
+
+    pub fn categoryIds(self: SeedInfo) IdRange {
+        return .{ .min = self.category_id_min, .max = self.category_id_max };
+    }
+};
+
+pub fn loadSeed(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(SeedInfo) {
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const data = try f.readToEndAlloc(allocator, 1 << 24);
+    defer allocator.free(data);
+    return std.json.parseFromSlice(SeedInfo, allocator, data, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
 
 pub const LatencyStats = struct {
     p50: u64,
@@ -149,6 +259,8 @@ pub const RssStats = struct {
     final: u64,
     note: ?[]const u8,
 };
+
+pub const RSS_UNAVAILABLE = RssStats{ .peak = 0, .final = 0, .note = "rss_unavailable" };
 
 pub const ErrorCounts = struct {
     connect_failed: u64,
@@ -188,29 +300,20 @@ pub const BenchRecord = struct {
     errors: ErrorCounts,
 };
 
-pub const JsonLineWriter = struct {
-    file: std.fs.File,
-    mutex: std.Thread.Mutex = .{},
+pub fn appendJsonLine(allocator: std.mem.Allocator, output_path: ?[]const u8, record: BenchRecord) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, record, .{});
+    defer allocator.free(json);
+    const path = output_path orelse return writeLine(std.fs.File.stdout(), json);
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
+    defer file.close();
+    try file.seekFromEnd(0);
+    try writeLine(file, json);
+}
 
-    pub fn open(path: []const u8) !JsonLineWriter {
-        const file = try std.fs.cwd().createFile(path, .{ .read = false, .truncate = false });
-        try file.seekFromEnd(0);
-        return .{ .file = file };
-    }
-
-    pub fn appendRecord(self: *JsonLineWriter, record: BenchRecord) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const json = try std.json.Stringify.valueAlloc(std.heap.page_allocator, record, .{});
-        defer std.heap.page_allocator.free(json);
-        try self.file.writeAll(json);
-        try self.file.writeAll("\n");
-    }
-
-    pub fn close(self: *JsonLineWriter) void {
-        self.file.close();
-    }
-};
+fn writeLine(file: std.fs.File, json: []const u8) !void {
+    try file.writeAll(json);
+    try file.writeAll("\n");
+}
 
 pub const RssSampler = struct {
     pid: i32,
@@ -268,15 +371,6 @@ pub const RssSampler = struct {
     }
 };
 
-pub const WorkerCtx = struct {
-    id: u32,
-    ops_per_worker: u64,
-    warmup_ops: u64,
-    histogram: Histogram = .{},
-    errors: ErrorCounts = .{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 },
-    ops_completed: u64 = 0,
-};
-
 pub const CommonOpts = struct {
     profile: []const u8 = "unconstrained",
     output_path: ?[]const u8 = null,
@@ -326,9 +420,144 @@ pub fn parseCommonOpts(
     return opts;
 }
 
+pub fn elapsedMs(since_ns: i128) u64 {
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - since_ns);
+    return elapsed_ns / std.time.ns_per_ms;
+}
+
+pub const Frame = struct {
+    bytes: []const u8,
+    ops: u64 = 1,
+};
+
+pub const Worker = struct {
+    id: u32,
+    rand: std.Random,
+    req_buf: []u8,
+    counter: u64 = 0,
+    ops_completed: u64 = 0,
+};
+
+pub const Run = struct {
+    allocator: std.mem.Allocator,
+    opts: CommonOpts,
+    histogram: AtomicHistogram = .{},
+    ops_completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    connect_failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    protocol_error: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    duration_ms: u64 = 0,
+    rss: RssStats = RSS_UNAVAILABLE,
+
+    pub fn init(allocator: std.mem.Allocator, opts: CommonOpts) Run {
+        return .{ .allocator = allocator, .opts = opts };
+    }
+
+    pub fn runWorkers(self: *Run, comptime Ctx: type, ctx: *Ctx) !void {
+        if (self.opts.workers == 0) return error.InvalidWorkers;
+
+        const Main = struct {
+            fn main(bench: *Run, c: *Ctx, id: u32) void {
+                workerLoop(Ctx, bench, c, id) catch |err| {
+                    std.log.warn("worker {d} fatal: {s}", .{ id, @errorName(err) });
+                };
+            }
+        };
+
+        const threads = try self.allocator.alloc(std.Thread, self.opts.workers);
+        defer self.allocator.free(threads);
+
+        const t_start = std.time.nanoTimestamp();
+        for (threads, 0..) |*th, i| {
+            th.* = try std.Thread.spawn(.{}, Main.main, .{ self, ctx, @as(u32, @intCast(i)) });
+        }
+        for (threads) |th| th.join();
+        self.duration_ms = elapsedMs(t_start);
+    }
+
+    pub fn opsCompleted(self: *const Run) u64 {
+        return self.ops_completed.load(.monotonic);
+    }
+
+    pub fn record(self: *const Run, workload: []const u8, params: WorkloadParams, ops_total: u64) BenchRecord {
+        const h = &self.histogram;
+        return .{
+            .ts = std.time.milliTimestamp(),
+            .host = posix.getenv("HOSTNAME") orelse "unknown",
+            .git_rev = self.opts.git_rev orelse "unknown",
+            .profile = self.opts.profile,
+            .workload = workload,
+            .params = params,
+            .duration_ms = self.duration_ms,
+            .ops_total = ops_total,
+            .ops_per_sec = if (self.duration_ms > 0) ops_total * 1000 / self.duration_ms else 0,
+            .latency_ns = .{
+                .p50 = h.percentile(50.0),
+                .p95 = h.percentile(95.0),
+                .p99 = h.percentile(99.0),
+                .p99_9 = h.percentile(99.9),
+                .max = h.maxValue(),
+                .mean = h.mean(),
+                .samples = h.samples(),
+            },
+            .rss_bytes = self.rss,
+            .errors = .{
+                .connect_failed = self.connect_failed.load(.monotonic),
+                .timeout = 0,
+                .protocol_error = self.protocol_error.load(.monotonic),
+            },
+        };
+    }
+
+    pub fn emit(self: *const Run, workload: []const u8, params: WorkloadParams, ops_total: u64) !void {
+        try appendJsonLine(self.allocator, self.opts.output_path, self.record(workload, params, ops_total));
+    }
+};
+
+fn workerLoop(comptime Ctx: type, bench: *Run, ctx: *Ctx, id: u32) !void {
+    const fd = tcpConnect(bench.opts.connect_host, bench.opts.port) catch {
+        _ = bench.connect_failed.fetchAdd(1, .monotonic);
+        return;
+    };
+    defer posix.close(fd);
+
+    const req_buf = try bench.allocator.alloc(u8, Ctx.REQ_BUF_SIZE);
+    defer bench.allocator.free(req_buf);
+    const resp_buf = try bench.allocator.alloc(u8, Ctx.RESP_BUF_SIZE);
+    defer bench.allocator.free(resp_buf);
+
+    const seed: u64 = if (@hasDecl(Ctx, "prngSeed")) Ctx.prngSeed(id) else id;
+    var prng = std.Random.DefaultPrng.init(seed);
+    var worker = Worker{ .id = id, .rand = prng.random(), .req_buf = req_buf };
+    defer _ = bench.ops_completed.fetchAdd(worker.ops_completed, .monotonic);
+
+    while (worker.ops_completed < bench.opts.ops_per_worker) {
+        const frame = try ctx.nextFrame(&worker);
+
+        const t0 = std.time.nanoTimestamp();
+        const resp_len = sendAndReceive(fd, frame.bytes, resp_buf) catch {
+            _ = bench.protocol_error.fetchAdd(1, .monotonic);
+            return;
+        };
+        const latency_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
+
+        if (resp_len < RESPONSE_HEADER_SIZE or !accepted(Ctx, ctx, resp_buf[0..resp_len], latency_ns)) {
+            _ = bench.protocol_error.fetchAdd(1, .monotonic);
+            return;
+        }
+
+        if (worker.ops_completed >= bench.opts.warmup_ops) bench.histogram.recordValue(latency_ns);
+        worker.ops_completed += frame.ops;
+    }
+}
+
+fn accepted(comptime Ctx: type, ctx: *Ctx, resp: []const u8, latency_ns: u64) bool {
+    if (!@hasDecl(Ctx, "onResponse")) return true;
+    return ctx.onResponse(resp, latency_ns);
+}
+
 test "FrameBuilder: round-trip a create_link frame" {
     var buf: [256]u8 = undefined;
-    var fb = FrameBuilder.init(&buf, 1);
+    var fb = FrameBuilder.init(&buf, .create_link);
     fb.writeU64(42);
     fb.writeU16LenPrefixed("https://example.com");
     fb.writeU16LenPrefixed("Example");
@@ -341,39 +570,23 @@ test "FrameBuilder: round-trip a create_link frame" {
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, frame[6..8], .little));
 }
 
-test "Histogram: percentile resolution within 2% of true value" {
-    var h = Histogram{};
-    var i: u64 = 0;
-    while (i < 1000) : (i += 1) {
-        h.recordValue(1_000 + i * 1_000);
-    }
-    const p50 = h.percentile(50.0);
-    try std.testing.expect(p50 > 490_000 and p50 < 510_000);
-    const p99 = h.percentile(99.0);
-    try std.testing.expect(p99 > 970_000 and p99 < 1_010_000);
+test "Run.record: an empty histogram reports all-zero latency so seed keeps its baseline shape" {
+    const bench = Run.init(std.testing.allocator, .{});
+    const rec = bench.record("seed", .{ .seed = .{ .categories = 1, .links = 1, .depth = 1 } }, 2);
+    try std.testing.expectEqual(@as(u64, 0), rec.latency_ns.p99);
+    try std.testing.expectEqual(@as(u64, 0), rec.latency_ns.mean);
+    try std.testing.expectEqual(@as(u64, 0), rec.latency_ns.samples);
+    try std.testing.expectEqual(@as(u64, 0), rec.ops_per_sec);
+    try std.testing.expectEqualStrings("rss_unavailable", rec.rss_bytes.note.?);
 }
 
-test "Histogram: merge sums counts" {
-    var a = Histogram{};
-    var b = Histogram{};
-    a.recordValue(100_000);
-    a.recordValue(200_000);
-    b.recordValue(300_000);
-    a.merge(&b);
-    try std.testing.expectEqual(@as(u64, 3), a.total_count);
-    try std.testing.expectEqual(@as(u64, 300_000), a.max_recorded);
-}
-
-test "JsonLineWriter: appends valid JSONL lines" {
+test "appendJsonLine: appends one JSONL line per record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(path);
     const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/test.jsonl", .{path});
     defer std.testing.allocator.free(file);
-
-    var w = try JsonLineWriter.open(file);
-    defer w.close();
 
     const rec = BenchRecord{
         .ts = 1714838400000,
@@ -386,19 +599,15 @@ test "JsonLineWriter: appends valid JSONL lines" {
         .ops_total = 4000,
         .ops_per_sec = 3243,
         .latency_ns = .{ .p50 = 100, .p95 = 200, .p99 = 300, .p99_9 = 400, .max = 500, .mean = 150, .samples = 4000 },
-        .rss_bytes = .{ .peak = 100_000_000, .final = 90_000_000, .note = null },
+        .rss_bytes = RSS_UNAVAILABLE,
         .errors = .{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 },
     };
-    try w.appendRecord(rec);
-    try w.appendRecord(rec);
+    try appendJsonLine(std.testing.allocator, file, rec);
+    try appendJsonLine(std.testing.allocator, file, rec);
 
     const f = try std.fs.cwd().openFile(file, .{});
     defer f.close();
     const contents = try f.readToEndAlloc(std.testing.allocator, 1 << 20);
     defer std.testing.allocator.free(contents);
-    var newline_count: usize = 0;
-    for (contents) |b| {
-        if (b == '\n') newline_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), newline_count);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "\n"));
 }
