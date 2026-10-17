@@ -20,8 +20,8 @@ pub fn createCategory(
     slug_str: []const u8,
     desc: []const u8,
 ) !u64 {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
 
     if (name.len > MAX_NAME_LEN or
         slug_str.len > MAX_SLUG_LEN or
@@ -33,7 +33,7 @@ pub fn createCategory(
     try slug_mod.ensureSlugPathFree(db, parent_id, slug_str, 0);
 
     const id = db.next_category_id.fetchAdd(1, .monotonic);
-    const now = std.time.timestamp();
+    const now = db.nowSeconds();
 
     const cat = schema.Category{
         .id = id,
@@ -78,8 +78,8 @@ pub fn updateCategory(
     slug_str: ?[]const u8,
     desc: ?[]const u8,
 ) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
 
     if (name) |n| if (n.len > MAX_NAME_LEN) return OperationError.FieldTooLong;
     if (slug_str) |s| if (s.len > MAX_SLUG_LEN) return OperationError.FieldTooLong;
@@ -96,7 +96,7 @@ pub fn updateCategory(
         var new_cat = old_cat;
         if (name) |n| new_cat.name = codec.FixedString(64).fromSlice(n);
         if (desc) |d| new_cat.description = codec.FixedString(1024).fromSlice(d);
-        new_cat.updated_at = std.time.timestamp();
+        new_cat.updated_at = db.nowSeconds();
 
         var arena = std.heap.ArenaAllocator.init(db.allocator);
         defer arena.deinit();
@@ -112,7 +112,7 @@ pub fn updateCategory(
     if (name) |n| new_cat.name = codec.FixedString(64).fromSlice(n);
     if (slug_str) |s| new_cat.slug = codec.FixedString(128).fromSlice(s);
     if (desc) |d| new_cat.description = codec.FixedString(1024).fromSlice(d);
-    new_cat.updated_at = std.time.timestamp();
+    new_cat.updated_at = db.nowSeconds();
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
@@ -122,8 +122,8 @@ pub fn updateCategory(
 }
 
 pub fn deleteCategory(db: *Directory, id: u64) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
 
     if ((try getCategory(db, id)) == null) return OperationError.CategoryNotFound;
 
@@ -150,8 +150,8 @@ pub fn deleteCategory(db: *Directory, id: u64) !void {
 }
 
 pub fn moveCategory(db: *Directory, id: u64, new_parent_id: u64) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
 
     const old_cat = (try getCategory(db, id)) orelse return OperationError.CategoryNotFound;
 
@@ -308,7 +308,7 @@ pub fn computeCategoryCounts(db: *Directory) !CategoryCounts {
     errdefer counts.deinit();
 
     {
-        const min_key: [16]u8 = .{0} ** 16;
+        const min_key: [16]u8 = @splat(0);
         var iter = try db.link_by_category().rangeScan(&min_key, null);
         defer iter.deinit();
         while (try iter.next()) |entry| {
@@ -321,7 +321,7 @@ pub fn computeCategoryCounts(db: *Directory) !CategoryCounts {
     }
 
     {
-        const min_key: [16]u8 = .{0} ** 16;
+        const min_key: [16]u8 = @splat(0);
         var iter = try db.cat_by_parent().rangeScan(&min_key, null);
         defer iter.deinit();
         while (try iter.next()) |entry| {
@@ -329,12 +329,12 @@ pub fn computeCategoryCounts(db: *Directory) !CategoryCounts {
             const parent = codec.decodeU64(entry.key[0..8]);
             const child = codec.decodeU64(entry.key[8..16]);
             const gop = try counts.children_of.getOrPut(parent);
-            if (!gop.found_existing) gop.value_ptr.* = .{};
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(allocator, child);
         }
     }
 
-    var all_ids: std.ArrayListUnmanaged(u64) = .{};
+    var all_ids: std.ArrayListUnmanaged(u64) = .empty;
     defer all_ids.deinit(allocator);
     {
         const min_key = codec.encodeU64(0);
@@ -348,7 +348,7 @@ pub fn computeCategoryCounts(db: *Directory) !CategoryCounts {
     }
 
     const Frame = struct { id: u64, expanded: bool };
-    var stack: std.ArrayListUnmanaged(Frame) = .{};
+    var stack: std.ArrayListUnmanaged(Frame) = .empty;
     defer stack.deinit(allocator);
     var on_path = std.AutoHashMap(u64, void).init(allocator);
     defer on_path.deinit();
@@ -401,7 +401,7 @@ pub fn recomputeCategoryCounts(db: *Directory) !void {
     var counts = try computeCategoryCounts(db);
     defer counts.deinit();
 
-    const now = std.time.timestamp();
+    const now = db.nowSeconds();
     var rewritten: u64 = 0;
     const min_key = codec.encodeU64(0);
     var iter = try db.categories_by_id().rangeScan(&min_key, null);

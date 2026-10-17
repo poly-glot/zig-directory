@@ -36,8 +36,8 @@ pub fn createLinkWithOpts(
     desc: []const u8,
     opts: CreateLinkOpts,
 ) !u64 {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     return createLinkWithOptsLocked(db, category_id, url, title, desc, opts);
 }
 
@@ -84,7 +84,7 @@ fn createLinkWithOptsLocked(
     }
 
     const id = db.next_link_id.fetchAdd(1, .monotonic);
-    const now = std.time.timestamp();
+    const now = db.nowSeconds();
 
     const link = schema.Link{
         .id = id,
@@ -129,8 +129,8 @@ pub fn updateLink(
     title: ?[]const u8,
     desc: ?[]const u8,
 ) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     return updateLinkLocked(db, id, url, title, desc);
 }
 
@@ -151,7 +151,7 @@ fn updateLinkLocked(
     if (url) |new_url| new_link.url = codec.FixedString(64).fromSlice(new_url);
     if (title) |t| new_link.title = codec.FixedString(128).fromSlice(t);
     if (desc) |d| new_link.description = codec.FixedString(256).fromSlice(d);
-    new_link.updated_at = std.time.timestamp();
+    new_link.updated_at = db.nowSeconds();
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
@@ -161,12 +161,12 @@ fn updateLinkLocked(
 }
 
 pub fn updateLinkStatus(db: *Directory, id: u64, status: u8) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
     var new_link = old_link;
     new_link.status = status;
-    new_link.updated_at = std.time.timestamp();
+    new_link.updated_at = db.nowSeconds();
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
@@ -176,13 +176,13 @@ pub fn updateLinkStatus(db: *Directory, id: u64, status: u8) !void {
 }
 
 pub fn updateLinkStatusBulkOne(db: *Directory, id: u64, status: u8) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
     if (old_link.status == status) return OperationError.AlreadyInState;
     var new_link = old_link;
     new_link.status = status;
-    new_link.updated_at = std.time.timestamp();
+    new_link.updated_at = db.nowSeconds();
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
@@ -236,8 +236,8 @@ pub fn recountLinkStatuses(db: *Directory) !void {
 }
 
 pub fn moveLink(db: *Directory, id: u64, new_category_id: u64) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     const old_link = (try getLink(db, id)) orelse return OperationError.LinkNotFound;
 
     if (new_category_id == 0) return OperationError.CategoryNotFound;
@@ -260,8 +260,8 @@ pub fn moveLink(db: *Directory, id: u64, new_category_id: u64) !void {
 }
 
 pub fn deleteLink(db: *Directory, id: u64) !void {
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     return deleteLinkLocked(db, id);
 }
 
@@ -627,7 +627,7 @@ test "createLink rollback: failure during secondary insert leaves no trace in pr
     const std_t = std.testing;
 
     const allocator = std_t.allocator;
-    var mt = zigstore.MemTable.init(allocator);
+    var mt = zigstore.MemTable.init(std.testing.io, allocator);
     defer mt.deinit();
 
     const k1 = codec.encodeU64(123);
@@ -913,11 +913,11 @@ test "every mutating operation waits for the write mutex before validating" {
     const top = try category.createCategory(db, 0, "Top", "top", "");
     var probe = WriterProbe{ .db = db, .top = top };
 
-    db.write_mutex.lock();
+    db.write_mutex.lockUncancelable(db.io);
     const writer = try std.Thread.spawn(.{}, WriterProbe.run, .{&probe});
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    try std.Io.sleep(db.io, .fromMilliseconds(30), .awake);
     try std.testing.expect(!probe.finished.load(.acquire));
-    db.write_mutex.unlock();
+    db.write_mutex.unlock(db.io);
     writer.join();
 
     try std.testing.expect(probe.finished.load(.acquire));

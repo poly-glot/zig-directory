@@ -46,7 +46,7 @@ pub fn cascadeAncestorCounts(
     comptime increment: bool,
 ) !void {
     const ops = @import("../operations/operations.zig");
-    const now = std.time.timestamp();
+    const now = db.nowSeconds();
     const fld = comptime @tagName(direct_field);
     for (updates) |upd| {
         var cat = (try ops.getCategory(db, upd.cat_id)) orelse continue;

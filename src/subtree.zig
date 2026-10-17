@@ -11,14 +11,16 @@ pub const SubtreeError = error{ SubtreeTooLarge, OutOfMemory };
 pub const SubtreeCache = struct {
     descendants: std.AutoHashMap(u64, []u64),
     link_counts: std.AutoHashMap(u64, u64),
-    mutex: std.Thread.RwLock,
+    mutex: std.Io.RwLock,
+    io: std.Io,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) SubtreeCache {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator) SubtreeCache {
         return .{
             .descendants = std.AutoHashMap(u64, []u64).init(allocator),
             .link_counts = std.AutoHashMap(u64, u64).init(allocator),
-            .mutex = .{},
+            .mutex = .init,
+            .io = io,
             .allocator = allocator,
         };
     }
@@ -31,8 +33,8 @@ pub const SubtreeCache = struct {
     }
 
     pub fn getDescendantsCopy(self: *SubtreeCache, root: u64, allocator: std.mem.Allocator) !?[]u64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(self.io);
+        defer self.mutex.unlockShared(self.io);
         const hit = self.descendants.get(root) orelse return null;
         return try allocator.dupe(u64, hit);
     }
@@ -40,28 +42,28 @@ pub const SubtreeCache = struct {
     pub fn putDescendantsCopy(self: *SubtreeCache, root: u64, ids: []const u64) !void {
         const copy = try self.allocator.dupe(u64, ids);
         errdefer self.allocator.free(copy);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const gop = try self.descendants.getOrPut(root);
         if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
         gop.value_ptr.* = copy;
     }
 
     pub fn getLinkCount(self: *SubtreeCache, root: u64) ?u64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(self.io);
+        defer self.mutex.unlockShared(self.io);
         return self.link_counts.get(root);
     }
 
     pub fn putLinkCount(self: *SubtreeCache, root: u64, count: u64) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.link_counts.put(root, count);
     }
 
     pub fn invalidateAll(self: *SubtreeCache) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var it = self.descendants.iterator();
         while (it.next()) |e| self.allocator.free(e.value_ptr.*);
         self.descendants.clearRetainingCapacity();
@@ -76,9 +78,9 @@ pub fn collectDescendants(
 ) ![]u64 {
     var visited = std.AutoHashMap(u64, void).init(allocator);
     defer visited.deinit();
-    var queue: std.ArrayListUnmanaged(u64) = .{};
+    var queue: std.ArrayListUnmanaged(u64) = .empty;
     defer queue.deinit(allocator);
-    var result: std.ArrayListUnmanaged(u64) = .{};
+    var result: std.ArrayListUnmanaged(u64) = .empty;
     errdefer result.deinit(allocator);
 
     try visited.put(root, {});
@@ -118,7 +120,7 @@ pub fn listSubtreeLinkIds(
     limit: u32,
     allocator: std.mem.Allocator,
 ) !SubtreeLinkPage {
-    var page_ids: std.ArrayListUnmanaged(u64) = .{};
+    var page_ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer page_ids.deinit(allocator);
 
     var total: u64 = 0;
@@ -174,14 +176,14 @@ pub fn listSubtreeLinkIdsScan(
     defer desc_set.deinit();
     for (descendants) |d| try desc_set.put(d, {});
 
-    var page_ids: std.ArrayListUnmanaged(u64) = .{};
+    var page_ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer page_ids.deinit(allocator);
 
     var total: u64 = 0;
     var skipped: u64 = 0;
     const offset_u64: u64 = offset;
 
-    const min_key: [16]u8 = .{0} ** 16;
+    const min_key: [16]u8 = @splat(0);
     var iter = try link_by_category.rangeScan(&min_key, null);
     defer iter.deinit();
     while (try iter.next()) |entry| {
@@ -215,7 +217,7 @@ pub fn countSubtreeLinks(
     for (descendants) |d| try desc_set.put(d, {});
 
     var total: u64 = 0;
-    const min_key: [16]u8 = .{0} ** 16;
+    const min_key: [16]u8 = @splat(0);
     var iter = try link_by_category.rangeScan(&min_key, null);
     defer iter.deinit();
     while (try iter.next()) |entry| {

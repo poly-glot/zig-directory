@@ -64,7 +64,7 @@ fn searchTreeByToken(
     );
     defer iter.deinit();
 
-    var ids: std.ArrayListUnmanaged(u64) = .{};
+    var ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer ids.deinit(allocator);
 
     while (try iter.next()) |kv| {

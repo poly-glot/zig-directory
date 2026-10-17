@@ -151,16 +151,14 @@ pub const DecodeError = error{
 };
 
 pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     try buf.append(allocator, SCHEMA_VERSION);
     try buf.append(allocator, @intFromEnum(std.meta.activeTag(cs)));
 
-    inline for (@typeInfo(ChangeSet).@"union".fields) |uf| {
-        if (std.mem.eql(u8, uf.name, @tagName(std.meta.activeTag(cs)))) {
-            try wire_codec.encodeStruct(allocator, &buf, @field(cs, uf.name));
-        }
+    switch (cs) {
+        inline else => |effect| try wire_codec.encodeStruct(allocator, &buf, effect),
     }
 
     return try buf.toOwnedSlice(allocator);
@@ -169,16 +167,15 @@ pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
 pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
     if (bytes.len < 2) return DecodeError.BufferTooShort;
     if (bytes[0] != SCHEMA_VERSION) return DecodeError.UnsupportedSchemaVersion;
-    const tag = std.meta.intToEnum(Op, bytes[1]) catch return DecodeError.UnknownOpTag;
+    const tag = std.enums.fromInt(Op, bytes[1]) orelse return DecodeError.UnknownOpTag;
 
     var cur: usize = 2;
-    inline for (@typeInfo(ChangeSet).@"union".fields) |uf| {
-        if (@field(Op, uf.name) == tag) {
-            const variant = try wire_codec.decodeStruct(arena, uf.type, bytes, &cur);
-            return @unionInit(ChangeSet, uf.name, variant);
-        }
+    switch (tag) {
+        inline else => |op| {
+            const variant = try wire_codec.decodeStruct(arena, @FieldType(ChangeSet, @tagName(op)), bytes, &cur);
+            return @unionInit(ChangeSet, @tagName(op), variant);
+        },
     }
-    unreachable;
 }
 
 test "ChangeSet variant tags match Op enum" {
@@ -607,10 +604,12 @@ test "encode/decode roundtrip — slug_path_repair_complete" {
     try std.testing.expectEqual(@as(u64, 99), decoded.slug_path_repair_complete.seq);
 }
 
-fn fuzzDecodeOne(_: void, input: []const u8) anyerror!void {
+fn fuzzDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input: [4096]u8 = undefined;
+    const len = smith.slice(&input);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    _ = decode(arena.allocator(), input) catch {};
+    _ = decode(arena.allocator(), input[0..len]) catch {};
 }
 
 test "fuzz: changeset.decode tolerates arbitrary bytes" {

@@ -16,7 +16,7 @@ pub const InvariantId = enum(u8) {
     link_category_exists = 6,
 };
 
-pub const INVARIANT_COUNT = @typeInfo(InvariantId).@"enum".fields.len;
+pub const INVARIANT_COUNT = std.enums.values(InvariantId).len;
 
 pub const InvariantHealth = struct {
     name: []const u8,
@@ -49,7 +49,7 @@ pub const VerifierState = struct {
         .{ .name = "single_top", .expected = 0, .observed = 0 },
         .{ .name = "link_category_exists", .expected = 0, .observed = 0 },
     },
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
 
     pub fn snapshot(self: *VerifierState, db: *Directory) struct {
         last_run_at: i64,
@@ -59,8 +59,8 @@ pub const VerifierState = struct {
         slug_path_repair_worker_tasks_processed: u64,
         slug_path_repair_worker_chunks_processed: u64,
     } {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(db.io);
+        defer self.mutex.unlock(db.io);
         return .{
             .last_run_at = self.last_run_at,
             .indices = self.indices,
@@ -73,7 +73,7 @@ pub const VerifierState = struct {
 };
 
 pub fn runOnce(db: *Directory, state: *VerifierState) !void {
-    const t0 = std.time.milliTimestamp();
+    const t0 = db.nowMillis();
 
     try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
     try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
@@ -83,8 +83,8 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
 
     const cat_count = try countTree(db.categories_by_id(), codec.encodeU64(0)[0..]);
     const link_count = try countTree(db.links_by_id(), codec.encodeU64(0)[0..]);
-    const cat_by_parent_count = try countTree(db.cat_by_parent(), &([_]u8{0} ** 16));
-    const link_by_category_count = try countTree(db.link_by_category(), &([_]u8{0} ** 16));
+    const cat_by_parent_count = try countTree(db.cat_by_parent(), &@as([16]u8, @splat(0)));
+    const link_by_category_count = try countTree(db.link_by_category(), &@as([16]u8, @splat(0)));
     const link_by_url_hash_count = try countTree(db.link_by_url_hash(), codec.encodeU64(0)[0..]);
 
     var indices: [INVARIANT_COUNT]InvariantHealth = undefined;
@@ -133,10 +133,10 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
         .observed = link_count -| link_orphan_count,
     };
 
-    state.mutex.lock();
-    state.last_run_at = std.time.timestamp();
+    state.mutex.lockUncancelable(db.io);
+    state.last_run_at = db.nowSeconds();
     state.indices = indices;
-    state.mutex.unlock();
+    state.mutex.unlock(db.io);
 
     var any_drift = false;
 
@@ -169,11 +169,11 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
         );
     }
 
-    state.mutex.lock();
+    state.mutex.lockUncancelable(db.io);
     state.any_drift = any_drift;
-    state.mutex.unlock();
+    state.mutex.unlock(db.io);
 
-    const elapsed = std.time.milliTimestamp() - t0;
+    const elapsed = db.nowMillis() - t0;
     if (any_drift) {
         log.info("verifier: completed in {d}ms with drift (warn-only)", .{elapsed});
     } else {
@@ -211,7 +211,7 @@ fn countTops(db: *Directory) !u64 {
 fn countOrphans(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
 
-    var parents: std.ArrayListUnmanaged(u64) = .{};
+    var parents: std.ArrayListUnmanaged(u64) = .empty;
     defer parents.deinit(db.allocator);
     {
         const min_key = codec.encodeU64(0);
@@ -366,7 +366,7 @@ test "verifier: tampered link_count surfaces drift on link_by_category invariant
         var key_copy: [16]u8 = undefined;
         var found = false;
         {
-            const min_key: [16]u8 = .{0} ** 16;
+            const min_key: [16]u8 = @splat(0);
             var iter = try db.link_by_category().rangeScan(&min_key, null);
             defer iter.deinit();
             if (try iter.next()) |entry| {
@@ -423,12 +423,9 @@ test "verifier: every InvariantId has a matching snapshot index" {
     try runOnce(db, &state);
 
     const snap = state.snapshot(db);
-    const fields = @typeInfo(InvariantId).@"enum".fields;
-    try std.testing.expectEqual(fields.len, snap.indices.len);
-    inline for (fields, 0..) |f, i| {
-        const idx = snap.indices[i];
+    try std.testing.expectEqual(INVARIANT_COUNT, snap.indices.len);
+    for (snap.indices) |idx| {
         try std.testing.expect(idx.name.len > 0);
-        _ = f;
     }
 }
 
@@ -548,11 +545,11 @@ test "verifier: shutdown signal causes verifier loop to exit promptly" {
     var db = try Directory.openTestInstance(allocator, &tmp);
 
     db.startBackgroundThreads();
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
 
-    const t0 = std.time.milliTimestamp();
+    const t0 = std.Io.Clock.awake.now(std.testing.io);
     db.deinitTestInstance();
-    const elapsed = std.time.milliTimestamp() - t0;
+    const elapsed = t0.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds();
 
     try std.testing.expect(elapsed < 5_000);
 }

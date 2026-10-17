@@ -21,36 +21,33 @@ pub const Config = struct {
     subtree_scan_threshold: u32 = 1024,
     verifier_interval_s: u32 = 300,
 
-    pub fn fromEnv() Config {
-        var config = Config{ .server = zigstore.ServerConfig.fromEnv("DMOZDB_") };
-        if (std.posix.getenv("DMOZDB_DATA_DIR")) |v| {
+    pub fn fromEnv(env: *const std.process.Environ.Map) Config {
+        var config = Config{ .server = zigstore.ServerConfig.fromEnv("DMOZDB_", env) };
+        if (env.get("DMOZDB_DATA_DIR")) |v| {
             config.data_dir = v;
         }
-        if (std.posix.getenv("DMOZDB_RENAME_INLINE_THRESHOLD")) |v| {
+        if (env.get("DMOZDB_RENAME_INLINE_THRESHOLD")) |v| {
             config.rename_inline_threshold = std.fmt.parseInt(u32, v, 10) catch config.rename_inline_threshold;
         }
-        if (std.posix.getenv("DMOZDB_REPAIR_WORKER_INTERVAL_MS")) |v| {
+        if (env.get("DMOZDB_REPAIR_WORKER_INTERVAL_MS")) |v| {
             config.repair_worker_interval_ms = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_interval_ms;
         }
-        if (std.posix.getenv("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |v| {
+        if (env.get("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |v| {
             config.repair_worker_chunk_size = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_chunk_size;
         }
-        if (std.posix.getenv("DMOZDB_SUBTREE_SCAN_THRESHOLD")) |v| {
+        if (env.get("DMOZDB_SUBTREE_SCAN_THRESHOLD")) |v| {
             config.subtree_scan_threshold = std.fmt.parseInt(u32, v, 10) catch config.subtree_scan_threshold;
         }
-        if (std.posix.getenv("DMOZDB_VERIFIER_INTERVAL_S")) |v| {
+        if (env.get("DMOZDB_VERIFIER_INTERVAL_S")) |v| {
             config.verifier_interval_s = std.fmt.parseInt(u32, v, 10) catch config.verifier_interval_s;
         }
         return config;
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const config = Config.fromEnv();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const config = Config.fromEnv(init.environ_map);
 
     log.info("Dmoz Zig Development - starting up", .{});
     log.info("  bind={d}.{d}.{d}.{d}:{d} data_dir={s} cache={d}MB threads={d} trusted_ips={d}", .{
@@ -59,7 +56,7 @@ pub fn main() !void {
         config.server.trusted_count,
     });
 
-    const db = try Directory.init(allocator, config);
+    const db = try Directory.init(init.io, allocator, config);
     defer db.deinit();
 
     try db.recover();
