@@ -159,11 +159,10 @@ pub fn moveCategory(db: *Directory, id: u64, new_parent_id: u64) !void {
     }
 
     if (new_parent_id != 0) {
-        const MAX_HIERARCHY_DEPTH = 256;
         var walk_id = new_parent_id;
-        var depth: u32 = 0;
+        var depth: usize = 0;
         while (walk_id != 0) : (depth += 1) {
-            if (depth >= MAX_HIERARCHY_DEPTH) return OperationError.PathTooDeep;
+            if (depth >= shared.MAX_DEPTH) return OperationError.PathTooDeep;
             if (walk_id == id) return OperationError.CircularHierarchy;
             const walk_cat = (try getCategory(db, walk_id)) orelse break;
             walk_id = walk_cat.parent_id;
@@ -246,24 +245,14 @@ pub fn walkAncestors(
     id: u64,
     buf: []schema.Category,
 ) ![]schema.Category {
-    var id_buf: [64]u64 = undefined;
-    var depth: usize = 0;
-
-    const cat = (try getCategory(db, id)) orelse return buf[0..0];
-    var cur = cat.parent_id;
-    while (cur != 0 and depth < id_buf.len) {
-        id_buf[depth] = cur;
-        depth += 1;
-        const ancestor = (try getCategory(db, cur)) orelse break;
-        cur = ancestor.parent_id;
+    var id_buf: [shared.MAX_DEPTH + 1]u64 = undefined;
+    const path = try getCategoryPath(db, id, &id_buf);
+    const ancestor_ids = path[0..path.len -| 1];
+    const n = @min(ancestor_ids.len, buf.len);
+    for (ancestor_ids[0..n], 0..) |ancestor_id, i| {
+        buf[i] = (try getCategory(db, ancestor_id)) orelse return buf[0..i];
     }
-    if (depth > buf.len) depth = buf.len;
-    var i: usize = 0;
-    while (i < depth) : (i += 1) {
-        const aid = id_buf[depth - 1 - i];
-        buf[i] = (try getCategory(db, aid)) orelse return buf[0..i];
-    }
-    return buf[0..depth];
+    return buf[0..n];
 }
 
 const SubtreeAgg = struct { link_subtree: u64, child_subtree: u32 };
@@ -879,4 +868,25 @@ test "moving a category under a parent that already has its slug is refused" {
     _ = try createCategory(db, a, "News", "news", "");
     const b_news = try createCategory(db, b, "News", "news", "");
     try std.testing.expectError(OperationError.DuplicateSlug, moveCategory(db, b_news, a));
+}
+
+test "moveCategory refuses a new parent whose chain is already MAX_DEPTH deep" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try createCategory(db, 0, "Top", "top", "");
+    const mover_id = try createCategory(db, top_id, "Mover", "mover", "");
+
+    var deepest_id = top_id;
+    var i: usize = 1;
+    while (i <= shared.MAX_DEPTH) : (i += 1) {
+        var slug_buf: [16]u8 = undefined;
+        const slug = std.fmt.bufPrint(&slug_buf, "d{d}", .{i}) catch unreachable;
+        deepest_id = try createCategory(db, deepest_id, "d", slug, "");
+    }
+
+    try std.testing.expectError(OperationError.PathTooDeep, moveCategory(db, mover_id, deepest_id));
 }

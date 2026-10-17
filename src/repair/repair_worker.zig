@@ -96,21 +96,21 @@ fn planSwap(
     db: *Directory,
     root_id: u64,
     old_root_path: []const u8,
-    child: schema.Category,
+    child_id: u64,
     sa: std.mem.Allocator,
 ) !?changeset.SlugPathSwap {
     var d_old_buf: [2048]u8 = undefined;
-    const d_old = (operations.composeOldDescendantPath(db, old_root_path, root_id, child.id, &d_old_buf) catch null) orelse
+    const d_old = (operations.composeOldDescendantPath(db, old_root_path, root_id, child_id, &d_old_buf) catch null) orelse
         return null;
     var d_new_buf: [2048]u8 = undefined;
-    const d_new = (try operations.buildCanonicalSlugPath(db, &child, &d_new_buf)) orelse return null;
+    const d_new = (try operations.buildSlugPath(db, child_id, &d_new_buf)) orelse return null;
     if (std.mem.eql(u8, d_old, d_new)) return null;
     var v_buf: [16]u8 = undefined;
     if ((try db.categories_by_slug_path().search(d_old, &v_buf)) == null) return null;
     return changeset.SlugPathSwap{
         .old_path = try sa.dupe(u8, d_old),
         .new_path = try sa.dupe(u8, d_new),
-        .cat_id = child.id,
+        .cat_id = child_id,
     };
 }
 
@@ -127,14 +127,14 @@ fn processChunk(
 
     var swaps: std.ArrayList(changeset.SlugPathSwap) = .{};
     const old_root_path = qt.task.old_slug_prefix.slice();
+    const children_buf = try sa.alloc(schema.Category, 256);
 
     while (stack.items.len > 0) {
         const f_idx = stack.items.len - 1;
         const cur_id = stack.items[f_idx].id;
         const cur_off = stack.items[f_idx].child_offset;
 
-        var children_buf: [256]schema.Category = undefined;
-        const children = try operations.listChildren(db, cur_id, cur_off, 256, &children_buf);
+        const children = try operations.listChildren(db, cur_id, cur_off, 256, children_buf);
         if (children.len == 0) {
             _ = stack.pop();
             continue;
@@ -143,7 +143,7 @@ fn processChunk(
         for (children, 0..) |child, i| {
             try stack.append(stack_alloc, .{ .id = child.id, .child_offset = 0 });
 
-            if (try planSwap(db, qt.task.cat_id, old_root_path, child, sa)) |swap| {
+            if (try planSwap(db, qt.task.cat_id, old_root_path, child.id, sa)) |swap| {
                 try swaps.append(sa, swap);
             }
 
