@@ -3,6 +3,7 @@ const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const category = @import("operations_category.zig");
+const OperationError = @import("operations_shared.zig").OperationError;
 
 pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
     if (path.len == 0) return null;
@@ -43,6 +44,29 @@ pub fn resolveSlugPath(db: *Directory, path: []const u8) !?u64 {
     const canonical = (try buildCanonicalSlugPath(db, &cat, &path_buf)) orelse return null;
     if (!std.mem.eql(u8, canonical, resolved_path)) return null;
     return cat_id;
+}
+
+pub fn ensureSlugPathFree(db: *Directory, parent_id: u64, slug: []const u8, own_id: u64) !void {
+    var path_buf: [2048]u8 = undefined;
+    const path = (try composeChildSlugPath(db, parent_id, slug, &path_buf)) orelse return;
+    var v_buf: [8]u8 = undefined;
+    const existing = (try db.categories_by_slug_path().search(path, &v_buf)) orelse return;
+    if (existing.len == 8 and codec.decodeU64(existing[0..8]) == own_id) return;
+    return OperationError.DuplicateSlug;
+}
+
+fn composeChildSlugPath(db: *Directory, parent_id: u64, slug: []const u8, buf: []u8) !?[]const u8 {
+    if (parent_id == 0) {
+        if (slug.len > buf.len) return null;
+        @memcpy(buf[0..slug.len], slug);
+        return buf[0..slug.len];
+    }
+    const parent_path = (try buildSlugPath(db, parent_id, buf)) orelse return null;
+    const total = parent_path.len + 1 + slug.len;
+    if (total > buf.len) return null;
+    buf[parent_path.len] = '/';
+    @memcpy(buf[parent_path.len + 1 ..][0..slug.len], slug);
+    return buf[0..total];
 }
 
 pub fn buildSlugPath(db: *Directory, id: u64, buf: []u8) !?[]const u8 {

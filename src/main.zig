@@ -18,8 +18,8 @@ pub const Config = struct {
     rename_inline_threshold: u32 = 5000,
     repair_worker_interval_ms: u32 = 1000,
     repair_worker_chunk_size: u32 = 10000,
-    repair_worker_max_tasks_per_tick: u32 = 1,
     subtree_scan_threshold: u32 = 1024,
+    verifier_interval_s: u32 = 300,
 
     pub fn fromEnv() Config {
         var config = Config{ .server = zigstore.ServerConfig.fromEnv("DMOZDB_") };
@@ -35,11 +35,11 @@ pub const Config = struct {
         if (std.posix.getenv("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |v| {
             config.repair_worker_chunk_size = std.fmt.parseInt(u32, v, 10) catch 10000;
         }
-        if (std.posix.getenv("DMOZDB_REPAIR_WORKER_MAX_TASKS_PER_TICK")) |v| {
-            config.repair_worker_max_tasks_per_tick = std.fmt.parseInt(u32, v, 10) catch 1;
-        }
         if (std.posix.getenv("DMOZDB_SUBTREE_SCAN_THRESHOLD")) |v| {
             config.subtree_scan_threshold = std.fmt.parseInt(u32, v, 10) catch 1024;
+        }
+        if (std.posix.getenv("DMOZDB_VERIFIER_INTERVAL_S")) |v| {
+            config.verifier_interval_s = std.fmt.parseInt(u32, v, 10) catch 300;
         }
         return config;
     }
@@ -99,5 +99,5 @@ test "Config: rename_inline_threshold default and env override" {
     try std.testing.expectEqual(@as(u32, 5000), default_cfg.rename_inline_threshold);
     try std.testing.expectEqual(@as(u32, 1000), default_cfg.repair_worker_interval_ms);
     try std.testing.expectEqual(@as(u32, 10000), default_cfg.repair_worker_chunk_size);
-    try std.testing.expectEqual(@as(u32, 1), default_cfg.repair_worker_max_tasks_per_tick);
+    try std.testing.expectEqual(@as(u32, 300), default_cfg.verifier_interval_s);
 }

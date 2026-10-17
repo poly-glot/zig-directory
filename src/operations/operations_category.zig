@@ -5,6 +5,7 @@ const Directory = @import("../directory.zig").Directory;
 const shared = @import("operations_shared.zig");
 const compute = @import("operations_changeset_compute.zig");
 const link_mod = @import("operations_link.zig");
+const slug_mod = @import("operations_slug.zig");
 
 const OperationError = shared.OperationError;
 const MAX_NAME_LEN = shared.MAX_NAME_LEN;
@@ -18,6 +19,9 @@ pub fn createCategory(
     slug_str: []const u8,
     desc: []const u8,
 ) !u64 {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+
     if (name.len > MAX_NAME_LEN or
         slug_str.len > MAX_SLUG_LEN or
         desc.len > MAX_CATEGORY_DESC_LEN) return OperationError.FieldTooLong;
@@ -25,6 +29,7 @@ pub fn createCategory(
     if (parent_id != 0) {
         if ((try getCategory(db, parent_id)) == null) return OperationError.ParentNotFound;
     }
+    try slug_mod.ensureSlugPathFree(db, parent_id, slug_str, 0);
 
     const id = db.next_category_id.fetchAdd(1, .monotonic);
     const now = std.time.timestamp();
@@ -72,6 +77,9 @@ pub fn updateCategory(
     slug_str: ?[]const u8,
     desc: ?[]const u8,
 ) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+
     if (name) |n| if (n.len > MAX_NAME_LEN) return OperationError.FieldTooLong;
     if (slug_str) |s| if (s.len > MAX_SLUG_LEN) return OperationError.FieldTooLong;
     if (desc) |d| if (d.len > MAX_CATEGORY_DESC_LEN) return OperationError.FieldTooLong;
@@ -97,6 +105,8 @@ pub fn updateCategory(
         return;
     }
 
+    try slug_mod.ensureSlugPathFree(db, old_cat.parent_id, slug_str.?, id);
+
     var new_cat = old_cat;
     if (name) |n| new_cat.name = codec.FixedString(64).fromSlice(n);
     if (slug_str) |s| new_cat.slug = codec.FixedString(128).fromSlice(s);
@@ -111,6 +121,9 @@ pub fn updateCategory(
 }
 
 pub fn deleteCategory(db: *Directory, id: u64) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+
     if ((try getCategory(db, id)) == null) return OperationError.CategoryNotFound;
 
     var children_buf: [1]schema.Category = undefined;
@@ -122,7 +135,7 @@ pub fn deleteCategory(db: *Directory, id: u64) !void {
         const links = (try link_mod.listLinks(db, id, 0, 64, &links_buf, null, 0)).items;
         if (links.len == 0) break;
         for (links) |link| {
-            try link_mod.deleteLink(db, link.id);
+            try link_mod.deleteLinkLocked(db, link.id);
         }
     }
 
@@ -136,6 +149,9 @@ pub fn deleteCategory(db: *Directory, id: u64) !void {
 }
 
 pub fn moveCategory(db: *Directory, id: u64, new_parent_id: u64) !void {
+    db.write_mutex.lock();
+    defer db.write_mutex.unlock();
+
     const old_cat = (try getCategory(db, id)) orelse return OperationError.CategoryNotFound;
 
     if (new_parent_id != 0) {
@@ -155,6 +171,7 @@ pub fn moveCategory(db: *Directory, id: u64, new_parent_id: u64) !void {
     }
 
     if (old_cat.parent_id == new_parent_id) return;
+    try slug_mod.ensureSlugPathFree(db, new_parent_id, old_cat.slug.slice(), id);
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
@@ -807,4 +824,59 @@ test "moveCategory: cat_by_parent + slug-path B+Trees swapped" {
     try std.testing.expectEqual(@as(u32, 1), b.child_count_subtree);
     const top = (try getCategory(db, top_id)).?;
     try std.testing.expectEqual(@as(u32, 3), top.child_count_subtree);
+}
+
+test "two siblings cannot share a slug" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try createCategory(db, 0, "Top", "top", "");
+    _ = try createCategory(db, top, "Arts", "arts", "");
+    try std.testing.expectError(OperationError.DuplicateSlug, createCategory(db, top, "Arts Again", "arts", ""));
+}
+
+test "the same slug is allowed under different parents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try createCategory(db, 0, "Top", "top", "");
+    const a = try createCategory(db, top, "A", "a", "");
+    const b = try createCategory(db, top, "B", "b", "");
+    _ = try createCategory(db, a, "News", "news", "");
+    _ = try createCategory(db, b, "News", "news", "");
+}
+
+test "renaming onto a sibling's slug is refused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try createCategory(db, 0, "Top", "top", "");
+    _ = try createCategory(db, top, "Arts", "arts", "");
+    const music = try createCategory(db, top, "Music", "music", "");
+    try std.testing.expectError(OperationError.DuplicateSlug, updateCategory(db, music, null, "arts", null));
+    try updateCategory(db, music, "Music!", "music", null);
+}
+
+test "moving a category under a parent that already has its slug is refused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try createCategory(db, 0, "Top", "top", "");
+    const a = try createCategory(db, top, "A", "a", "");
+    const b = try createCategory(db, top, "B", "b", "");
+    _ = try createCategory(db, a, "News", "news", "");
+    const b_news = try createCategory(db, b, "News", "news", "");
+    try std.testing.expectError(OperationError.DuplicateSlug, moveCategory(db, b_news, a));
 }

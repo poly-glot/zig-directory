@@ -8,6 +8,7 @@ pub const OperationError = error{
     AlreadyInState,
     ParentNotFound,
     DuplicateUrl,
+    DuplicateSlug,
     CircularHierarchy,
     CategoryHasChildren,
     InvalidSlug,

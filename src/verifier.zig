@@ -13,7 +13,10 @@ pub const InvariantId = enum(u8) {
     subtree_counts = 3,
     no_orphans = 4,
     single_top = 5,
+    link_category_exists = 6,
 };
+
+pub const INVARIANT_COUNT = @typeInfo(InvariantId).@"enum".fields.len;
 
 pub const InvariantHealth = struct {
     name: []const u8,
@@ -37,19 +40,20 @@ pub const InvariantHealth = struct {
 pub const VerifierState = struct {
     last_run_at: i64 = 0,
     any_drift: bool = false,
-    indices: [6]InvariantHealth = .{
+    indices: [INVARIANT_COUNT]InvariantHealth = .{
         .{ .name = "cat_by_parent", .expected = 0, .observed = 0 },
         .{ .name = "link_by_category", .expected = 0, .observed = 0 },
         .{ .name = "link_by_url_hash", .expected = 0, .observed = 0 },
         .{ .name = "subtree_counts", .expected = 0, .observed = 0 },
         .{ .name = "no_orphans", .expected = 0, .observed = 0 },
         .{ .name = "single_top", .expected = 0, .observed = 0 },
+        .{ .name = "link_category_exists", .expected = 0, .observed = 0 },
     },
     mutex: std.Thread.Mutex = .{},
 
     pub fn snapshot(self: *VerifierState, db: *Directory) struct {
         last_run_at: i64,
-        indices: [6]InvariantHealth,
+        indices: [INVARIANT_COUNT]InvariantHealth,
         slug_path_repair_queue_depth: u64,
         slug_path_repair_worker_last_tick_ms: i64,
         slug_path_repair_worker_tasks_processed: u64,
@@ -83,7 +87,7 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
     const link_by_category_count = try countTree(db.link_by_category(), &([_]u8{0} ** 16));
     const link_by_url_hash_count = try countTree(db.link_by_url_hash(), codec.encodeU64(0)[0..]);
 
-    var indices: [6]InvariantHealth = undefined;
+    var indices: [INVARIANT_COUNT]InvariantHealth = undefined;
 
     indices[@intFromEnum(InvariantId.cat_by_parent_coverage)] = .{
         .name = "cat_by_parent",
@@ -120,6 +124,13 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
         .name = "single_top",
         .expected = if (cat_count == 0) 0 else 1,
         .observed = top_count,
+    };
+
+    const link_orphan_count = try countLinksWithMissingCategory(db);
+    indices[@intFromEnum(InvariantId.link_category_exists)] = .{
+        .name = "link_category_exists",
+        .expected = link_count,
+        .observed = link_count -| link_orphan_count,
     };
 
     state.mutex.lock();
@@ -232,6 +243,28 @@ fn countOrphans(db: *Directory) !u64 {
     for (parents.items) |parent_id| {
         const parent = ops.getCategory(db, parent_id) catch null;
         if (parent == null) orphans += 1;
+    }
+    return orphans;
+}
+
+fn countLinksWithMissingCategory(db: *Directory) !u64 {
+    const ops = @import("operations/operations.zig");
+
+    var category_exists = std.AutoHashMap(u64, bool).init(db.allocator);
+    defer category_exists.deinit();
+
+    var orphans: u64 = 0;
+    const min_key = codec.encodeU64(0);
+    var iter = try db.links_by_id().rangeScan(&min_key, null);
+    defer iter.deinit();
+    while (try iter.next()) |entry| {
+        if (entry.value.len < @sizeOf(schema.Link)) continue;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
+        const gop = try category_exists.getOrPut(link.category_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = (ops.getCategory(db, link.category_id) catch null) != null;
+        }
+        if (!gop.value_ptr.*) orphans += 1;
     }
     return orphans;
 }
@@ -632,4 +665,29 @@ test "H14: verifier flags slug-path coverage divergence" {
 
     try runOnce(db, &state);
     try std.testing.expect(state.any_drift);
+}
+
+test "verifier reports a link whose category no longer exists" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const ops = @import("operations/operations.zig");
+    const top = try ops.createCategory(db, 0, "Top", "top", "");
+    const doomed = try ops.createCategory(db, top, "Doomed", "doomed", "");
+    _ = try ops.createLink(db, doomed, "https://orphan.example", "Orphan", "");
+
+    db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    const doomed_key = codec.encodeU64(doomed);
+    _ = try db.categories_by_id().delete(&doomed_key);
+
+    var state = VerifierState{};
+    try runOnce(db, &state);
+
+    const inv = state.indices[@intFromEnum(InvariantId.link_category_exists)];
+    try std.testing.expectEqual(@as(u64, 1), inv.expected);
+    try std.testing.expectEqual(@as(u64, 0), inv.observed);
+    try std.testing.expect(inv.driftBp() > 0);
 }

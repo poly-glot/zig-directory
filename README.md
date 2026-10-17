@@ -267,7 +267,6 @@ are read by `zigstore.ServerConfig.fromEnv("DMOZDB_")`; the rest by `src/main.zi
 | `DMOZDB_RENAME_INLINE_THRESHOLD`          | u32    | `5000`            | Subtree size at which rename/move flips from in-line strict to queued async repair |
 | `DMOZDB_REPAIR_WORKER_INTERVAL_MS`        | u32    | `1000`            | Repair-worker tick interval (ms)                                            |
 | `DMOZDB_REPAIR_WORKER_CHUNK_SIZE`         | u32    | `10000`           | Descendants processed per worker chunk                                      |
-| `DMOZDB_REPAIR_WORKER_MAX_TASKS_PER_TICK` | u32    | `1`               | Tasks pulled from the queue per tick                                        |
 | `DMOZDB_SUBTREE_SCAN_THRESHOLD`           | u32    | `1024`            | Descendant count above which `list_subtree_links` uses the sequential `link_by_category` scan instead of per-descendant range scans |
 | `DMOZDB_VERIFIER_INTERVAL_S`              | u32    | `300`             | Seconds between background verifier runs                                    |
 
@@ -362,6 +361,7 @@ Codes 21 and 31–33 are unassigned.
 | 7      | `duplicate_url`       | `duplicate`          | URL already stored                                   |
 | 8      | `offset_too_large`    | `invalid`            | `list_subtree_links` offset above 5000               |
 | 9      | `already_in_progress` | `err`                | A snapshot is already running                        |
+| 10     | `duplicate_slug`      | `duplicate`          | A sibling category already has that slug (create, rename, or move) |
 
 ### CRUD Operations
 

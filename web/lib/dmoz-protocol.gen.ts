@@ -63,6 +63,7 @@ export const enum SubStatus {
   DuplicateUrl = 7,
   OffsetTooLarge = 8,
   AlreadyInProgress = 9,
+  DuplicateSlug = 10,
 }
 
 export const STATUS_MSG: Record<number, string> = {
@@ -87,6 +88,7 @@ export const SUB_STATUS_MSG: Record<number, string> = {
   7: "duplicate url",
   8: "offset too large",
   9: "already in progress",
+  10: "duplicate slug",
 };
 
 export const CATEGORY_SIZE = 1288;
