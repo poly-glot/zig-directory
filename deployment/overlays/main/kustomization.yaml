@@ -19,10 +19,10 @@ patches:
 images:
 - name: dmozdb-backend
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: 8c8a01dafa5da9a5705b2e32b6f3b17cba63462a-backend
+  newTag: b2446d1ca6dc1eab7816cf21c04f489c3c7f5e68-backend
 - name: dmozdb-mcp
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: 8c8a01dafa5da9a5705b2e32b6f3b17cba63462a-mcp
+  newTag: b2446d1ca6dc1eab7816cf21c04f489c3c7f5e68-mcp
 - name: dmozdb-web
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: 8c8a01dafa5da9a5705b2e32b6f3b17cba63462a-web
+  newTag: b2446d1ca6dc1eab7816cf21c04f489c3c7f5e68-web
