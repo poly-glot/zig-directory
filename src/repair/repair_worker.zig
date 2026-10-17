@@ -8,14 +8,14 @@ const operations = @import("../operations/operations.zig");
 const log = std.log.scoped(.repair_worker);
 
 pub fn tickOnce(db: *Directory) !void {
-    db.repair_worker_mutex.lock();
-    defer db.repair_worker_mutex.unlock();
+    db.repair_worker_mutex.lockUncancelable(db.io);
+    defer db.repair_worker_mutex.unlock(db.io);
 
     if (db.slug_path_repair_queue().entryCount() != 0) {
         if (try peekMin(db)) |task| try processTask(db, task);
     }
 
-    db.repair_worker_last_tick_ms.store(std.time.milliTimestamp(), .release);
+    db.repair_worker_last_tick_ms.store(db.nowMillis(), .release);
 
     const depth = db.slug_path_repair_queue().entryCount();
     if (depth >= 10000) {
@@ -33,7 +33,7 @@ const QueuedTask = struct {
 };
 
 fn peekMin(db: *Directory) !?QueuedTask {
-    const start_key = [_]u8{0} ** 8;
+    const start_key: [8]u8 = @splat(0);
     var iter = try db.slug_path_repair_queue().rangeScan(&start_key, null);
     defer iter.deinit();
     if (try iter.next()) |entry| {
@@ -49,7 +49,7 @@ fn peekMin(db: *Directory) !?QueuedTask {
 const WalkFrame = struct { id: u64, child_offset: u32 };
 
 fn processTask(db: *Directory, qt: QueuedTask) !void {
-    const t0 = std.time.milliTimestamp();
+    const t0 = db.nowMillis();
     var chunks: u32 = 0;
 
     const root_cat = try operations.getCategory(db, qt.task.cat_id);
@@ -61,21 +61,21 @@ fn processTask(db: *Directory, qt: QueuedTask) !void {
 
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
-    var stack: std.ArrayList(WalkFrame) = .{};
+    var stack: std.ArrayList(WalkFrame) = .empty;
     try stack.append(arena.allocator(), .{ .id = qt.task.cat_id, .child_offset = 0 });
 
     while (stack.items.len > 0) {
-        db.write_mutex.lock();
-        defer db.write_mutex.unlock();
+        db.write_mutex.lockUncancelable(db.io);
+        defer db.write_mutex.unlock(db.io);
         if (try processChunk(db, qt, &stack, arena.allocator())) chunks += 1;
     }
 
-    db.write_mutex.lock();
-    defer db.write_mutex.unlock();
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
     try db.commit(changeset.ChangeSet{ .slug_path_repair_complete = .{ .seq = qt.seq } });
     _ = db.repair_worker_tasks_processed.fetchAdd(1, .monotonic);
     log.info("task seq={d} cat_id={d} op={s} chunks={d} processed in {d} ms", .{
-        qt.seq, qt.task.cat_id, @tagName(qt.task.op), chunks, std.time.milliTimestamp() - t0,
+        qt.seq, qt.task.cat_id, @tagName(qt.task.op), chunks, db.nowMillis() - t0,
     });
 }
 
@@ -87,7 +87,7 @@ fn processOneChunk(db: *Directory) !void {
     }
     var arena = std.heap.ArenaAllocator.init(db.allocator);
     defer arena.deinit();
-    var stack: std.ArrayList(WalkFrame) = .{};
+    var stack: std.ArrayList(WalkFrame) = .empty;
     try stack.append(arena.allocator(), .{ .id = qt.task.cat_id, .child_offset = 0 });
     _ = try processChunk(db, qt, &stack, arena.allocator());
 }
@@ -125,7 +125,7 @@ fn processChunk(
     defer swap_arena.deinit();
     const sa = swap_arena.allocator();
 
-    var swaps: std.ArrayList(changeset.SlugPathSwap) = .{};
+    var swaps: std.ArrayList(changeset.SlugPathSwap) = .empty;
     const old_root_path = qt.task.old_slug_prefix.slice();
     const children_buf = try sa.alloc(schema.Category, 256);
 

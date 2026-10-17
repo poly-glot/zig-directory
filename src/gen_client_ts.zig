@@ -41,21 +41,17 @@ fn isFixedString(comptime T: type) ?FixedStringMeta {
     return .{ .capacity = T.capacity };
 }
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var args = init.minimal.args.iterate();
     _ = args.next();
     const out_path = args.next() orelse "web/lib/dmoz-protocol.gen.ts";
 
-    var file = try std.fs.cwd().createFile(out_path, .{ .truncate = true });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+    defer file.close(io);
 
     var buf: [16384]u8 = undefined;
-    var fw = file.writer(&buf);
+    var fw = file.writer(io, &buf);
     const w = &fw.interface;
 
     try writeHeader(w);
@@ -99,8 +95,8 @@ fn writeLinkStatusEnum(w: *std.Io.Writer) !void {
         \\export function linkStatusFromByte(b: number): LinkStatus {
         \\
     );
-    inline for (@typeInfo(schema.LinkStatus).@"enum".fields) |f| {
-        try w.print("    if (b === {d}) return \"{s}\";\n", .{ f.value, f.name });
+    inline for (comptime std.enums.values(schema.LinkStatus)) |status| {
+        try w.print("    if (b === {d}) return \"{s}\";\n", .{ @intFromEnum(status), @tagName(status) });
     }
     try w.writeAll(
         \\    return "unknown";
@@ -109,8 +105,8 @@ fn writeLinkStatusEnum(w: *std.Io.Writer) !void {
         \\export function statusToCode(s: LinkStatus): number {
         \\
     );
-    inline for (@typeInfo(schema.LinkStatus).@"enum".fields) |f| {
-        try w.print("    if (s === \"{s}\") return {d};\n", .{ f.name, f.value });
+    inline for (comptime std.enums.values(schema.LinkStatus)) |status| {
+        try w.print("    if (s === \"{s}\") return {d};\n", .{ @tagName(status), @intFromEnum(status) });
     }
     try w.writeAll(
         \\    throw new Error(`statusToCode: cannot encode "${s}"`);

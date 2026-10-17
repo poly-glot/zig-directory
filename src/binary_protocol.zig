@@ -257,7 +257,7 @@ const CreateLinks = BatchCreateHandler(link_fields, @intFromEnum(Op.create_link)
 const CreateCategories = BatchCreateHandler(category_fields, @intFromEnum(Op.create_category), operations.createCategory);
 
 pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, resp: []u8) usize {
-    const op: Op = std.meta.intToEnum(Op, op_byte) catch {
+    const op: Op = std.enums.fromInt(Op, op_byte) orelse {
         return writeErrorResp(resp, op_byte, .invalid);
     };
     return switch (op) {
@@ -760,9 +760,9 @@ fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     var it = inverted.TokenIterator.init(query);
     while (it.next(&tok_buf)) |tok| {
-        if (std.ascii.indexOfIgnoreCase(link.title.slice(), tok) != null) return 0;
-        if (std.ascii.indexOfIgnoreCase(link.url.slice(), tok) != null) return 1;
-        if (std.ascii.indexOfIgnoreCase(link.description.slice(), tok) != null) return 2;
+        if (std.ascii.findIgnoreCase(link.title.slice(), tok) != null) return 0;
+        if (std.ascii.findIgnoreCase(link.url.slice(), tok) != null) return 1;
+        if (std.ascii.findIgnoreCase(link.description.slice(), tok) != null) return 2;
     }
     return 0;
 }
@@ -778,7 +778,7 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const consumed: usize = 2 + query_len + 4;
     const scope: SearchScope = switch (payload.len - consumed) {
         0 => .both,
-        1 => std.meta.intToEnum(SearchScope, payload[consumed]) catch return writeErrorResp(resp, op_byte, .invalid),
+        1 => std.enums.fromInt(SearchScope, payload[consumed]) orelse return writeErrorResp(resp, op_byte, .invalid),
         else => return writeErrorResp(resp, op_byte, .invalid),
     };
 
@@ -926,7 +926,7 @@ fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
         return writeErrorRespSub(resp, op_byte, .invalid, .field_too_long);
     }
 
-    const t_start = std.time.nanoTimestamp();
+    const t_start = std.Io.Clock.awake.now(db.io);
 
     var inserted: u64 = 0;
     var duplicates: u64 = 0;
@@ -970,8 +970,7 @@ fn handleBulkImport(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8
         }
     }
 
-    const t_end = std.time.nanoTimestamp();
-    const elapsed_ms: u64 = @intCast(@divTrunc(t_end - t_start, std.time.ns_per_ms));
+    const elapsed_ms: u64 = @intCast(t_start.durationTo(std.Io.Clock.awake.now(db.io)).toMilliseconds());
 
     log.info("bulk_import: done count={d} inserted={d} dup={d} err={d} elapsed_ms={d}", .{
         count, inserted, duplicates, errors, elapsed_ms,
@@ -1498,7 +1497,7 @@ test "snapshot op (22): writes snapshot.meta and returns wal_sequence + duration
     try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
     try std.testing.expectEqual(@intFromEnum(SubStatus.none), resp[6]);
 
-    const snap = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(db.config.data_dir)).?;
+    const snap = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(db.io, db.config.data_dir)).?;
     try std.testing.expectEqual(zigstore.snapshot.SNAP_MAGIC, snap.magic);
 
     const reported_seq = std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE..][0..8], .little);
@@ -2298,8 +2297,8 @@ test "breadcrumbs_by_ids (30): unresolved id yields an empty group, preserving o
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[off..][0..2], .little));
 }
 
-fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+fn fuzzProcessFramesOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2308,9 +2307,7 @@ fn fuzzProcessFramesOne(_: void, input: []const u8) anyerror!void {
 
     var bp: zigstore.connection.BufferPair = .{};
     var conn = zigstore.connection.Connection{ .phase = .reading_request, .buf = &bp };
-    const n = @min(input.len, bp.request_buf.len);
-    @memcpy(bp.request_buf[0..n], input[0..n]);
-    conn.bytes_read = n;
+    conn.bytes_read = smith.slice(&bp.request_buf);
     protocol.processFrames(db, &conn, &Directory.dispatch, db.op_latency, RESPONSE_RESERVE);
 }
 

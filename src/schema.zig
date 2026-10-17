@@ -47,14 +47,14 @@ pub const Link = extern struct {
     created_at: i64 = 0,
     updated_at: i64 = 0,
     status: u8 = @intFromEnum(LinkStatus.approved),
-    _pad1: [7]u8 = .{0} ** 7,
+    _pad1: [7]u8 = @splat(0),
     submitter_id: u64 = 0,
     editor_note: FixedString(1024) = .{},
     tags: FixedString(256) = .{},
     language: FixedString(8) = .{},
     region: FixedString(8) = .{},
     license: FixedString(64) = .{},
-    _pad2: [6]u8 = .{0} ** 6,
+    _pad2: [6]u8 = @splat(0),
 };
 
 comptime {
@@ -71,7 +71,7 @@ pub const RepairOp = enum(u8) {
 pub const RepairTask = extern struct {
     cat_id: u64 = 0,
     op: RepairOp = .renamed_slug,
-    _pad: [7]u8 = [_]u8{0} ** 7,
+    _pad: [7]u8 = @splat(0),
     created_at: i64 = 0,
     old_slug_prefix: FixedString(2048) = .{},
 };

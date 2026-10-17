@@ -47,6 +47,7 @@ pub const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
 const MEMTABLE_FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
 
 pub const Directory = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
     config: Config,
     store: *Store,
@@ -55,10 +56,10 @@ pub const Directory = struct {
     verifier_worker: ?*zigstore.Worker,
     verifier_interval_ns: u64,
 
-    write_mutex: std.Thread.Mutex,
+    write_mutex: std.Io.Mutex,
 
     repair_worker: ?*zigstore.Worker,
-    repair_worker_mutex: std.Thread.Mutex,
+    repair_worker_mutex: std.Io.Mutex,
     repair_worker_tasks_processed: std.atomic.Value(u64),
     repair_worker_chunks_processed: std.atomic.Value(u64),
     repair_worker_last_tick_ms: std.atomic.Value(i64),
@@ -161,9 +162,11 @@ pub const Directory = struct {
     }
 
     pub fn openTestInstance(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !*Self {
-        const path = try tmp.dir.realpathAlloc(allocator, ".");
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+        const path = try allocator.dupe(u8, path_buf[0..path_len]);
         errdefer allocator.free(path);
-        const dir = try Self.init(allocator, .{
+        const dir = try Self.init(std.testing.io, allocator, .{
             .data_dir = path,
             .server = .{
                 .cache_size_mb = 16,
@@ -182,8 +185,8 @@ pub const Directory = struct {
         allocator.free(data_dir);
     }
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !*Self {
-        const store = try Store.init(allocator, .{
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config) !*Self {
+        const store = try Store.init(io, allocator, .{
             .data_dir = config.data_dir,
             .cache_size_mb = config.server.cache_size_mb,
             .wal_batch_size = config.server.wal_batch_size,
@@ -206,21 +209,22 @@ pub const Directory = struct {
         const verifier_interval_ns = @as(u64, config.verifier_interval_s) * std.time.ns_per_s;
 
         self.* = Self{
+            .io = io,
             .allocator = allocator,
             .config = config,
             .store = store,
             .verifier_state = .{},
             .verifier_worker = null,
             .verifier_interval_ns = verifier_interval_ns,
-            .write_mutex = .{},
+            .write_mutex = .init,
             .repair_worker = null,
-            .repair_worker_mutex = .{},
+            .repair_worker_mutex = .init,
             .repair_worker_tasks_processed = std.atomic.Value(u64).init(0),
             .repair_worker_chunks_processed = std.atomic.Value(u64).init(0),
             .repair_worker_last_tick_ms = std.atomic.Value(i64).init(0),
             .mt_flusher = null,
             .checkpointer = null,
-            .subtree_cache = subtree_mod.SubtreeCache.init(allocator),
+            .subtree_cache = subtree_mod.SubtreeCache.init(io, allocator),
             .url_bloom = url_bloom,
             .next_category_id = std.atomic.Value(u64).init(store.counter("next_category_id").*),
             .next_link_id = std.atomic.Value(u64).init(store.counter("next_link_id").*),
@@ -346,8 +350,8 @@ pub const Directory = struct {
             self.store.deinit();
         } else {
             self.store.cache.deinit();
-            self.store.journal.close();
-            self.store.file.close();
+            self.store.journal.close(self.io);
+            self.store.file.close(self.io);
             inline for (Store.schema_def.memtable_indexes) |name| {
                 self.store.memtable(name).deinit();
             }
@@ -426,6 +430,14 @@ pub const Directory = struct {
         self.store.counter("next_repair_seq").* = self.next_repair_seq.load(.monotonic);
     }
 
+    pub fn nowSeconds(self: *Self) i64 {
+        return std.Io.Clock.real.now(self.io).toSeconds();
+    }
+
+    pub fn nowMillis(self: *Self) i64 {
+        return std.Io.Clock.real.now(self.io).toMilliseconds();
+    }
+
     pub fn checkpoint(self: *Self) !void {
         self.syncPersistedCounters();
         _ = try self.store.checkpoint();
@@ -441,14 +453,14 @@ pub const Directory = struct {
         const cat_count = self.categories_by_id().entryCount();
         const link_count = self.links_by_id().entryCount();
         const pg_count = blk: {
-            self.store.cache.alloc_lock.lock();
-            defer self.store.cache.alloc_lock.unlock();
+            self.store.cache.alloc_lock.lockUncancelable(self.io);
+            defer self.store.cache.alloc_lock.unlock(self.io);
             break :blk self.store.cache.page_count;
         };
 
         const wal_pending: u64 = if (self.store.wal_writer) |*w| blk: {
-            w.lock.lock();
-            defer w.lock.unlock();
+            w.lock.lockUncancelable(self.io);
+            defer w.lock.unlock(self.io);
             break :blk w.entry_count;
         } else 0;
 

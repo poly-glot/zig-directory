@@ -81,7 +81,7 @@ protocol op handlers. Binary-only TCP protocol processed inline on the epoll thr
 
 ### Engine
 
-`dmozdb` is built on **zigstore** (`github.com/poly-glot/zigstore`, pinned in `build.zig.zon`, currently `v1.4.1`). The
+`dmozdb` is built on **zigstore** (`github.com/poly-glot/zigstore`, pinned in `build.zig.zon`, currently `v3.0.0`). The
 library owns the generic machinery:
 
 | zigstore module                      | Responsibility                                                            |
@@ -177,7 +177,7 @@ record all refuse to start rather than serve or silently drop data.
 
 ### Prerequisites
 
-- **Zig 0.15.2**: [install guide](https://ziglang.org/download/)
+- **Zig 0.16.0**: [install guide](https://ziglang.org/download/)
 - **Docker** (optional, for containerized deployment)
 
 ### Build from Source
@@ -237,7 +237,7 @@ docker run -d \
 
 The project includes a full [Dev Container](.devcontainer/devcontainer.json) configuration for VS Code and GitHub Codespaces:
 
-- Ubuntu 24.04 with Zig 0.15.2 and ZLS pre-installed
+- Ubuntu 24.04 with Zig 0.16.0 and ZLS 0.16.0 pre-installed
 - Docker-in-Docker enabled for container builds
 - VS Code extensions: Zig language support, GitLens, ShellCheck
 - Port 8080 auto-forwarded
@@ -980,7 +980,7 @@ simplicity, predictability and raw throughput over generality.
 #### One dependency: zigstore
 
 The engine is the public library zigstore, pinned by URL and hash in `build.zig.zon`. Everything else compiles against
-the Zig 0.15 standard library. There is no vendored C code and no build system beyond `build.zig`. Upgrading the engine
+the Zig 0.16 standard library. There is no vendored C code and no build system beyond `build.zig`. Upgrading the engine
 is a one-line change to the pinned tag; schema and operations stay here.
 
 #### Binary protocol only

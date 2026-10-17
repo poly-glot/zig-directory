@@ -17,7 +17,7 @@ pub const RebuildStats = struct {
 };
 
 pub fn rebuildAllIndices(db: *Directory) !RebuildStats {
-    const t0 = std.time.milliTimestamp();
+    const t0 = db.nowMillis();
 
     var stats = RebuildStats{
         .categories_rebuilt = 0,
@@ -26,15 +26,15 @@ pub fn rebuildAllIndices(db: *Directory) !RebuildStats {
     };
 
     {
-        db.write_mutex.lock();
-        defer db.write_mutex.unlock();
+        db.write_mutex.lockUncancelable(db.io);
+        defer db.write_mutex.unlock(db.io);
 
         try db.drainAllMemtables();
 
-        db.store.mt_drain_mutex.lock();
-        defer db.store.mt_drain_mutex.unlock();
-        db.store.apply_mutex.lock();
-        defer db.store.apply_mutex.unlock();
+        db.store.mt_drain_mutex.lockUncancelable(db.io);
+        defer db.store.mt_drain_mutex.unlock(db.io);
+        db.store.apply_mutex.lockUncancelable(db.io);
+        defer db.store.apply_mutex.unlock(db.io);
 
         stats.categories_rebuilt = try rebuildCategoryIndices(db);
 
@@ -45,7 +45,7 @@ pub fn rebuildAllIndices(db: *Directory) !RebuildStats {
 
     log.info(
         "rebuild_index: cats={d} links={d} drained={d} in {d}ms",
-        .{ stats.categories_rebuilt, stats.links_rebuilt, stats.queue_entries_drained, std.time.milliTimestamp() - t0 },
+        .{ stats.categories_rebuilt, stats.links_rebuilt, stats.queue_entries_drained, db.nowMillis() - t0 },
     );
     return stats;
 }
@@ -63,7 +63,7 @@ fn rebuildCategoryIndices(db: *Directory) !u64 {
         slug_best.deinit();
     }
 
-    var cat_ids: std.ArrayListUnmanaged(u64) = .{};
+    var cat_ids: std.ArrayListUnmanaged(u64) = .empty;
     defer cat_ids.deinit(db.allocator);
     {
         const min_key = codec.encodeU64(0);

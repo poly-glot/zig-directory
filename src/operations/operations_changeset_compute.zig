@@ -11,7 +11,7 @@ const MAX_DEPTH = @import("operations_shared.zig").MAX_DEPTH;
 const TokenSource = struct { text: []const u8, field: changeset.TokenField };
 
 fn tokenize(sources: []const TokenSource, allocator: std.mem.Allocator) ![]changeset.Token {
-    var out: std.ArrayList(changeset.Token) = .{};
+    var out: std.ArrayList(changeset.Token) = .empty;
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     for (sources) |f| {
         var iter = inverted.TokenIterator.init(f.text);
@@ -48,7 +48,7 @@ fn collectAncestorUpdates(
     child_count_subtree_delta: i64,
     allocator: std.mem.Allocator,
 ) ![]changeset.AncestorUpdate {
-    var updates: std.ArrayList(changeset.AncestorUpdate) = .{};
+    var updates: std.ArrayList(changeset.AncestorUpdate) = .empty;
     var current_id = start_id;
     var depth: usize = 0;
     while (current_id != 0 and depth < MAX_DEPTH) : (depth += 1) {
@@ -139,11 +139,11 @@ fn collectDescendantSwaps(
     allocator: std.mem.Allocator,
 ) !DescendantSwaps {
     const threshold = db.config.rename_inline_threshold;
-    var swaps: std.ArrayList(changeset.SlugPathSwap) = .{};
+    var swaps: std.ArrayList(changeset.SlugPathSwap) = .empty;
     var above_threshold = false;
     var descendant_count: u32 = 0;
 
-    var stack: std.ArrayList(u64) = .{};
+    var stack: std.ArrayList(u64) = .empty;
     defer stack.deinit(allocator);
     try stack.append(allocator, root_id);
 
@@ -182,7 +182,7 @@ fn collectDescendantSwaps(
             .seq = db.next_repair_seq.fetchAdd(1, .monotonic),
             .op = op,
             .old_slug_prefix = try allocator.dupe(u8, old_path),
-            .created_at = std.time.milliTimestamp(),
+            .created_at = db.nowMillis(),
         };
     }
 
@@ -239,7 +239,7 @@ pub fn computeCategoryMoveChangeSet(
 
     var cat_post_move = cat;
     cat_post_move.parent_id = new_parent_id;
-    cat_post_move.updated_at = std.time.timestamp();
+    cat_post_move.updated_at = db.nowSeconds();
 
     const link_subtree_delta: u64 = cat.link_count_subtree;
     const child_subtree_delta: u32 = cat.child_count_subtree + 1;
@@ -317,7 +317,7 @@ pub fn computeLinkRecatChangeSet(
 
     var link_post_move = link;
     link_post_move.category_id = new_category_id;
-    link_post_move.updated_at = std.time.timestamp();
+    link_post_move.updated_at = db.nowSeconds();
 
     return changeset.ChangeSet{ .link_recategorized = .{
         .link = link_post_move,

@@ -16,7 +16,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     curl xz-utils ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-ARG ZIG_VERSION=0.15.2
+ARG ZIG_VERSION=0.16.0
 RUN ZIG_ARCH="$(uname -m)" && \
     curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /usr/local && \

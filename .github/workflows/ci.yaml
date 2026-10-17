@@ -27,7 +27,7 @@ jobs:
     # build crawls under QEMU emulation.
     runs-on: ubuntu-24.04-arm
     env:
-      ZIG_VERSION: "0.15.2"
+      ZIG_VERSION: "0.16.0"
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -51,7 +51,7 @@ jobs:
           restore-keys: zig-${{ env.ZIG_VERSION }}-
 
       - name: zig build test
-        run: zig build test
+        run: zig build test --summary all
 
       # The bench client and the importer are gated behind -Dtools and are not in
       # the test graph, so this is the only thing that keeps them compiling.

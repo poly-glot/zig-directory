@@ -1,6 +1,13 @@
 const std = @import("std");
-const posix = std.posix;
+const linux = std.os.linux;
 const zigstore = @import("zigstore");
+
+pub const Env = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    hostname: []const u8,
+};
 
 pub const AtomicHistogram = zigstore.histogram.AtomicHistogram;
 
@@ -84,22 +91,45 @@ pub fn writeLinkItem(fb: *FrameBuilder, cat_id: u64, comptime url_fmt: []const u
     fb.writeU16LenPrefixed("");
 }
 
+fn syscall(rc: usize) !usize {
+    return switch (linux.errno(rc)) {
+        .SUCCESS => rc,
+        .INTR => error.Interrupted,
+        .CONNREFUSED => error.ConnectionRefused,
+        .PIPE => error.BrokenPipe,
+        .CONNRESET => error.ConnectionReset,
+        else => error.Unexpected,
+    };
+}
+
+fn writeFd(fd: i32, bytes: []const u8) !usize {
+    return syscall(linux.write(fd, bytes.ptr, bytes.len));
+}
+
+fn readFd(fd: i32, buf: []u8) !usize {
+    return syscall(linux.read(fd, buf.ptr, buf.len));
+}
+
+pub fn closeFd(fd: i32) void {
+    _ = linux.close(fd);
+}
+
 pub fn sendAndReceive(stream_fd: i32, frame: []const u8, resp_buf: []u8) !usize {
     var sent: usize = 0;
     while (sent < frame.len) {
-        const n = try posix.write(stream_fd, frame[sent..]);
+        const n = try writeFd(stream_fd, frame[sent..]);
         if (n == 0) return error.WriteEof;
         sent += n;
     }
     var read_total: usize = 0;
     while (read_total < RESPONSE_HEADER_SIZE) {
-        const n = try posix.read(stream_fd, resp_buf[read_total..]);
+        const n = try readFd(stream_fd, resp_buf[read_total..]);
         if (n == 0) return error.ReadEof;
         read_total += n;
     }
     const resp_len = std.mem.readInt(u32, resp_buf[0..4], .little);
     while (read_total < resp_len) {
-        const n = try posix.read(stream_fd, resp_buf[read_total..]);
+        const n = try readFd(stream_fd, resp_buf[read_total..]);
         if (n == 0) return error.ReadEof;
         read_total += n;
     }
@@ -107,10 +137,14 @@ pub fn sendAndReceive(stream_fd: i32, frame: []const u8, resp_buf: []u8) !usize 
 }
 
 pub fn tcpConnect(host: []const u8, port: u16) !i32 {
-    const addr = try std.net.Address.parseIp(host, port);
-    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &addr.any, addr.getOsSockLen());
+    const addr = try std.Io.net.Ip4Address.parse(host, port);
+    const sa = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, addr.port),
+        .addr = @bitCast(addr.bytes),
+    };
+    const fd: i32 = @intCast(try syscall(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0)));
+    errdefer closeFd(fd);
+    _ = try syscall(linux.connect(fd, &sa, @sizeOf(linux.sockaddr.in)));
     return fd;
 }
 
@@ -205,11 +239,25 @@ fn collectBatchIds(resp: []const u8, expected_count: u16, range: *IdRange) !void
     }
 }
 
-pub fn ensureDir(path: []const u8) !void {
-    std.fs.cwd().makePath(path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+pub fn ensureDir(io: std.Io, path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, path);
+}
+
+pub fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const data = try allocator.alloc(u8, size);
+    errdefer allocator.free(data);
+    const n = try f.readPositionalAll(io, data, 0);
+    if (n != size) return error.UnexpectedEof;
+    return data;
+}
+
+pub fn writeFileAll(io: std.Io, path: []const u8, lines: []const []const u8) !void {
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    for (lines) |line| try f.writeStreamingAll(io, line);
 }
 
 pub fn seedPath(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
@@ -233,10 +281,8 @@ pub const SeedInfo = struct {
     }
 };
 
-pub fn loadSeed(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(SeedInfo) {
-    const f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
-    const data = try f.readToEndAlloc(allocator, 1 << 24);
+pub fn loadSeed(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(SeedInfo) {
+    const data = try readFileAlloc(io, allocator, path);
     defer allocator.free(data);
     return std.json.parseFromSlice(SeedInfo, allocator, data, .{
         .ignore_unknown_fields = true,
@@ -300,22 +346,23 @@ pub const BenchRecord = struct {
     errors: ErrorCounts,
 };
 
-pub fn appendJsonLine(allocator: std.mem.Allocator, output_path: ?[]const u8, record: BenchRecord) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, record, .{});
-    defer allocator.free(json);
-    const path = output_path orelse return writeLine(std.fs.File.stdout(), json);
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = false });
-    defer file.close();
-    try file.seekFromEnd(0);
-    try writeLine(file, json);
-}
-
-fn writeLine(file: std.fs.File, json: []const u8) !void {
-    try file.writeAll(json);
-    try file.writeAll("\n");
+pub fn appendJsonLine(env: Env, output_path: ?[]const u8, record: BenchRecord) !void {
+    const line = try std.json.Stringify.valueAlloc(env.allocator, record, .{});
+    defer env.allocator.free(line);
+    const path = output_path orelse {
+        try std.Io.File.stdout().writeStreamingAll(env.io, line);
+        try std.Io.File.stdout().writeStreamingAll(env.io, "\n");
+        return;
+    };
+    const file = try std.Io.Dir.cwd().createFile(env.io, path, .{ .truncate = false });
+    defer file.close(env.io);
+    const end = (try file.stat(env.io)).size;
+    try file.writePositionalAll(env.io, line, end);
+    try file.writePositionalAll(env.io, "\n", end + line.len);
 }
 
 pub const RssSampler = struct {
+    io: std.Io,
     pid: i32,
     interval_ms: u64,
     thread: ?std.Thread = null,
@@ -336,8 +383,8 @@ pub const RssSampler = struct {
 
     fn sampleLoop(self: *RssSampler) void {
         while (!self.shutdown.load(.acquire)) {
-            std.Thread.sleep(self.interval_ms * std.time.ns_per_ms);
-            const rss = readRssBytes(self.pid) catch |err| {
+            std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.interval_ms)), .awake) catch return;
+            const rss = readRssBytes(self.io, self.pid) catch |err| {
                 std.log.warn("rss sample failed: {s}", .{@errorName(err)});
                 continue;
             };
@@ -350,13 +397,18 @@ pub const RssSampler = struct {
         }
     }
 
-    fn readRssBytes(pid: i32) !u64 {
+    fn readRssBytes(io: std.Io, pid: i32) !u64 {
         var path_buf: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "/proc/{d}/status", .{pid});
-        const f = try std.fs.cwd().openFile(path, .{});
-        defer f.close();
+        const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer f.close(io);
         var buf: [4096]u8 = undefined;
-        const n = try f.readAll(&buf);
+        var n: usize = 0;
+        while (n < buf.len) {
+            const got = try f.readStreaming(io, &.{buf[n..]});
+            if (got == 0) break;
+            n += got;
+        }
         var lines = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "VmRSS:")) {
@@ -384,7 +436,7 @@ pub const CommonOpts = struct {
 };
 
 pub fn parseCommonOpts(
-    args: *std.process.ArgIterator,
+    args: *std.process.Args.Iterator,
     leftovers: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
 ) !CommonOpts {
@@ -420,9 +472,24 @@ pub fn parseCommonOpts(
     return opts;
 }
 
-pub fn elapsedMs(since_ns: i128) u64 {
-    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - since_ns);
-    return elapsed_ns / std.time.ns_per_ms;
+pub fn now(io: std.Io) std.Io.Timestamp {
+    return std.Io.Clock.awake.now(io);
+}
+
+pub fn elapsedNs(io: std.Io, since: std.Io.Timestamp) u64 {
+    return @intCast(since.durationTo(now(io)).toNanoseconds());
+}
+
+pub fn elapsedMs(io: std.Io, since: std.Io.Timestamp) u64 {
+    return elapsedNs(io, since) / std.time.ns_per_ms;
+}
+
+pub fn unixMillis(io: std.Io) i64 {
+    return std.Io.Clock.real.now(io).toMilliseconds();
+}
+
+pub fn sleepMs(io: std.Io, ms: u64) void {
+    std.Io.sleep(io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
 pub const Frame = struct {
@@ -439,7 +506,7 @@ pub const Worker = struct {
 };
 
 pub const Run = struct {
-    allocator: std.mem.Allocator,
+    env: Env,
     opts: CommonOpts,
     histogram: AtomicHistogram = .{},
     ops_completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -448,8 +515,8 @@ pub const Run = struct {
     duration_ms: u64 = 0,
     rss: RssStats = RSS_UNAVAILABLE,
 
-    pub fn init(allocator: std.mem.Allocator, opts: CommonOpts) Run {
-        return .{ .allocator = allocator, .opts = opts };
+    pub fn init(env: Env, opts: CommonOpts) Run {
+        return .{ .env = env, .opts = opts };
     }
 
     pub fn runWorkers(self: *Run, comptime Ctx: type, ctx: *Ctx) !void {
@@ -463,15 +530,15 @@ pub const Run = struct {
             }
         };
 
-        const threads = try self.allocator.alloc(std.Thread, self.opts.workers);
-        defer self.allocator.free(threads);
+        const threads = try self.env.allocator.alloc(std.Thread, self.opts.workers);
+        defer self.env.allocator.free(threads);
 
-        const t_start = std.time.nanoTimestamp();
+        const t_start = now(self.env.io);
         for (threads, 0..) |*th, i| {
             th.* = try std.Thread.spawn(.{}, Main.main, .{ self, ctx, @as(u32, @intCast(i)) });
         }
         for (threads) |th| th.join();
-        self.duration_ms = elapsedMs(t_start);
+        self.duration_ms = elapsedMs(self.env.io, t_start);
     }
 
     pub fn opsCompleted(self: *const Run) u64 {
@@ -481,8 +548,8 @@ pub const Run = struct {
     pub fn record(self: *const Run, workload: []const u8, params: WorkloadParams, ops_total: u64) BenchRecord {
         const h = &self.histogram;
         return .{
-            .ts = std.time.milliTimestamp(),
-            .host = posix.getenv("HOSTNAME") orelse "unknown",
+            .ts = unixMillis(self.env.io),
+            .host = self.env.hostname,
             .git_rev = self.opts.git_rev orelse "unknown",
             .profile = self.opts.profile,
             .workload = workload,
@@ -509,7 +576,7 @@ pub const Run = struct {
     }
 
     pub fn emit(self: *const Run, workload: []const u8, params: WorkloadParams, ops_total: u64) !void {
-        try appendJsonLine(self.allocator, self.opts.output_path, self.record(workload, params, ops_total));
+        try appendJsonLine(self.env, self.opts.output_path, self.record(workload, params, ops_total));
     }
 };
 
@@ -518,12 +585,12 @@ fn workerLoop(comptime Ctx: type, bench: *Run, ctx: *Ctx, id: u32) !void {
         _ = bench.connect_failed.fetchAdd(1, .monotonic);
         return;
     };
-    defer posix.close(fd);
+    defer closeFd(fd);
 
-    const req_buf = try bench.allocator.alloc(u8, Ctx.REQ_BUF_SIZE);
-    defer bench.allocator.free(req_buf);
-    const resp_buf = try bench.allocator.alloc(u8, Ctx.RESP_BUF_SIZE);
-    defer bench.allocator.free(resp_buf);
+    const req_buf = try bench.env.allocator.alloc(u8, Ctx.REQ_BUF_SIZE);
+    defer bench.env.allocator.free(req_buf);
+    const resp_buf = try bench.env.allocator.alloc(u8, Ctx.RESP_BUF_SIZE);
+    defer bench.env.allocator.free(resp_buf);
 
     const seed: u64 = if (@hasDecl(Ctx, "prngSeed")) Ctx.prngSeed(id) else id;
     var prng = std.Random.DefaultPrng.init(seed);
@@ -533,12 +600,12 @@ fn workerLoop(comptime Ctx: type, bench: *Run, ctx: *Ctx, id: u32) !void {
     while (worker.ops_completed < bench.opts.ops_per_worker) {
         const frame = try ctx.nextFrame(&worker);
 
-        const t0 = std.time.nanoTimestamp();
+        const t0 = now(bench.env.io);
         const resp_len = sendAndReceive(fd, frame.bytes, resp_buf) catch {
             _ = bench.protocol_error.fetchAdd(1, .monotonic);
             return;
         };
-        const latency_ns: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        const latency_ns = elapsedNs(bench.env.io, t0);
 
         if (resp_len < RESPONSE_HEADER_SIZE or !accepted(Ctx, ctx, resp_buf[0..resp_len], latency_ns)) {
             _ = bench.protocol_error.fetchAdd(1, .monotonic);
@@ -570,8 +637,17 @@ test "FrameBuilder: round-trip a create_link frame" {
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, frame[6..8], .little));
 }
 
+fn testEnv() Env {
+    return .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .environ = undefined,
+        .hostname = "test",
+    };
+}
+
 test "Run.record: an empty histogram reports all-zero latency so seed keeps its baseline shape" {
-    const bench = Run.init(std.testing.allocator, .{});
+    const bench = Run.init(testEnv(), .{});
     const rec = bench.record("seed", .{ .seed = .{ .categories = 1, .links = 1, .depth = 1 } }, 2);
     try std.testing.expectEqual(@as(u64, 0), rec.latency_ns.p99);
     try std.testing.expectEqual(@as(u64, 0), rec.latency_ns.mean);
@@ -583,8 +659,8 @@ test "Run.record: an empty histogram reports all-zero latency so seed keeps its 
 test "appendJsonLine: appends one JSONL line per record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(path);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(std.testing.io, &path_buf)];
     const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/test.jsonl", .{path});
     defer std.testing.allocator.free(file);
 
@@ -602,12 +678,10 @@ test "appendJsonLine: appends one JSONL line per record" {
         .rss_bytes = RSS_UNAVAILABLE,
         .errors = .{ .connect_failed = 0, .timeout = 0, .protocol_error = 0 },
     };
-    try appendJsonLine(std.testing.allocator, file, rec);
-    try appendJsonLine(std.testing.allocator, file, rec);
+    try appendJsonLine(testEnv(), file, rec);
+    try appendJsonLine(testEnv(), file, rec);
 
-    const f = try std.fs.cwd().openFile(file, .{});
-    defer f.close();
-    const contents = try f.readToEndAlloc(std.testing.allocator, 1 << 20);
+    const contents = try readFileAlloc(std.testing.io, std.testing.allocator, file);
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "\n"));
 }

@@ -281,14 +281,14 @@ test "E2E: snapshot create and load meta" {
     defer db.deinitTestInstance();
 
     const dir = db.config.data_dir;
-    var snap_mgr = zigstore.snapshot.SnapshotManager.init(dir, 3600);
+    var snap_mgr = zigstore.snapshot.SnapshotManager.init(db.io, dir, 3600);
     try snap_mgr.createSnapshot(db.store.snapshotHost());
 
-    const meta = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(dir)).?;
+    const meta = (try zigstore.snapshot.SnapshotManager.loadSnapshotMeta(db.io, dir)).?;
     try testing.expectEqual(@as(u32, 0x534E4150), meta.magic);
     try testing.expectEqual(db.store.header.seq, meta.wal_sequence);
 
-    const seq = try zigstore.snapshot.SnapshotManager.getWalSequence(dir);
+    const seq = try zigstore.snapshot.SnapshotManager.getWalSequence(db.io, dir);
     try testing.expectEqual(meta.wal_sequence, seq);
 }
 

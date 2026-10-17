@@ -7,14 +7,17 @@ const browse = @import("workloads/browse.zig");
 const search = @import("workloads/search.zig");
 const mixed = @import("workloads/mixed.zig");
 const cold = @import("workloads/cold.zig");
+const common = @import("common.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const env = common.Env{
+        .io = init.io,
+        .allocator = init.gpa,
+        .environ = init.environ_map,
+        .hostname = init.environ_map.get("HOSTNAME") orelse "unknown",
+    };
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    var args = init.minimal.args.iterate();
     _ = args.skip();
 
     const sub = args.next() orelse {
@@ -25,14 +28,14 @@ pub fn main() !void {
         printHelp();
         return;
     }
-    if (std.mem.eql(u8, sub, "seed")) return seed.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "create_link")) return create_link.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "bulk_import")) return bulk_import.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "get_link")) return get_link.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "browse")) return browse.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "search")) return search.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "mixed")) return mixed.run(allocator, &args);
-    if (std.mem.eql(u8, sub, "cold")) return cold.run(allocator, &args);
+    if (std.mem.eql(u8, sub, "seed")) return seed.run(env, &args);
+    if (std.mem.eql(u8, sub, "create_link")) return create_link.run(env, &args);
+    if (std.mem.eql(u8, sub, "bulk_import")) return bulk_import.run(env, &args);
+    if (std.mem.eql(u8, sub, "get_link")) return get_link.run(env, &args);
+    if (std.mem.eql(u8, sub, "browse")) return browse.run(env, &args);
+    if (std.mem.eql(u8, sub, "search")) return search.run(env, &args);
+    if (std.mem.eql(u8, sub, "mixed")) return mixed.run(env, &args);
+    if (std.mem.eql(u8, sub, "cold")) return cold.run(env, &args);
 
     std.debug.print("Unknown subcommand: {s}\n\n", .{sub});
     printHelp();
