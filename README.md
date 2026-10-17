@@ -775,7 +775,8 @@ The page cache (`page_cache.zig` in zigstore) keeps frequently accessed pages in
 
 - **Configurable size**: default 256 MB = 16,384 pages
 - **Eviction policy**: LRU per shard with pin counting; pinned pages cannot be evicted
-- **Dirty tracking**: pages fetched for mutation are marked dirty and written back on snapshot, eviction or shutdown
+- **No-steal dirty tracking**: pages fetched for mutation are marked dirty and never evicted; they reach `store.dat`
+  only through a checkpoint (journal, then in place), and a pressure valve checkpoints early once half the cache is dirty
 - **Thread-safe**: 64 shards keyed by page ID, each behind its own `std.Thread.Mutex`
 - **Atomic stats**: `hit_count` and `miss_count` use `std.atomic.Value` for lock-free reads
 
@@ -800,8 +801,13 @@ tags (`link_inserted`, `link_deleted`, `link_text_updated`, `link_recategorized`
 
 **Group commit**: the flusher thread wakes when the batch reaches `DMOZDB_WAL_BATCH_SIZE` (default 256) or after a
 fixed 2 ms, writes every pending entry and issues one `fdatasync`. Each committing handler waits in `awaitDurable` for
-its sequence to pass that fsync. If an fsync fails, `fsync_failed` is set and stays set: every later commit returns
-`error.WalFlushFailed` until the process restarts.
+its sequence to pass that fsync. If an fsync fails, `fsync_failed` is set and stays set: every later commit is refused
+with `error.WalFlushFailed` before it is appended, and `Directory.commit` aborts the process on it, because the entry
+whose fsync failed is already applied in memory and only a restart makes what is served match what is durable.
+
+**Recovery scan**: on open the WAL is scanned for the last valid record. A torn tail of at most one group-commit batch
+is trimmed; valid records more than one batch beyond a corrupt record mean the damage is not a torn write, so the store
+refuses to start (`error.WalCorrupt`) instead of silently discarding them.
 
 ### Slug Path Resolution
 
@@ -916,7 +922,8 @@ The server creates these files in `DMOZDB_DATA_DIR`:
 | File            | Purpose                                                                 |
 |-----------------|-------------------------------------------------------------------------|
 | `store.dat`     | Main data file (16 KB pages: header + B+Tree nodes)                     |
-| `wal.bin`       | Write-ahead log (append-only; truncated on clean shutdown)              |
+| `wal.bin`       | Write-ahead log (append-only; truncated at every checkpoint)            |
+| `checkpoint.journal` | Page images of the checkpoint in progress; empty between checkpoints, redone on open if a crash left it complete |
 | `snapshot.meta` | 64-byte superblock written by op 22 / `dmoz_import`; records the WAL sequence at that point |
 
 ### Monitoring
@@ -936,16 +943,16 @@ The server handles `SIGINT` and `SIGTERM` via a self-pipe that wakes the epoll l
 
 1. Signal handler sets an atomic flag and writes a byte to the self-pipe
 2. Epoll loop wakes, detects the shutdown fd, and exits
-3. Background workers (memtable flusher, verifier, repair worker) are stopped
-4. Memtables are drained into the B+Trees and all dirty cache pages are flushed
-5. File header is persisted (page count, root page pointers, entry counts, ID counters)
-6. `wal.bin` is truncated, but only if steps 4 and 5 succeeded; otherwise it is kept for replay on the next boot
-7. All connections are closed
+3. Background workers (checkpointer, memtable flusher, verifier, repair worker) are stopped
+4. A final checkpoint runs: memtables drain into the B+Trees, every dirty page and the header go through
+   `checkpoint.journal` into `store.dat`, and `wal.bin` is truncated only after the header is durable; if any step
+   fails the WAL is kept for replay on the next boot
+5. All connections are closed
 
 ### Backup
 
-There is no online backup. Either stop the server, or take a snapshot (op 22) and copy immediately after it returns;
-`snapshot.meta` on its own is not a backup.
+There is no online backup. Either stop the server, or take a snapshot (op 22, a full checkpoint) and copy `store.dat`
+immediately after it returns, before the next checkpoint starts; `snapshot.meta` on its own is not a backup.
 
 ```bash
 # Stop the server for a consistent backup
