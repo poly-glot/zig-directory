@@ -51,7 +51,7 @@ spec:
             tcpSocket:
               port: 8080
             periodSeconds: 3
-            failureThreshold: 30
+            failureThreshold: 100
           livenessProbe:
             tcpSocket:
               port: 8080
