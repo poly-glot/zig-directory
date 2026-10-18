@@ -39,6 +39,9 @@ export const enum Op {
   BulkDeleteLinks = 35,
   CountsByStatus = 36,
   PutLinkVectors = 37,
+  QueryLinks = 38,
+  PutLinkEntities = 39,
+  MatchNames = 40,
   Ping = 255,
 }
 
@@ -113,6 +116,20 @@ export function statusToCode(s: LinkStatus): number {
   throw new Error(`statusToCode: cannot encode "${s}"`);
 }
 
+export const RELIGIONS = [
+  "islam",
+  "christianity",
+  "judaism",
+  "hinduism",
+  "buddhism",
+  "sikhism",
+  "taoism",
+  "jainism",
+  "bahai",
+  "shinto",
+  "paganism",
+] as const;
+export type Religion = typeof RELIGIONS[number];
 export interface Category {
   id: number;
   parentId: number;

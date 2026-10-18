@@ -9,6 +9,7 @@ pub const Op = enum(u8) {
     link_text_updated = 3,
     link_recategorized = 4,
     link_vectors_put = 5,
+    link_entities_put = 6,
     category_inserted = 10,
     category_deleted = 11,
     category_text_updated = 12,
@@ -70,6 +71,13 @@ pub const LinkRecatEffect = struct {
     new_chain_updates: []const AncestorUpdate,
 };
 
+pub const LinkEntitiesEntry = struct {
+    link_id: u64,
+    facts: []const u8,
+};
+pub const LinkEntitiesPutEffect = struct {
+    entries: []const LinkEntitiesEntry,
+};
 pub const LinkVectorsPutEffect = struct {
     model: u64,
     vectors: []const schema.LinkVector,
@@ -137,6 +145,7 @@ pub const ChangeSet = union(Op) {
     link_text_updated: LinkTextUpdateEffect,
     link_recategorized: LinkRecatEffect,
     link_vectors_put: LinkVectorsPutEffect,
+    link_entities_put: LinkEntitiesPutEffect,
     category_inserted: CategoryInsertEffect,
     category_deleted: CategoryDeleteEffect,
     category_text_updated: CategoryTextUpdateEffect,
@@ -325,6 +334,26 @@ test "encode/decode roundtrip — link_recategorized" {
     try std.testing.expectEqual(@as(u64, 5), e.old_category_id);
     try std.testing.expectEqual(@as(usize, 1), e.old_chain_updates.len);
     try std.testing.expectEqual(@as(usize, 2), e.new_chain_updates.len);
+}
+
+test "encode/decode roundtrip — link_entities_put" {
+    const allocator = std.testing.allocator;
+    const cs = ChangeSet{ .link_entities_put = .{ .entries = &.{
+        .{ .link_id = 7, .facts = "\x01\x01\x00\x01PK\x00\x00" },
+        .{ .link_id = 9, .facts = "\x01\x00\x00\x00\x00\x00" },
+    } } };
+
+    const encoded = try encode(allocator, cs);
+    defer allocator.free(encoded);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = try decode(arena.allocator(), encoded);
+
+    try std.testing.expectEqual(Op.link_entities_put, std.meta.activeTag(decoded));
+    const e = decoded.link_entities_put;
+    try std.testing.expectEqual(@as(usize, 2), e.entries.len);
+    try std.testing.expectEqual(@as(u64, 9), e.entries[1].link_id);
+    try std.testing.expectEqualSlices(u8, "\x01\x01\x00\x01PK\x00\x00", e.entries[0].facts);
 }
 
 test "encode/decode roundtrip — link_vectors_put" {

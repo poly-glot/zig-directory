@@ -42,7 +42,7 @@ RUN deno install --entrypoint _fresh/compiled-entry.js && \
     cd node_modules/.deno/onnxruntime-node@*/node_modules/onnxruntime-node/bin/napi-v6 && \
     rm -rf darwin win32 linux/x64 && \
     mv linux/arm64/libonnxruntime.so.1 /web/
-RUN deno run -A scripts/fetch-embedding-model.ts
+RUN deno run -A scripts/fetch-models.ts
 RUN deno compile \
     --output dmozdb-web \
     --include _fresh \
@@ -69,7 +69,10 @@ COPY --from=web-builder /web/dmozdb-web /usr/local/bin/dmozdb-web
 COPY --from=web-builder /web/libonnxruntime.so.1 /usr/local/lib/
 RUN ldconfig
 COPY --from=web-builder /web/data/models /opt/models
+COPY --from=web-builder /web/lib/data /opt/entity-data
 ENV EMBEDDING_MODEL_DIR=/opt/models/bge-small-en-v1.5
+ENV ENTITY_DATA_DIR=/opt/entity-data
+ENV NER_MODEL_DIR=/opt/models/bert-base-NER
 
 # compiled-entry.js reads PORT and HOSTNAME; bind all interfaces in-container.
 ENV HOSTNAME=0.0.0.0

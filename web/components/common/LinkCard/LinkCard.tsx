@@ -10,6 +10,7 @@ interface Props {
   crumb?: string;
   added?: string;
   monoSeed?: string;
+  footer?: ComponentChildren;
 }
 
 const ARROW_GLYPH = (
@@ -67,19 +68,19 @@ function monoVariant(seed: string): number {
 }
 
 export default function LinkCard(
-  { href, title, url, description, crumb, added, monoSeed }: Props,
+  { href, title, url, description, crumb, added, monoSeed, footer }: Props,
 ) {
   const titleText = plainText(title);
   const mono = monogramText(titleText);
   const variant = monoVariant(monoSeed ?? titleText ?? "x");
   const external = !!url;
   const target = external ? url : href;
-  return (
-    <a
-      class={`${styles.card} card`}
-      href={target}
-      {...(external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
-    >
+  const destination = {
+    href: target,
+    ...(external ? { target: "_blank", rel: "noopener noreferrer" } : {}),
+  };
+  const body = (
+    <>
       <div class={styles.head}>
         <span
           class={`${styles.mono} ${MONO_CLASSES[variant]}`}
@@ -106,6 +107,16 @@ export default function LinkCard(
           </div>
         )
         : null}
-    </a>
+    </>
+  );
+
+  if (!footer) {
+    return <a class={`${styles.card} card`} {...destination}>{body}</a>;
+  }
+  return (
+    <div class={`${styles.card} card`}>
+      <a class={styles.body} {...destination}>{body}</a>
+      {footer}
+    </div>
   );
 }

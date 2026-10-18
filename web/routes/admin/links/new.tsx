@@ -2,7 +2,7 @@ import { page } from "fresh";
 import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
 import { isHttpUrl } from "../../../lib/url.ts";
-import { storeLinkVector } from "../../../lib/embedder.ts";
+import { enrichLink } from "../../../lib/link-enrichment.ts";
 import { formField } from "../../../lib/utils.ts";
 import CreatePageShell from "../../../components/admin/CreatePageShell/CreatePageShell.tsx";
 import CategoryPicker from "../../../islands/CategoryPicker.tsx";
@@ -96,7 +96,7 @@ export const handler = define.handlers<Data>({
         values.title,
         values.description,
       );
-      await storeLinkVector(client, id);
+      await enrichLink(client, id);
     } catch (e) {
       return page({
         values,

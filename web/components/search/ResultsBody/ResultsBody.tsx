@@ -1,4 +1,4 @@
-import type { Category, Link } from "../../../lib/dmoz-client.ts";
+import type { Category, Link, SearchLink } from "../../../lib/dmoz-client.ts";
 import CategoryRow from "../../common/CategoryRow/CategoryRow.tsx";
 import SectionHead from "../../common/SectionHead/SectionHead.tsx";
 import { pad2 } from "../../../lib/format.ts";
@@ -11,7 +11,7 @@ interface Props {
   query: string;
   rawCats: Category[];
   allLinks: Link[];
-  filteredLinks: Link[];
+  filteredLinks: SearchLink[];
   tokens: string[];
   sort: Sort;
   activeCat: number;
@@ -97,7 +97,7 @@ function ListingsSection(
     sort: Sort;
     activeCat: number;
     activeYear: number;
-    filteredLinks: Link[];
+    filteredLinks: SearchLink[];
     tokens: string[];
     clearHref: string;
   },
@@ -124,7 +124,13 @@ function ListingsSection(
           : (
             <div class="cards fluid">
               {filteredLinks.map((l) => (
-                <ResultArticle key={l.id} link={l} tokens={tokens} />
+                <ResultArticle
+                  key={l.id}
+                  link={l}
+                  tokens={tokens}
+                  moreFromSite={l.moreFromSite}
+                  site={l.site}
+                />
               ))}
             </div>
           )}

@@ -81,3 +81,11 @@ export function truncate(text: string, max: number): string {
 export function formatCategoryName(name: string): string {
   return name.replace(/_/g, " ");
 }
+
+const ROOT_SLUG = "top";
+
+export function categoryPath(chain: Array<{ slug: string }>): string {
+  const [root, ...rest] = chain;
+  const visible = root?.slug === ROOT_SLUG ? rest : chain;
+  return visible.map((c) => c.slug).join("/");
+}

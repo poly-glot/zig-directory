@@ -1,15 +1,17 @@
+import type { ComponentChildren } from "preact";
 import Eyebrow from "../../common/Eyebrow/Eyebrow.tsx";
 import RecentQueries from "../../../islands/RecentQueries.tsx";
 import styles from "./Hero.module.css";
 
 interface Props {
   query: string;
-  categoryCount: number;
-  linkCount: number;
-  filteredCount: number;
-  hasFilters: boolean;
+  categoryCount?: number;
+  linkCount?: number;
+  filteredCount?: number;
+  hasFilters?: boolean;
   /** True when categoryCount or linkCount sits at the server cap. */
-  capped: boolean;
+  capped?: boolean;
+  summary?: ComponentChildren;
 }
 
 const SEARCH_GLYPH = (
@@ -83,15 +85,28 @@ function ResultCount(
 export default function Hero(
   {
     query,
-    categoryCount,
-    linkCount,
-    filteredCount,
-    hasFilters,
-    capped,
+    categoryCount = 0,
+    linkCount = 0,
+    filteredCount = 0,
+    hasFilters = false,
+    capped = false,
+    summary,
   }: Props,
 ) {
   const hasQuery = query.length > 0;
   const totalShown = categoryCount + linkCount;
+  const count = summary ??
+    (hasQuery && totalShown > 0
+      ? (
+        <ResultCount
+          categoryCount={categoryCount}
+          linkCount={linkCount}
+          filteredCount={filteredCount}
+          hasFilters={hasFilters}
+          capped={capped}
+        />
+      )
+      : null);
   return (
     <section class={styles.hero}>
       <div class="container">
@@ -99,7 +114,9 @@ export default function Hero(
         <h1 class="display mt-16">Find a site by describing it.</h1>
         <p class="lede mt-16">
           Editor-vetted results ranked by your words and by what they mean, so a
-          site can match without using your exact terms.
+          site can match without using your exact terms. Name a site, country,
+          category, religion or person, such as tripod.com or Pakistan, and the
+          results narrow to it.
         </p>
         <form
           action="/search"
@@ -117,19 +134,7 @@ export default function Hero(
           <button type="submit" class="btn">Search</button>
         </form>
         <RecentQueries />
-        {hasQuery && totalShown > 0
-          ? (
-            <div class={styles.count}>
-              <ResultCount
-                categoryCount={categoryCount}
-                linkCount={linkCount}
-                filteredCount={filteredCount}
-                hasFilters={hasFilters}
-                capped={capped}
-              />
-            </div>
-          )
-          : null}
+        {count ? <div class={styles.count}>{count}</div> : null}
       </div>
     </section>
   );

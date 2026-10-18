@@ -10,6 +10,7 @@ const histogram = zigstore.histogram;
 const binary_protocol = @import("binary_protocol.zig");
 const header_upgrade = @import("header_upgrade.zig");
 const vector_index = @import("vector_index.zig");
+const facts_index = @import("facts/facts_index.zig");
 const Config = @import("main.zig").Config;
 
 const log = std.log.scoped(.directory);
@@ -38,12 +39,23 @@ pub const schema_v5 = zigstore.schema(.{
     .counters = &v5_counters,
 });
 
-pub const schema = zigstore.schema(.{
+const v6_indexes = v5_indexes ++ .{.{ .name = "link_vectors", .key = .u64 }};
+const v6_counters = v5_counters ++ .{"embedding_model"};
+
+pub const schema_v6 = zigstore.schema(.{
     .magic = schema_v5.magic,
     .format_version = 6,
-    .indexes = v5_indexes ++ .{.{ .name = "link_vectors", .key = .u64 }},
+    .indexes = v6_indexes,
     .memtable_indexes = memtable_indexes,
-    .counters = &(v5_counters ++ .{"embedding_model"}),
+    .counters = &v6_counters,
+});
+
+pub const schema = zigstore.schema(.{
+    .magic = schema_v5.magic,
+    .format_version = 7,
+    .indexes = v6_indexes ++ .{.{ .name = "link_entities", .key = .u64 }},
+    .memtable_indexes = memtable_indexes,
+    .counters = &v6_counters,
 });
 
 pub const Store = zigstore.Engine(schema);
@@ -93,6 +105,9 @@ pub const Directory = struct {
 
     vectors: vector_index.VectorIndex,
     vector_loader: ?std.Thread,
+
+    facts: facts_index.FactsIndex,
+    facts_loader: ?std.Thread,
 
     next_category_id: std.atomic.Value(u64),
     next_link_id: std.atomic.Value(u64),
@@ -173,6 +188,10 @@ pub const Directory = struct {
         return self.store.tree("link_vectors");
     }
 
+    pub fn link_entities(self: *Self) *zigstore.BPlusTree {
+        return self.store.tree("link_entities");
+    }
+
     pub fn mt_categories_by_id(self: *Self) *zigstore.MemTable {
         return self.store.memtable("categories_by_id");
     }
@@ -217,7 +236,7 @@ pub const Directory = struct {
     }
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config) !*Self {
-        try header_upgrade.upgradeToV6(io, config.data_dir);
+        try header_upgrade.upgradeHeader(io, config.data_dir);
 
         const store = try Store.init(io, allocator, .{
             .data_dir = config.data_dir,
@@ -265,6 +284,8 @@ pub const Directory = struct {
             .url_bloom_seeder_stop = std.atomic.Value(bool).init(false),
             .vectors = .{ .model = .init(store.counter("embedding_model").*) },
             .vector_loader = null,
+            .facts = .{},
+            .facts_loader = null,
             .next_category_id = std.atomic.Value(u64).init(store.counter("next_category_id").*),
             .next_link_id = std.atomic.Value(u64).init(store.counter("next_link_id").*),
             .next_repair_seq = std.atomic.Value(u64).init(store.counter("next_repair_seq").*),
@@ -311,6 +332,26 @@ pub const Directory = struct {
             log.warn("vector loader failed to start — hybrid search stays keyword-only", .{});
             break :blk null;
         };
+        self.facts_loader = std.Thread.spawn(.{}, loadFactsInBackground, .{self}) catch blk: {
+            log.warn("facts loader failed to start — query_links answers not ready", .{});
+            break :blk null;
+        };
+    }
+
+    fn loadFactsInBackground(self: *Self) void {
+        const started = std.Io.Clock.awake.now(self.io);
+        @import("operations/operations.zig").loadFactsIndex(self) catch |err| {
+            log.warn("facts index load stopped: {} — query_links answers not ready", .{err});
+            return;
+        };
+        if (self.facts.ready.load(.acquire)) {
+            log.info("facts index loaded {d} links, {d} categories and entities for {d} links in {d} ms", .{
+                self.facts.linkCount(self.io),
+                self.facts.categoryCount(self.io),
+                self.facts.entityCount(self.io),
+                started.untilNow(self.io, .awake).toMilliseconds(),
+            });
+        }
     }
 
     fn loadVectorsInBackground(self: *Self) void {
@@ -418,6 +459,8 @@ pub const Directory = struct {
         if (self.url_bloom_seeder) |t| t.join();
         self.vectors.loader_stop.store(true, .release);
         if (self.vector_loader) |t| t.join();
+        self.facts.loader_stop.store(true, .release);
+        if (self.facts_loader) |t| t.join();
         if (self.checkpointer) |w| w.stop();
         if (self.repair_worker) |w| w.stop();
         if (self.verifier_worker) |w| w.stop();
@@ -433,6 +476,7 @@ pub const Directory = struct {
 
         self.url_bloom.deinit();
         self.vectors.deinit(self.allocator);
+        self.facts.deinit(self.allocator);
         self.subtree_cache.deinit();
 
         const allocator = self.allocator;

@@ -21,6 +21,8 @@ import {
   Op,
   readCategory,
   readLink,
+  type Religion,
+  RELIGIONS,
   Status,
   STATUS_MSG,
   statusToCode,
@@ -72,7 +74,11 @@ export interface Crumb {
 }
 
 /** A search-hit link carries which field matched: 0=title, 1=url, 2=description. */
-export type SearchLink = Link & { matchField: number };
+export type SearchLink = Link & {
+  matchField: number;
+  site: string;
+  moreFromSite: number;
+};
 
 const SEARCH_SCOPE_CODE = { both: 0, links: 1, categories: 2 } as const;
 const SEARCH_MODE_RANKED = 1;
@@ -85,6 +91,181 @@ export interface SearchResult {
   categories: Category[];
   links: SearchLink[];
   vectorUsed: boolean;
+}
+
+export const QUERY_LINKS_MAX_ROWS = 50;
+export const MATCH_NAMES_MAX = 32;
+export const MATCH_NAME_MAX_BYTES = 128;
+
+export interface NameMatch {
+  categoryId: number;
+  namesSomeone: boolean;
+}
+
+export type LinkQueryGroupBy =
+  | "none"
+  | "domain"
+  | "site"
+  | "host"
+  | "branch"
+  | "country"
+  | "religion"
+  | "person"
+  | "org";
+export type CountryEdge = "cctld" | "category" | "entity";
+export const COUNTRY_EDGES: readonly CountryEdge[] = [
+  "cctld",
+  "category",
+  "entity",
+];
+
+export interface LinkQuery {
+  categoryId?: number;
+  domain?: string;
+  country?: string;
+  via?: readonly CountryEdge[];
+  hostedOnly?: boolean;
+  status?: LinkStatus | "any";
+  words?: string;
+  allWords?: boolean;
+  religions?: readonly Religion[];
+  entity?: string;
+  groupBy?: LinkQueryGroupBy;
+  groupLimit?: number;
+  limit?: number;
+  afterId?: number;
+}
+
+export interface LinkQueryGroup {
+  label: string;
+  categoryId: number;
+  links: number;
+  sites: number;
+}
+
+export type QueriedLink = Link & {
+  site: string;
+  cctldCountry: string;
+  categoryCountry: string;
+  entityCountries: string[];
+  religions: Religion[];
+};
+
+export interface LinkQueryResult {
+  ready: boolean;
+  total: number;
+  sites: number;
+  hosts: number;
+  domains: number;
+  groups: LinkQueryGroup[];
+  links: QueriedLink[];
+  nextAfterId: number;
+}
+
+export interface LinkEntities {
+  religions: Religion[];
+  countries: string[];
+  people: string[];
+  orgs: string[];
+}
+
+export interface LinkEntityWrite {
+  linkId: number;
+  textFingerprint: bigint;
+  entities: LinkEntities;
+}
+
+export type LinkEntityWriteCode =
+  | "ok"
+  | "not_found"
+  | "stale_text"
+  | "invalid_facts";
+
+export const MAX_ENTITY_WRITES = 64;
+export const MAX_ENTITY_NAMES = 8;
+export const MAX_ENTITY_NAME_BYTES = 64;
+
+const LINK_ENTITY_WRITE_CODES: LinkEntityWriteCode[] = [
+  "ok",
+  "not_found",
+  "stale_text",
+  "invalid_facts",
+];
+const ENTITY_FORMAT_VERSION = 1;
+
+const LINK_QUERY_GROUP_BY_CODE: Record<LinkQueryGroupBy, number> = {
+  none: 0,
+  domain: 1,
+  site: 2,
+  host: 3,
+  branch: 4,
+  country: 5,
+  religion: 6,
+  person: 7,
+  org: 8,
+};
+const COUNTRY_EDGE_BIT: Record<CountryEdge, number> = {
+  cctld: 1,
+  category: 2,
+  entity: 4,
+};
+const ANY_STATUS_CODE = 0xff;
+
+function religionMask(religions: readonly Religion[]): number {
+  return religions.reduce((mask, r) => mask | (1 << RELIGIONS.indexOf(r)), 0);
+}
+
+function religionsFromMask(mask: number): Religion[] {
+  return RELIGIONS.filter((_, bit) => (mask & (1 << bit)) !== 0);
+}
+
+function linkQueryOptions(q: LinkQuery): bigint {
+  const status = q.status === "any"
+    ? ANY_STATUS_CODE
+    : statusToCode(q.status ?? "approved");
+  const via = (q.via ?? COUNTRY_EDGES).reduce(
+    (bits, edge) => bits | COUNTRY_EDGE_BIT[edge],
+    0,
+  );
+  const fields: Array<[value: number, bits: number]> = [
+    [via, 4],
+    [q.hostedOnly ? 1 : 0, 1],
+    [q.allWords ? 1 : 0, 1],
+    [LINK_QUERY_GROUP_BY_CODE[q.groupBy ?? "none"], 4],
+    [status, 8],
+    [q.groupLimit ?? 10, 8],
+    [q.limit ?? 20, 8],
+    [religionMask(q.religions ?? []), 16],
+  ];
+  let packed = 0n;
+  let shift = 0n;
+  for (const [value, bits] of fields) {
+    packed |= BigInt(value) << shift;
+    shift += BigInt(bits);
+  }
+  return packed;
+}
+
+function countryCode(r: BufferReader): string {
+  const first = r.u8();
+  const second = r.u8();
+  return first === 0 ? "" : String.fromCharCode(first, second);
+}
+
+function encodeEntities(entities: LinkEntities): Uint8Array {
+  const w = new BufferWriter()
+    .u8(ENTITY_FORMAT_VERSION)
+    .u16(religionMask(entities.religions))
+    .u8(entities.countries.length);
+  for (const code of entities.countries) w.raw(encoder.encode(code));
+  for (const names of [entities.people, entities.orgs]) {
+    w.u8(names.length);
+    for (const name of names) {
+      const bytes = encoder.encode(name);
+      w.u8(bytes.length).raw(bytes);
+    }
+  }
+  return w.build();
 }
 
 export interface QueryEmbedding {
@@ -593,12 +774,17 @@ export class DmozClient {
    */
   async breadcrumbsByIds(ids: number[]): Promise<Map<number, Crumb[]>> {
     const out = new Map<number, Crumb[]>();
-    for (let i = 0; i < ids.length; i += BREADCRUMBS_BY_IDS_MAX) {
-      const chunk = ids.slice(i, i + BREADCRUMBS_BY_IDS_MAX);
+    let start = 0;
+    while (start < ids.length) {
+      const chunk = ids.slice(start, start + BREADCRUMBS_BY_IDS_MAX);
       const w = new BufferWriter().u16(chunk.length);
       for (const id of chunk) w.u64(id);
       const resp = await this.request(Op.BreadcrumbsByIds, w.build());
       this.assertOk(resp);
+      if (resp.count === 0) {
+        throw new Error("breadcrumbsByIds: one chain exceeds the reply buffer");
+      }
+      start += resp.count;
       const r = new BufferReader(resp.payload);
       for (let g = 0; g < resp.count; g++) {
         const len = r.u16();
@@ -927,18 +1113,22 @@ export class DmozClient {
       scope?: "both" | "links" | "categories";
       mode?: "all_terms" | "ranked";
       queryEmbedding?: QueryEmbedding;
+      capPerSite?: boolean;
     } = {},
   ): Promise<SearchResult> {
     const limit = opts.limit ?? 20;
     const w = new BufferWriter().str(query).u32(limit);
     const scope = SEARCH_SCOPE_CODE[opts.scope ?? "both"];
     const embedding = opts.queryEmbedding;
+    const ranked = embedding !== undefined || opts.mode === "ranked";
+    const capPerSite = ranked && opts.capPerSite === true;
     if (embedding) {
       w.u8(scope).u8(SEARCH_MODE_HYBRID).raw(u64Bytes(embedding.model)).raw(
         f32Bytes(embedding.vector),
       );
     } else if (opts.mode === "ranked") w.u8(scope).u8(SEARCH_MODE_RANKED);
     else if (scope !== SEARCH_SCOPE_CODE.both) w.u8(scope);
+    if (capPerSite) w.u8(1);
     const resp = await this.request(Op.Search, w.build());
     this.assertOk(resp);
 
@@ -953,18 +1143,117 @@ export class DmozClient {
     );
     r.skip(catCount * CATEGORY_SIZE);
 
-    // New per-row layout: [Link struct][u8 match_field].
     const linkCount = r.u16();
     const links: SearchLink[] = [];
     for (let i = 0; i < linkCount; i++) {
       const link = readLink(new BufferReader(resp.payload, r.offset));
       r.skip(LINK_SIZE);
       const matchField = r.u8();
-      links.push({ ...link, matchField });
+      const site = capPerSite ? r.str() : "";
+      const moreFromSite = capPerSite ? r.u16() : 0;
+      links.push({ ...link, matchField, site, moreFromSite });
     }
 
     const vectorUsed = embedding !== undefined && r.u8() === 1;
     return { categories, links, vectorUsed };
+  }
+
+  async matchNames(phrases: readonly string[]): Promise<NameMatch[] | null> {
+    const w = new BufferWriter().u16(phrases.length);
+    for (const phrase of phrases) w.str(phrase);
+    const resp = await this.request(Op.MatchNames, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const ready = r.u8() === 1;
+    const matches = Array.from({ length: r.u16() }, () => ({
+      categoryId: r.u64(),
+      namesSomeone: r.u8() === 1,
+    }));
+    return ready ? matches : null;
+  }
+
+  async queryLinks(q: LinkQuery = {}): Promise<LinkQueryResult> {
+    const w = new BufferWriter()
+      .u64(q.categoryId ?? 0)
+      .str(q.domain ?? "")
+      .str(q.country ?? "")
+      .raw(u64Bytes(linkQueryOptions(q)))
+      .str(q.words ?? "")
+      .str(q.entity ?? "")
+      .u64(q.afterId ?? 0);
+    const resp = await this.request(Op.QueryLinks, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const ready = r.u8() === 1;
+    const total = r.u64();
+    const sites = r.u64();
+    const hosts = r.u64();
+    const domains = r.u64();
+    const groups = Array.from({ length: r.u16() }, () => ({
+      label: r.str(),
+      categoryId: r.u64(),
+      links: r.u64(),
+      sites: r.u64(),
+    }));
+
+    const linkCount = r.u16();
+    const links: QueriedLink[] = [];
+    for (let i = 0; i < linkCount; i++) {
+      const link = readLink(new BufferReader(resp.payload, r.offset));
+      r.skip(LINK_SIZE);
+      const site = r.str();
+      const cctldCountry = countryCode(r);
+      const categoryCountry = countryCode(r);
+      const religions = religionsFromMask(r.u16());
+      const entityCountries = Array.from(
+        { length: r.u8() },
+        () => countryCode(r),
+      );
+      links.push({
+        ...link,
+        site,
+        cctldCountry,
+        categoryCountry,
+        entityCountries,
+        religions,
+      });
+    }
+    return {
+      ready,
+      total,
+      sites,
+      hosts,
+      domains,
+      groups,
+      links,
+      nextAfterId: r.u64(),
+    };
+  }
+
+  async putLinkEntities(
+    writes: LinkEntityWrite[],
+  ): Promise<Array<{ linkId: number; code: LinkEntityWriteCode }>> {
+    if (writes.length === 0) return [];
+    if (writes.length > MAX_ENTITY_WRITES) {
+      throw new Error(`putLinkEntities: cap is ${MAX_ENTITY_WRITES}`);
+    }
+    const w = new BufferWriter().u16(writes.length);
+    for (const item of writes) {
+      const facts = encodeEntities(item.entities);
+      w.u64(item.linkId).raw(u64Bytes(item.textFingerprint)).u16(facts.length)
+        .raw(facts);
+    }
+    const resp = await this.request(Op.PutLinkEntities, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const total = r.u16() + r.u16();
+    return Array.from({ length: total }, () => ({
+      linkId: Number(r.u64()),
+      code: LINK_ENTITY_WRITE_CODES[r.u8()] ?? "invalid_facts",
+    }));
   }
 
   async putLinkVectors(

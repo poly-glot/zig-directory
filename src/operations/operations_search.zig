@@ -8,6 +8,7 @@ const link_mod = @import("operations_link.zig");
 const shared = @import("operations_shared.zig");
 const ranking = @import("../ranking.zig");
 const vector_index = @import("../vector_index.zig");
+const sites = @import("../facts/sites.zig");
 
 const log = shared.log;
 
@@ -57,17 +58,9 @@ pub fn searchCategoriesRanked(
     limit: u32,
     buf: []schema.Category,
 ) ![]schema.Category {
-    return searchRanked(
-        schema.Category,
-        db,
-        db.categories_index_tree(),
-        db.next_category_id.load(.monotonic),
-        MAX_POSTINGS_PER_TOKEN,
-        query,
-        limit,
-        buf,
-        category.getCategory,
-    );
+    const ranked = try rankedIds(db.allocator, db.categories_index_tree(), db.next_category_id.load(.monotonic), MAX_POSTINGS_PER_TOKEN, query);
+    defer db.allocator.free(ranked);
+    return fetchInRankOrder(schema.Category, db, ranked, limit, buf, category.getCategory);
 }
 
 pub fn searchLinksRanked(
@@ -75,18 +68,11 @@ pub fn searchLinksRanked(
     query: []const u8,
     limit: u32,
     buf: []schema.Link,
+    site_rows: ?[]RowSite,
 ) ![]schema.Link {
-    return searchRanked(
-        schema.Link,
-        db,
-        db.links_index_tree(),
-        linkCorpusSize(db),
-        MAX_POSTINGS_PER_TOKEN,
-        query,
-        limit,
-        buf,
-        link_mod.getLink,
-    );
+    const ranked = try rankedIds(db.allocator, db.links_index_tree(), linkCorpusSize(db), MAX_POSTINGS_PER_TOKEN, query);
+    defer db.allocator.free(ranked);
+    return fetchLinks(db, ranked, limit, buf, site_rows);
 }
 
 fn linkCorpusSize(db: *Directory) u64 {
@@ -103,7 +89,7 @@ fn searchTreeByToken(
     return postingsForToken(tree, token, allocator, std.math.maxInt(usize));
 }
 
-fn postingsForToken(
+pub fn postingsForToken(
     tree: *@import("zigstore").BPlusTree,
     token: []const u8,
     allocator: std.mem.Allocator,
@@ -176,22 +162,6 @@ fn inverseDocumentFrequency(corpus_size: u64, document_frequency: usize) f64 {
     return @log(1.0 + (n - df + 0.5) / (df + 0.5));
 }
 
-fn searchRanked(
-    comptime T: type,
-    db: *Directory,
-    tree: *@import("zigstore").BPlusTree,
-    corpus_size: u64,
-    postings_cap: usize,
-    query: []const u8,
-    limit: u32,
-    buf: []T,
-    comptime getter: fn (*Directory, u64) anyerror!?T,
-) ![]T {
-    const ranked = try rankedIds(db.allocator, tree, corpus_size, postings_cap, query);
-    defer db.allocator.free(ranked);
-    return fetchInRankOrder(T, db, ranked, limit, buf, getter);
-}
-
 fn rankedIds(
     allocator: std.mem.Allocator,
     tree: *@import("zigstore").BPlusTree,
@@ -250,6 +220,59 @@ fn fetchInRankOrder(
     return buf[0..count];
 }
 
+pub const RowSite = struct {
+    key_buf: [sites.MAX_SITE_LEN]u8 = undefined,
+    key_len: u8 = 0,
+    more: u16 = 0,
+
+    pub fn key(self: *const RowSite) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+};
+
+const MAX_LINKS_PER_SITE: u8 = 2;
+
+const SiteTally = struct {
+    shown: u8,
+    last_row: usize,
+};
+
+fn fetchLinks(db: *Directory, ranked: []const ScoredId, limit: u32, buf: []schema.Link, site_rows: ?[]RowSite) ![]schema.Link {
+    const rows = site_rows orelse return fetchInRankOrder(schema.Link, db, ranked, limit, buf, link_mod.getLink);
+    return fetchCappedPerSite(db, ranked, limit, buf, rows);
+}
+
+fn fetchCappedPerSite(db: *Directory, ranked: []const ScoredId, limit: u32, buf: []schema.Link, rows: []RowSite) ![]schema.Link {
+    const max = @min(limit, buf.len, rows.len);
+    var tallies: std.StringHashMapUnmanaged(SiteTally) = .empty;
+    defer tallies.deinit(db.allocator);
+    try tallies.ensureTotalCapacity(db.allocator, @intCast(max));
+
+    var count: usize = 0;
+    for (ranked) |hit| {
+        if (count == max) break;
+        const link = (link_mod.getLink(db, hit.id) catch null) orelse continue;
+
+        const row = &rows[count];
+        row.* = .{};
+        row.key_len = @intCast(sites.siteFor(link.url.slice(), &row.key_buf).key.len);
+
+        if (tallies.getPtr(row.key())) |tally| {
+            if (tally.shown >= MAX_LINKS_PER_SITE) {
+                rows[tally.last_row].more +|= 1;
+                continue;
+            }
+            tally.* = .{ .shown = tally.shown + 1, .last_row = count };
+        } else {
+            tallies.putAssumeCapacityNoClobber(row.key(), .{ .shown = 1, .last_row = count });
+        }
+
+        buf[count] = link;
+        count += 1;
+    }
+    return buf[0..count];
+}
+
 pub const HybridLinks = struct {
     links: []schema.Link,
     vector_used: bool,
@@ -262,6 +285,7 @@ pub fn searchLinksHybrid(
     query_embedding: *const vector_index.Embedding,
     limit: u32,
     buf: []schema.Link,
+    site_rows: ?[]RowSite,
 ) !HybridLinks {
     const keyword = try rankedIds(db.allocator, db.links_index_tree(), linkCorpusSize(db), MAX_POSTINGS_PER_TOKEN, query);
     defer db.allocator.free(keyword);
@@ -269,7 +293,7 @@ pub fn searchLinksHybrid(
 
     const quantized = if (vectorHalfUsable(db, model)) vector_index.quantize(query_embedding) else null;
     const q = quantized orelse return .{
-        .links = fetchInRankOrder(schema.Link, db, keyword, limit, buf, link_mod.getLink),
+        .links = try fetchLinks(db, keyword, limit, buf, site_rows),
         .vector_used = false,
     };
 
@@ -279,7 +303,7 @@ pub fn searchLinksHybrid(
     const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest });
     defer db.allocator.free(fused);
     return .{
-        .links = fetchInRankOrder(schema.Link, db, fused, limit, buf, link_mod.getLink),
+        .links = try fetchLinks(db, fused, limit, buf, site_rows),
         .vector_used = true,
     };
 }
@@ -478,7 +502,7 @@ test "ranked search: a query sharing only some terms still matches" {
     var buf: [8]schema.Link = undefined;
     try std.testing.expectEqual(@as(usize, 0), (try searchLinks(db, "alpha gamma", 8, &buf)).len);
 
-    const hits = try searchLinksRanked(db, "alpha gamma", 8, &buf);
+    const hits = try searchLinksRanked(db, "alpha gamma", 8, &buf, null);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(alpha, hits[0].id);
 }
@@ -498,7 +522,7 @@ test "ranked search: more matched terms rank first, then rarer terms" {
     const both = try link_mod.createLink(db, top_id, "https://example.com/5", "garden bonsai", "");
 
     var buf: [8]schema.Link = undefined;
-    const hits = try searchLinksRanked(db, "bonsai garden", 8, &buf);
+    const hits = try searchLinksRanked(db, "bonsai garden", 8, &buf, null);
     try std.testing.expectEqual(@as(usize, 5), hits.len);
     try std.testing.expectEqual(both, hits[0].id);
     try std.testing.expectEqual(rare_only, hits[1].id);
@@ -518,7 +542,7 @@ test "ranked search: equal scores break ties on ascending id" {
     _ = try link_mod.createLink(db, top_id, "https://example.com/3", "orchid", "");
 
     var buf: [2]schema.Link = undefined;
-    const hits = try searchLinksRanked(db, "orchid", 8, &buf);
+    const hits = try searchLinksRanked(db, "orchid", 8, &buf, null);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(first, hits[0].id);
     try std.testing.expectEqual(second, hits[1].id);
@@ -536,7 +560,7 @@ test "ranked search: repeated query terms count once" {
     const fern = try link_mod.createLink(db, top_id, "https://example.com/2", "fern", "");
 
     var buf: [8]schema.Link = undefined;
-    const hits = try searchLinksRanked(db, "orchid orchid orchid fern", 8, &buf);
+    const hits = try searchLinksRanked(db, "orchid orchid orchid fern", 8, &buf, null);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(orchid, hits[0].id);
     try std.testing.expectEqual(fern, hits[1].id);
@@ -554,20 +578,10 @@ test "ranked search: a token past the postings cap contributes nothing" {
     _ = try link_mod.createLink(db, top_id, "https://example.com/2", "www", "");
     const rare = try link_mod.createLink(db, top_id, "https://example.com/3", "www bonsai", "");
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchRanked(
-        schema.Link,
-        db,
-        db.links_index_tree(),
-        linkCorpusSize(db),
-        2,
-        "www bonsai",
-        8,
-        &buf,
-        link_mod.getLink,
-    );
-    try std.testing.expectEqual(@as(usize, 1), hits.len);
-    try std.testing.expectEqual(rare, hits[0].id);
+    const ranked = try rankedIds(allocator, db.links_index_tree(), linkCorpusSize(db), 2, "www bonsai");
+    defer allocator.free(ranked);
+    try std.testing.expectEqual(@as(usize, 1), ranked.len);
+    try std.testing.expectEqual(rare, ranked[0].id);
 }
 
 test "ranked search: categories rank by matched terms" {
@@ -585,4 +599,34 @@ test "ranked search: categories rank by matched terms" {
     const hits = try searchCategoriesRanked(db, "bonsai gardening tools", 8, &buf);
     try std.testing.expect(hits.len >= 2);
     try std.testing.expectEqual(both, hits[0].id);
+}
+
+test "ranked search: the per-site cap keeps two links a site, folds a domain's hosts together and counts the rest on its last row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try category.createCategory(db, 0, "Top", "top", "");
+    const first = try link_mod.createLink(db, top_id, "https://www.example.com/a", "Bonsai A", "");
+    const second = try link_mod.createLink(db, top_id, "https://shop.example.com/b", "Bonsai B", "");
+    _ = try link_mod.createLink(db, top_id, "https://example.com/c", "Bonsai C", "");
+    _ = try link_mod.createLink(db, top_id, "https://example.com/d", "Bonsai D", "");
+    const ada = try link_mod.createLink(db, top_id, "http://members.tripod.com/~ada/", "Bonsai Ada", "");
+    const bob = try link_mod.createLink(db, top_id, "http://members.tripod.com/~bob/", "Bonsai Bob", "");
+
+    var buf: [8]schema.Link = undefined;
+    var rows: [8]RowSite = undefined;
+    const hits = try searchLinksRanked(db, "bonsai", 8, &buf, &rows);
+
+    try std.testing.expectEqual(@as(usize, 4), hits.len);
+    for ([_]u64{ first, second, ada, bob }, hits) |expected, hit| try std.testing.expectEqual(expected, hit.id);
+
+    try std.testing.expectEqualStrings("example.com", rows[1].key());
+    try std.testing.expectEqual(@as(u16, 2), rows[1].more);
+    try std.testing.expectEqual(@as(u16, 0), rows[0].more);
+    try std.testing.expectEqualStrings("members.tripod.com/~ada", rows[2].key());
+    try std.testing.expectEqualStrings("members.tripod.com/~bob", rows[3].key());
+    try std.testing.expectEqual(@as(u16, 0), rows[3].more);
 }

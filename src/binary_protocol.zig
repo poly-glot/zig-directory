@@ -4,6 +4,10 @@ const protocol = zigstore.protocol;
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
 const operations = @import("operations/operations.zig");
+const facts_index = @import("facts/facts_index.zig");
+const countries = @import("facts/countries.zig");
+const url_facts = @import("facts/url_facts.zig");
+const entities = @import("facts/entities.zig");
 const subtree = @import("subtree.zig");
 
 const log = std.log.scoped(.binary);
@@ -56,7 +60,7 @@ pub fn mapErrorWithSubStatus(err: anyerror) StatusPair {
         error.OffsetTooLarge => .{ .status = .invalid, .sub_status = .offset_too_large },
         error.SnapshotInProgress => .{ .status = .err, .sub_status = .already_in_progress },
         error.EmbeddingModelMismatch => .{ .status = .invalid, .sub_status = .embedding_model_mismatch },
-        error.InvalidEmbeddingModel, error.TooManyVectors => .{ .status = .invalid, .sub_status = .none },
+        error.InvalidEmbeddingModel, error.TooManyVectors, error.TooManyEntityWrites => .{ .status = .invalid, .sub_status = .none },
         else => .{ .status = .err, .sub_status = .none },
     };
 }
@@ -95,6 +99,9 @@ pub const Op = enum(u8) {
     bulk_delete_links = 35,
     counts_by_status = 36,
     put_link_vectors = 37,
+    query_links = 38,
+    put_link_entities = 39,
+    match_names = 40,
     ping = 255,
 };
 
@@ -299,6 +306,9 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
         .bulk_delete_links => handleBulkDeleteLinks(db, resp, op_byte, payload),
         .counts_by_status => handleCountsByStatus(db, resp, op_byte),
         .put_link_vectors => handlePutLinkVectors(db, resp, op_byte, payload),
+        .query_links => handleQueryLinks(db, resp, op_byte, payload),
+        .put_link_entities => handlePutLinkEntities(db, resp, op_byte, payload),
+        .match_names => handleMatchNames(db, resp, op_byte, payload),
     };
 }
 
@@ -417,27 +427,20 @@ fn handleBreadcrumbsByIds(db: *Directory, resp: []u8, op_byte: u8, payload: []co
     var groups: u16 = 0;
     var i: usize = 0;
     while (i < want) : (i += 1) {
-        if (off + 2 > resp.len) break;
         const id = std.mem.readInt(u64, payload[2 + i * 8 ..][0..8], .little);
 
         var anc_buf: [64]schema.Category = undefined;
         const ancestors = operations.walkAncestors(db, id, &anc_buf) catch anc_buf[0..0];
         const self_cat = operations.getCategory(db, id) catch null;
+        const crumbs: usize = if (self_cat != null) ancestors.len + 1 else 0;
+        if (off + 2 + crumbs * CRUMB_SIZE > resp.len) break;
 
-        const len_off = off;
+        std.mem.writeInt(u16, resp[off..][0..2], @intCast(crumbs), .little);
         off += 2;
-        var written: u16 = 0;
         if (self_cat) |sc| {
-            if (off + (ancestors.len + 1) * CRUMB_SIZE <= resp.len) {
-                for (ancestors) |a| {
-                    off = writeCrumb(resp, off, a);
-                    written += 1;
-                }
-                off = writeCrumb(resp, off, sc);
-                written += 1;
-            }
+            for (ancestors) |a| off = writeCrumb(resp, off, a);
+            off = writeCrumb(resp, off, sc);
         }
-        std.mem.writeInt(u16, resp[len_off..][0..2], written, .little);
         groups += 1;
     }
 
@@ -786,17 +789,27 @@ fn searchCategoriesInMode(db: *Directory, mode: SearchMode, query: []const u8, m
     };
 }
 
-fn searchLinksInMode(db: *Directory, mode: SearchMode, query: []const u8, query_vector: []const u8, max: u32, buf: []schema.Link) !operations.HybridLinks {
+fn searchLinksInMode(db: *Directory, mode: SearchMode, query: []const u8, query_vector: []const u8, max: u32, buf: []schema.Link, site_rows: ?[]operations.RowSite) !operations.HybridLinks {
     return switch (mode) {
         .all_terms => .{ .links = try operations.searchLinks(db, query, max, buf), .vector_used = false },
-        .ranked => .{ .links = try operations.searchLinksRanked(db, query, max, buf), .vector_used = false },
+        .ranked => .{ .links = try operations.searchLinksRanked(db, query, max, buf, site_rows), .vector_used = false },
         .hybrid => {
             const model = std.mem.readInt(u64, query_vector[0..8], .little);
             var embedding: vector_index.Embedding = undefined;
             vector_index.readEmbedding(query_vector[8..][0..EMBEDDING_BYTES], &embedding);
-            return operations.searchLinksHybrid(db, query, model, &embedding, max, buf);
+            return operations.searchLinksHybrid(db, query, model, &embedding, max, buf, site_rows);
         },
     };
+}
+
+fn writeRowSite(resp: []u8, start: usize, row: *const operations.RowSite) usize {
+    var off = start;
+    std.mem.writeInt(u16, resp[off..][0..2], row.key_len, .little);
+    off += 2;
+    @memcpy(resp[off..][0..row.key_len], row.key());
+    off += row.key_len;
+    std.mem.writeInt(u16, resp[off..][0..2], row.more, .little);
+    return off + 2;
 }
 
 fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -809,7 +822,6 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
 
     const trailing = payload[2 + query_len + 4 ..];
     const options = trailing[0..@min(trailing.len, 2)];
-    const query_vector = trailing[options.len..];
     const scope: SearchScope = if (options.len >= 1)
         std.enums.fromInt(SearchScope, options[0]) orelse return writeErrorResp(resp, op_byte, .invalid)
     else
@@ -819,7 +831,12 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     else
         .all_terms;
     const expected_vector_len: usize = if (mode == .hybrid) HYBRID_QUERY_BYTES else 0;
-    if (query_vector.len != expected_vector_len) return writeErrorResp(resp, op_byte, .invalid);
+    const after_options = trailing[options.len..];
+    if (after_options.len != expected_vector_len and after_options.len != expected_vector_len + 1) return writeErrorResp(resp, op_byte, .invalid);
+    const query_vector = after_options[0..expected_vector_len];
+    const cap_byte: u8 = if (after_options.len > expected_vector_len) after_options[expected_vector_len] else 0;
+    if (cap_byte > 1 or (cap_byte == 1 and mode == .all_terms)) return writeErrorResp(resp, op_byte, .invalid);
+    const cap_per_site = cap_byte == 1;
 
     if (resp.len < RESPONSE_HEADER_SIZE + 4) return writeErrorResp(resp, op_byte, .err);
 
@@ -833,19 +850,23 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     var off = writeCountedCategoryRows(resp, RESPONSE_HEADER_SIZE, cats, 2);
 
     var link_buf: [SEARCH_MAX_RESULTS]schema.Link = undefined;
+    var row_sites: [SEARCH_MAX_RESULTS]operations.RowSite = undefined;
+    const site_rows: ?[]operations.RowSite = if (cap_per_site) &row_sites else null;
     const found: operations.HybridLinks = if (scope == .categories_only)
         .{ .links = link_buf[0..0], .vector_used = false }
     else
-        searchLinksInMode(db, mode, query, query_vector, max, &link_buf) catch .{ .links = link_buf[0..0], .vector_used = false };
+        searchLinksInMode(db, mode, query, query_vector, max, &link_buf, site_rows) catch .{ .links = link_buf[0..0], .vector_used = false };
     const links = found.links;
     const link_count_off = off;
     off += 2;
     var links_written: u16 = 0;
-    for (links) |*link| {
-        if (off + @sizeOf(schema.Link) + 1 > resp.len) break;
+    for (links, row_sites[0..links.len]) |*link, *row| {
+        const site_bytes: usize = if (cap_per_site) 4 + @as(usize, row.key_len) else 0;
+        if (off + @sizeOf(schema.Link) + 1 + site_bytes > resp.len) break;
         off = appendRow(resp, off, link);
         resp[off] = @intFromEnum(linkMatchField(link.*, query));
         off += 1;
+        if (cap_per_site) off = writeRowSite(resp, off, row);
         links_written += 1;
     }
     std.mem.writeInt(u16, resp[link_count_off..][0..2], links_written, .little);
@@ -858,6 +879,191 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
 
     writeOkHeader(resp, op_byte, off, 0);
     return off;
+}
+
+pub const QUERY_LINKS_MAX_ROWS: u8 = 50;
+const QUERY_LINKS_MAX_WORDS_BYTES: usize = 256;
+const ANY_STATUS: u8 = 0xFF;
+
+const QueryLinksOptions = packed struct(u64) {
+    via: u4 = 0,
+    hosted_only: bool = false,
+    all_words: bool = false,
+    group_by: u4 = 0,
+    status: u8 = ANY_STATUS,
+    group_limit: u8 = 0,
+    limit: u8 = 0,
+    religions: u16 = 0,
+    _unused: u14 = 0,
+};
+
+const query_links_fields = &[_]struct { []const u8, type }{
+    .{ "category_id", u64 },
+    .{ "domain", []const u8 },
+    .{ "country", []const u8 },
+    .{ "options", u64 },
+    .{ "words", []const u8 },
+    .{ "entity", []const u8 },
+    .{ "after_id", u64 },
+};
+
+fn handleQueryLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    const parsed = parsePayload(query_links_fields, payload) orelse return writeErrorResp(resp, op_byte, .invalid);
+    var domain_buf: [url_facts.MAX_HOST_LEN]u8 = undefined;
+    const request = linkQueryFrom(parsed.result, &domain_buf) orelse return writeErrorResp(resp, op_byte, .invalid);
+
+    var arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer arena.deinit();
+    const result = operations.queryLinks(db, request, arena.allocator()) catch |err| switch (err) {
+        error.NoSearchableWords => return writeErrorResp(resp, op_byte, .invalid),
+        else => return writeMappedError(resp, op_byte, err),
+    };
+
+    var body: std.Io.Writer = .fixed(resp[RESPONSE_HEADER_SIZE..]);
+    writeQueryLinksBody(&body, result) catch return writeErrorRespSub(resp, op_byte, .invalid, .buffer_too_small);
+    const len = RESPONSE_HEADER_SIZE + body.end;
+    writeOkHeader(resp, op_byte, len, @intCast(result.links.len));
+    return len;
+}
+
+fn linkQueryFrom(p: anytype, domain_buf: *[url_facts.MAX_HOST_LEN]u8) ?operations.LinkQuery {
+    const options: QueryLinksOptions = @bitCast(p.options);
+    const domain = std.mem.trimStart(u8, p.domain, ".");
+    if (domain.len > domain_buf.len or p.words.len > QUERY_LINKS_MAX_WORDS_BYTES) return null;
+    if (options.group_limit > QUERY_LINKS_MAX_ROWS or options.limit > QUERY_LINKS_MAX_ROWS) return null;
+    if (options.status != ANY_STATUS and options.status > @intFromEnum(schema.LinkStatus.rejected)) return null;
+    if (options.via > facts_index.Via.all or options.religions & ~entities.RELIGION_MASK != 0) return null;
+    if (p.entity.len > entities.MAX_NAME_LEN) return null;
+
+    const group_by = std.enums.fromInt(facts_index.GroupBy, options.group_by) orelse return null;
+    const country: ?countries.Code = switch (p.country.len) {
+        0 => null,
+        2 => if (countries.isAssigned(p.country[0..2].*)) p.country[0..2].* else return null,
+        else => return null,
+    };
+
+    return .{
+        .facts = .{
+            .category_id = p.category_id,
+            .domain_suffix = std.ascii.lowerString(domain_buf, domain),
+            .country = country,
+            .via = if (options.via == 0) facts_index.Via.all else options.via,
+            .religions = options.religions,
+            .entity_name = p.entity,
+            .hosted_only = options.hosted_only,
+            .status = if (options.status == ANY_STATUS) null else options.status,
+            .group_by = group_by,
+            .group_limit = options.group_limit,
+            .page_limit = options.limit,
+            .after_id = p.after_id,
+        },
+        .words = p.words,
+        .words_match = if (options.all_words) .all else .any,
+    };
+}
+
+fn writeQueryLinksBody(w: *std.Io.Writer, result: operations.LinkQueryResult) std.Io.Writer.Error!void {
+    const answer = result.answer;
+    try w.writeByte(@intFromBool(result.ready));
+    for ([_]u64{ answer.total, answer.sites, answer.hosts, answer.domains }) |n| try w.writeInt(u64, n, .little);
+
+    try w.writeInt(u16, @intCast(answer.groups.len), .little);
+    for (answer.groups) |group| {
+        try w.writeInt(u16, @intCast(group.label.len), .little);
+        try w.writeAll(group.label);
+        try w.writeInt(u64, group.category_id, .little);
+        try w.writeInt(u64, group.links, .little);
+        try w.writeInt(u64, group.sites, .little);
+    }
+
+    try w.writeInt(u16, @intCast(result.links.len), .little);
+    for (result.links) |item| {
+        try w.writeAll(std.mem.asBytes(&item.link));
+        try w.writeInt(u16, @intCast(item.row.site.len), .little);
+        try w.writeAll(item.row.site);
+        try w.writeAll(&item.row.cctld);
+        try w.writeAll(&item.row.category_country);
+        try w.writeInt(u16, item.row.religions, .little);
+        try w.writeByte(@intCast(item.row.entity_countries.len));
+        for (item.row.entity_countries) |code| try w.writeAll(&code);
+    }
+    try w.writeInt(u64, answer.next_after_id, .little);
+}
+
+fn handleMatchNames(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    if (payload.len < 2) return writeErrorResp(resp, op_byte, .invalid);
+    const count = std.mem.readInt(u16, payload[0..2], .little);
+    if (count == 0 or count > operations.MAX_NAME_MATCHES) return writeErrorResp(resp, op_byte, .invalid);
+
+    var phrases: [operations.MAX_NAME_MATCHES][]const u8 = undefined;
+    var off: usize = 2;
+    for (phrases[0..count]) |*phrase| {
+        if (off + 2 > payload.len) return writeErrorResp(resp, op_byte, .invalid);
+        const len = std.mem.readInt(u16, payload[off..][0..2], .little);
+        off += 2;
+        if (len == 0 or len > facts_index.MAX_FOLDED_NAME or off + len > payload.len) return writeErrorResp(resp, op_byte, .invalid);
+        phrase.* = payload[off..][0..len];
+        off += len;
+    }
+    if (off != payload.len) return writeErrorResp(resp, op_byte, .invalid);
+
+    var arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer arena.deinit();
+    var matches: [operations.MAX_NAME_MATCHES]operations.NameMatch = undefined;
+    const ready = operations.matchNames(db, arena.allocator(), phrases[0..count], matches[0..count]) catch |err| return writeMappedError(resp, op_byte, err);
+    const answered = if (ready) matches[0..count] else matches[0..0];
+
+    var body: std.Io.Writer = .fixed(resp[RESPONSE_HEADER_SIZE..]);
+    writeMatchNamesBody(&body, ready, answered) catch return writeErrorRespSub(resp, op_byte, .invalid, .buffer_too_small);
+    const len = RESPONSE_HEADER_SIZE + body.end;
+    writeOkHeader(resp, op_byte, len, @intCast(answered.len));
+    return len;
+}
+
+fn writeMatchNamesBody(w: *std.Io.Writer, ready: bool, matches: []const operations.NameMatch) std.Io.Writer.Error!void {
+    try w.writeByte(@intFromBool(ready));
+    try w.writeInt(u16, @intCast(matches.len), .little);
+    for (matches) |match| {
+        try w.writeInt(u64, match.category_id, .little);
+        try w.writeByte(@intFromBool(match.names_someone));
+    }
+}
+
+fn handlePutLinkEntities(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    if (payload.len < 2) return writeErrorResp(resp, op_byte, .invalid);
+    const count = std.mem.readInt(u16, payload[0..2], .little);
+    if (count == 0 or count > operations.MAX_ENTITY_WRITES) return writeErrorResp(resp, op_byte, .invalid);
+    if (resp.len < RESPONSE_HEADER_SIZE + 4 + @as(usize, count) * 9) return writeErrorResp(resp, op_byte, .err);
+
+    var writes: [operations.MAX_ENTITY_WRITES]operations.EntityWrite = undefined;
+    var off: usize = 2;
+    for (writes[0..count]) |*w| {
+        if (off + 18 > payload.len) return writeErrorResp(resp, op_byte, .invalid);
+        w.link_id = std.mem.readInt(u64, payload[off..][0..8], .little);
+        w.text_fingerprint = std.mem.readInt(u64, payload[off + 8 ..][0..8], .little);
+        const len = std.mem.readInt(u16, payload[off + 16 ..][0..2], .little);
+        off += 18;
+        if (len > entities.MAX_ENCODED_LEN or off + len > payload.len) return writeErrorResp(resp, op_byte, .invalid);
+        w.facts = payload[off..][0..len];
+        off += len;
+    }
+    if (off != payload.len) return writeErrorResp(resp, op_byte, .invalid);
+
+    var results: [operations.MAX_ENTITY_WRITES]operations.EntityWriteResult = undefined;
+    operations.putLinkEntities(db, writes[0..count], results[0..count]) catch |err| return writeMappedError(resp, op_byte, err);
+
+    var ok_count: u16 = 0;
+    var reply_off: usize = RESPONSE_HEADER_SIZE + 4;
+    for (writes[0..count], results[0..count]) |w, result| {
+        std.mem.writeInt(u64, resp[reply_off..][0..8], w.link_id, .little);
+        resp[reply_off + 8] = @intFromEnum(result);
+        reply_off += 9;
+        if (result == .ok) ok_count += 1;
+    }
+    std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], ok_count, .little);
+    std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE + 2 ..][0..2], count - ok_count, .little);
+    writeOkHeader(resp, op_byte, reply_off, 0);
+    return reply_off;
 }
 
 fn handlePutLinkVectors(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -2270,6 +2476,59 @@ test "search (op=14): mode byte selects ranked matching and absent mode keeps al
 
     pbuf[base + 1] = @intFromEnum(SearchMode.ranked);
     pbuf[base + 2] = 0;
+    pbuf[base + 3] = 0;
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 4]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+}
+
+test "search (op=14): a trailing cap byte keeps two links a site and the site's last row says how many more it had" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try operations.createCategory(db, 0, "Top", "top", "");
+    for ([_][]const u8{ "https://example.com/a", "https://example.com/b", "https://example.com/c", "https://example.com/d", "https://other.org/" }) |url| {
+        _ = try operations.createLink(db, top_id, url, "Bonsai Nursery", "");
+    }
+
+    const query = "bonsai";
+    var pbuf: [64]u8 = undefined;
+    std.mem.writeInt(u16, pbuf[0..2], query.len, .little);
+    @memcpy(pbuf[2..][0..query.len], query);
+    std.mem.writeInt(u32, pbuf[2 + query.len ..][0..4], 50, .little);
+    const base = 2 + query.len + 4;
+    pbuf[base] = @intFromEnum(SearchScope.links_only);
+    pbuf[base + 1] = @intFromEnum(SearchMode.ranked);
+    pbuf[base + 2] = 1;
+
+    var resp: [16384]u8 = undefined;
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 3]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+
+    var off: usize = RESPONSE_HEADER_SIZE + 2;
+    try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, resp[off..][0..2], .little));
+    off += 2;
+    const Row = struct { site: []const u8, more: u16 };
+    var rows: [3]Row = undefined;
+    for (&rows) |*row| {
+        off += @sizeOf(schema.Link) + 1;
+        const len = std.mem.readInt(u16, resp[off..][0..2], .little);
+        row.* = .{ .site = resp[off + 2 ..][0..len], .more = std.mem.readInt(u16, resp[off + 2 + len ..][0..2], .little) };
+        off += 4 + len;
+    }
+    try std.testing.expectEqual(@as(u16, 0), rows[0].more);
+    try std.testing.expectEqualStrings("example.com", rows[1].site);
+    try std.testing.expectEqual(@as(u16, 2), rows[1].more);
+    try std.testing.expectEqualStrings("other.org", rows[2].site);
+
+    pbuf[base + 2] = 2;
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 3]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    pbuf[base + 1] = @intFromEnum(SearchMode.all_terms);
+    pbuf[base + 2] = 1;
     _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 3]);
     try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
 }
@@ -2331,6 +2590,157 @@ test "put_link_vectors (op=37) and hybrid search (op=14 mode 2) frames" {
     try std.testing.expectEqual(link_id, std.mem.readInt(u64, resp[links_off + 2 ..][0..8], .little));
     try std.testing.expectEqual(@intFromEnum(MatchField.semantic), resp[links_off + 2 + @sizeOf(schema.Link)]);
     try std.testing.expectEqual(@as(u8, 1), resp[len - 1]);
+}
+
+fn queryLinksRequest(buf: []u8, category_id: u64, domain: []const u8, country: []const u8, options: QueryLinksOptions, words: []const u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeInt(u64, category_id, .little);
+    for ([_][]const u8{ domain, country }) |text| {
+        try w.writeInt(u16, @intCast(text.len), .little);
+        try w.writeAll(text);
+    }
+    try w.writeInt(u64, @bitCast(options), .little);
+    for ([_][]const u8{ words, "" }) |text| {
+        try w.writeInt(u16, @intCast(text.len), .little);
+        try w.writeAll(text);
+    }
+    try w.writeInt(u64, 0, .little);
+    return buf[0..w.end];
+}
+
+test "query_links (op=38) answers counts, groups and a hydrated page, and refuses bad options" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try operations.createCategory(db, 0, "Top", "top", "");
+    const arts = try operations.createCategory(db, top, "Arts", "arts", "");
+    const subdomain_site = try operations.createLink(db, arts, "http://samvak.tripod.com/", "Samvak", "");
+    _ = try operations.createLink(db, arts, "http://members.tripod.com/~fuzzy/", "Fuzzy", "");
+    _ = try operations.createLink(db, arts, "http://www.uet.edu.pk/", "UET", "");
+
+    const op = @intFromEnum(Op.query_links);
+    const by_site: QueryLinksOptions = .{ .status = 1, .group_by = @intFromEnum(facts_index.GroupBy.site), .group_limit = 10, .limit = 10 };
+    var req_buf: [256]u8 = undefined;
+    var resp: [16384]u8 = undefined;
+    const body = RESPONSE_HEADER_SIZE;
+
+    _ = handleQueryLinks(db, &resp, op, try queryLinksRequest(&req_buf, arts, "tripod.com", "", by_site, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u8, 0), resp[body]);
+
+    try operations.loadFactsIndex(db);
+    const len = handleQueryLinks(db, &resp, op, try queryLinksRequest(&req_buf, arts, ".Tripod.com", "", by_site, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u8, 1), resp[body]);
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, resp[body + 1 ..][0..8], .little));
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, resp[body + 9 ..][0..8], .little));
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, resp[8..10], .little));
+
+    var off: usize = body + 33;
+    const group_count = std.mem.readInt(u16, resp[off..][0..2], .little);
+    try std.testing.expectEqual(@as(u16, 2), group_count);
+    off += 2;
+    for (0..group_count) |_| off += 2 + std.mem.readInt(u16, resp[off..][0..2], .little) + 24;
+
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, resp[off..][0..2], .little));
+    off += 2;
+    try std.testing.expectEqual(subdomain_site, std.mem.readInt(u64, resp[off..][0..8], .little));
+    off += @sizeOf(schema.Link);
+    const site_len = std.mem.readInt(u16, resp[off..][0..2], .little);
+    try std.testing.expectEqualStrings("samvak.tripod.com", resp[off + 2 ..][0..site_len]);
+    const row_tail = 4 + 2 + 1;
+    try std.testing.expectEqual(len - 8, off + 2 + site_len + row_tail + @sizeOf(schema.Link) + 2 + "members.tripod.com/~fuzzy".len + row_tail);
+
+    _ = handleQueryLinks(db, &resp, op, try queryLinksRequest(&req_buf, 0, "", "ZZ", by_site, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+    _ = handleQueryLinks(db, &resp, op, try queryLinksRequest(&req_buf, 0, "", "", .{ .limit = QUERY_LINKS_MAX_ROWS + 1 }, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+    _ = handleQueryLinks(db, &resp, op, try queryLinksRequest(&req_buf, 0, "", "", .{ .group_by = 9 }, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+    _ = handleQueryLinks(db, &resp, op, try queryLinksRequest(&req_buf, 0, "", "", .{}, "a"));
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+}
+
+test "match_names (op=40) answers each phrase with its largest same-named category and refuses a short frame" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+    try operations.loadFactsIndex(db);
+
+    const top = try operations.createCategory(db, 0, "Top", "top", "");
+    const arts = try operations.createCategory(db, top, "Arts", "arts", "");
+    _ = try operations.createLink(db, arts, "http://one.example.com/", "One", "");
+
+    var req: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&req);
+    try w.writeInt(u16, 2, .little);
+    for ([_][]const u8{ "Art", "no such thing" }) |phrase| {
+        try w.writeInt(u16, @intCast(phrase.len), .little);
+        try w.writeAll(phrase);
+    }
+
+    var resp: [512]u8 = undefined;
+    const op = @intFromEnum(Op.match_names);
+    _ = handleMatchNames(db, &resp, op, req[0 .. w.end - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    _ = handleMatchNames(db, &resp, op, req[0..w.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    const body = resp[RESPONSE_HEADER_SIZE..];
+    try std.testing.expectEqual(@as(u8, 1), body[0]);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, body[1..3], .little));
+    try std.testing.expectEqual(arts, std.mem.readInt(u64, body[3..11], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, body[12..20], .little));
+}
+
+test "put_link_entities (op=39) answers per-item codes and query_links (op=38) filters on what it stored" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+    try operations.loadFactsIndex(db);
+
+    const top = try operations.createCategory(db, 0, "Top", "top", "");
+    const link_id = try operations.createLink(db, top, "http://www.breslov.org/", "Breslov", "Rebbe Nachman of Breslov");
+    const link = (try operations.getLink(db, link_id)).?;
+    const facts = "\x01\x04\x00\x01UA\x01\x0dRebbe Nachman\x00";
+
+    var put: [2 + 18 + facts.len + 18 + 3]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&put);
+    try w.writeInt(u16, 2, .little);
+    try w.writeInt(u64, link_id, .little);
+    try w.writeInt(u64, schema.linkTextFingerprint(link), .little);
+    try w.writeInt(u16, facts.len, .little);
+    try w.writeAll(facts);
+    try w.writeInt(u64, link_id, .little);
+    try w.writeInt(u64, schema.linkTextFingerprint(link), .little);
+    try w.writeInt(u16, 3, .little);
+    try w.writeAll("\x02\x00\x00");
+
+    var resp: [16384]u8 = undefined;
+    _ = handlePutLinkEntities(db, &resp, @intFromEnum(Op.put_link_entities), put[0 .. put.len - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    _ = handlePutLinkEntities(db, &resp, @intFromEnum(Op.put_link_entities), &put);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], .little));
+    try std.testing.expectEqual(@as(u8, 0), resp[RESPONSE_HEADER_SIZE + 4 + 8]);
+    try std.testing.expectEqual(@as(u8, 3), resp[RESPONSE_HEADER_SIZE + 4 + 9 + 8]);
+
+    var req_buf: [256]u8 = undefined;
+    const judaism: u16 = @as(u16, 1) << @intFromEnum(entities.Religion.judaism);
+    _ = handleQueryLinks(db, &resp, @intFromEnum(Op.query_links), try queryLinksRequest(&req_buf, 0, "", "UA", .{ .status = 1, .religions = judaism, .limit = 5 }, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE + 1 ..][0..8], .little));
+
+    _ = handleQueryLinks(db, &resp, @intFromEnum(Op.query_links), try queryLinksRequest(&req_buf, 0, "", "", .{ .religions = 0x8000 }, ""));
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
 }
 
 test "list_all_links with out-of-range status returns invalid" {
@@ -2512,6 +2922,31 @@ test "breadcrumbs_by_ids (30): unresolved id yields an empty group, preserving o
     try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, resp[off..][0..2], .little));
     off += 2;
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[off..][0..2], .little));
+}
+
+test "breadcrumbs_by_ids (30): a reply too small for every chain answers a prefix, never an empty chain for a known id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try operations.createCategory(db, 0, "Top", "top", "");
+    const arts = try operations.createCategory(db, top, "Arts", "arts", "");
+    const music = try operations.createCategory(db, arts, "Music", "music", "");
+
+    var payload: [2 + 16]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 2, .little);
+    std.mem.writeInt(u64, payload[2..][0..8], music, .little);
+    std.mem.writeInt(u64, payload[10..][0..8], music, .little);
+
+    var resp: [RESPONSE_HEADER_SIZE + 2 + 3 * CRUMB_SIZE + 2 + CRUMB_SIZE]u8 = undefined;
+    const reply_len = handleBreadcrumbsByIds(db, &resp, @intFromEnum(Op.breadcrumbs_by_ids), &payload);
+
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[8..10], .little));
+    try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], .little));
+    try std.testing.expectEqual(RESPONSE_HEADER_SIZE + 2 + 3 * CRUMB_SIZE, reply_len);
 }
 
 fn fuzzProcessFramesOne(_: void, smith: *std.testing.Smith) anyerror!void {

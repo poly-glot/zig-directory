@@ -6,7 +6,7 @@ import {
   type LinkStatus,
 } from "../../../../lib/dmoz-client.ts";
 import { formField } from "../../../../lib/utils.ts";
-import { storeLinkVector } from "../../../../lib/embedder.ts";
+import { enrichLink } from "../../../../lib/link-enrichment.ts";
 import AdminShell from "../../../../components/admin/AdminShell/AdminShell.tsx";
 import AdminStatusChip from "../../../../components/admin/AdminStatusChip/AdminStatusChip.tsx";
 import EditForm from "../../../../components/admin/EditForm/EditForm.tsx";
@@ -96,7 +96,7 @@ export const handler = define.handlers<Data>({
             url: formField(form, "url"),
             description: formField(form, "description"),
           });
-          await storeLinkVector(client, id);
+          await enrichLink(client, id);
           if (newStatus !== link.status) {
             await client.updateLinkStatus(id, newStatus);
           }

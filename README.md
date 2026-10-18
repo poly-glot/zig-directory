@@ -107,13 +107,13 @@ worker and the binary-protocol op handlers.
 
 The store lives in `DMOZDB_DATA_DIR` as `store.dat` (16 KB pages), `wal.bin` and `snapshot.meta`:
 
-- **Page 0**: file header (magic `DMOZ` / `0x444D4F5A`, `format_version` 6, a root page + entry count per index, the
+- **Page 0**: file header (magic `DMOZ` / `0x444D4F5A`, `format_version` 7, a root page + entry count per index, the
   three ID counters `next_category_id`, `next_link_id`, `next_repair_seq`, and the `embedding_model` id). A format 5
-  header is rewritten to format 6 at boot; data pages are untouched
+  or 6 header is rewritten to format 7 at boot, one format at a time; data pages are untouched
 - **Pages 1+**: B+Tree nodes. Every root is allocated lazily on first insert and recorded in the header, so no page
   number is fixed beyond page 0
 
-Twelve B+Trees back the read and write paths; the first six are also fronted by a memtable:
+Thirteen B+Trees back the read and write paths; the first six are also fronted by a memtable:
 
 | Index                       | Key                       | Value                     | Memtable | Purpose                                            |
 |-----------------------------|---------------------------|---------------------------|----------|----------------------------------------------------|
@@ -129,6 +129,7 @@ Twelve B+Trees back the read and write paths; the first six are also fronted by 
 | `links_index_tree`          | token ‖ link ID (BE)      | (empty)                   | no       | Posting list for link text search                  |
 | `slug_path_repair_queue`    | repair_seq (BE)           | RepairTask (2,080 bytes)  | no       | Pending descendant slug-path cleanups              |
 | `link_vectors`              | link ID                   | LinkVector (400 bytes)    | no       | int8 embedding per link for hybrid search          |
+| `link_entities`             | link ID                   | Entity facts (<= 1,062 B) | no       | Places, religions, people and orgs a link names    |
 
 ### Network Layer
 
@@ -343,6 +344,9 @@ Response: [u32 len][u8 op][u8 status][u8 sub_status][u8 pad][u16 count][payload.
 | 35     | `bulk_delete_links`       | no      | Delete up to 200 links, per-item result codes                            |
 | 36     | `counts_by_status`        | no      | Link counts per status                                                   |
 | 37     | `put_link_vectors`        | no      | Store up to 32 link embeddings, per-item result codes                    |
+| 38     | `query_links`             | no      | Count, filter and group links by domain, site, country, category, words  |
+| 39     | `put_link_entities`       | no      | Store up to 64 link entity records, per-item result codes                |
+| 40     | `match_names`             | no      | Per phrase: the largest category with that name, and whether links name it |
 | 255    | `ping`                    | no      | Ping/pong                                                                |
 
 Codes 21 and 31–33 are unassigned.
@@ -469,12 +473,16 @@ Each crumb list runs root-first and ends with the category itself; an unknown ID
 ```
 Request:  [u16 query_len (>= 2)][query][u32 limit][optional u8 scope: 0=both 1=links_only 2=categories_only]
           [optional u8 mode: 0=all_terms 1=ranked 2=hybrid][hybrid only: u64 model][384 x f32 LE query embedding]
-Response: [u16 cat_count][categories...][u16 link_count][link_count x ([Link bytes][u8 match_field])]
-          [hybrid only: u8 vector_used]
+          [optional u8 cap_per_site: 0 or 1, ranked and hybrid only]
+Response: [u16 cat_count][categories...][u16 link_count][link_count x ([Link bytes][u8 match_field]
+          [cap_per_site = 1 only: u16 len][site][u16 more])][hybrid only: u8 vector_used]
 ```
 
 `limit` is capped at 50 per kind. `match_field` is 0=title, 1=url, 2=description, 3=semantic (found by the vector half
 only). An absent mode byte means `all_terms`. `vector_used` is 0 when the server answered from keywords alone.
+`cap_per_site` = 1 keeps at most two links from one site, with sites decided as for `query_links`, so
+`members.tripod.com/~a` and `members.tripod.com/~b` are two sites. The last row kept for a site gives in `more` how
+many of its links the cap passed over before the page filled.
 
 **Put link vectors (op=37)**
 ```
@@ -485,6 +493,50 @@ Response: [u16 ok][u16 err][(ok + err) x ([u64 link_id][u8 code])]
 `text_fingerprint` is FNV-1a 64 over `title ++ 0x00 ++ description`. Codes: 0=ok, 1=not_found, 2=stale_text (the
 link's text changed since it was embedded), 3=invalid_vector (non-finite or zero). The server L2-normalises and
 quantises to int8. A `model` of 0, or one different from the stored model, is refused for the whole frame.
+
+**Query links (op=38)**
+```
+Request:  [u64 category_id (0 = all)][u16 len][domain suffix][u16 len][ISO country or empty]
+          [u64 options][u16 len][words][u16 len][entity name or empty][u64 after_id]
+Options:  bits 0-3 country edges (1 ccTLD, 2 category, 4 entity; 0 all), bit 4 hosted sites only,
+          bit 5 all words, bits 6-9 group by (0 none, 1 domain, 2 site, 3 host, 4 branch, 5 country,
+          6 religion, 7 person, 8 organisation), bits 10-17 status (0xFF any), bits 18-25 group limit (<= 50),
+          bits 26-33 page limit (<= 50), bits 34-49 religions (one bit each; 0 any)
+Response: [u8 ready][u64 links][u64 sites][u64 hosts][u64 domains]
+          [u16 group_count][group_count x ([u16 len][label][u64 branch_id][u64 links][u64 sites])]
+          [u16 link_count][link_count x ([Link bytes][u16 len][site][2 ccTLD country][2 category country]
+                                         [u16 religions][u8 n][n x 2 entity country])]
+          [u64 next_after_id]
+```
+
+`ready` is 0 until the facts index has loaded after boot. A domain suffix matches whole labels, so `tripod.com`
+covers every `*.tripod.com` host and never `nottripod.com`. Words use the search postings; a value with no
+searchable word is `invalid`. Religion bits follow islam, christianity, judaism, hinduism, buddhism, sikhism, taoism,
+jainism, bahai, shinto, paganism (`RELIGIONS` in the generated client). An entity name matches a whole person or
+organisation name the link carries, ignoring ASCII case.
+
+**Put link entities (op=39)**
+```
+Request:  [u16 count (1..64)][count x ([u64 link_id][u64 text_fingerprint][u16 len][record])]
+Record:   [u8 version = 1][u16 religions][u8 n (<= 8)][n x 2 ISO country]
+          [u8 n (<= 8)][n x ([u8 len (1..64)][UTF-8 person])][u8 n (<= 8)][n x ([u8 len (1..64)][UTF-8 org])]
+Response: [u16 ok][u16 err][(ok + err) x ([u64 link_id][u8 code])]
+```
+
+Codes: 0=ok, 1=not_found, 2=stale_text, 3=invalid_facts (the record does not decode, or names an unknown religion
+or an unassigned country). A put replaces the link's record. `text_fingerprint` is the same FNV-1a 64 as op 37.
+
+**Match names (op=40)**
+```
+Request:  [u16 count (1..32)][count x ([u16 len (1..128)][phrase])]
+Response: [u8 ready][u16 count][count x ([u64 category_id][u8 names_someone])]
+```
+
+A phrase matches a category whose name has the same words in any case, with a final `s` dropped from words longer
+than three letters, so `art` finds `Arts` and `kids and teens` finds `Kids_and_Teens`. Of several such categories
+the one with the most links in its subtree wins; `category_id` is 0 when none matches. `names_someone` is 1 when
+some link's entity record names a person or organisation with exactly this name in any case. `ready` is 0, with no
+rows, until the facts index has loaded.
 
 ### Update Operations
 
@@ -725,9 +777,15 @@ zig-directory/
 │   ├── changeset.zig                     Typed ChangeSet effects + encoder/decoder (WAL op 100)
 │   ├── subtree.zig                       Descendant collection and cache for browse_path / list_subtree_links
 │   ├── verifier.zig                      Background invariant verifier (warn-only)
-│   ├── header_upgrade.zig                Boot-time store.dat header rewrite, format 5 → 6
+│   ├── header_upgrade.zig                Boot-time store.dat header rewrite, format 5 → 6 → 7
 │   ├── ranking.zig                       Scored ids, bounded top-k, reciprocal rank fusion
 │   ├── vector_index.zig                  In-memory int8 link-vector matrix and nearest scan
+│   ├── facts/
+│   │   ├── facts_index.zig               In-memory link and category facts, kept in step by the apply path
+│   │   ├── url_facts.zig                 Host, registrable domain, label-boundary suffixes, ccTLD country
+│   │   ├── sites.zig                     Site identity on hosting platforms
+│   │   ├── entities.zig                  Entity record format: religions, countries, people, organisations
+│   │   ├── countries.zig, countries.tsv  ISO 3166 names and aliases
 │   ├── e2e_test.zig                      End-to-end tests against a temp data dir
 │   ├── test_support.zig                  Test-only fixtures: category/link builders, isPresent, tokenKey
 │   ├── gen_client_ts.zig                 Driver for `zig build gen-client-ts`
@@ -745,6 +803,7 @@ zig-directory/
 │   │   ├── operations_link.zig           Link CRUD, status, duplicate check, status recount
 │   │   ├── operations_search.zig         Posting-list search: all-terms, IDF-ranked, hybrid
 │   │   ├── operations_vector.zig         put_link_vectors and the background matrix load
+│   │   ├── operations_facts.zig          query_links, put_link_entities and the background facts load
 │   │   └── operations_slug.zig           Slug validation and slug-path resolution
 │   ├── repair/
 │   │   ├── repair.zig                    rebuild_index (op 20)
@@ -756,7 +815,7 @@ zig-directory/
 │   ├── workloads/                        seed, create_link, bulk_import, get_link, browse, search, mixed, cold
 │   ├── run-constrained.sh, run-server-constrained.sh
 │   └── README.md
-├── web/                                  Deno/Fresh frontend and query/link embedder; web/lib/dmoz-protocol.gen.ts is generated
+├── web/                                  Deno/Fresh frontend, embedder and entity extractor; web/lib/dmoz-protocol.gen.ts is generated
 ├── mcp/                                  FastMCP server over the frontend's /api/v1
 ├── e2e/                                  Playwright suite for the web frontend
 ├── k6/                                   k6 stress script
@@ -941,6 +1000,32 @@ Full-text search is served by two on-disk B+Trees: `categories_index_tree` and `
 - `hybrid` runs `ranked` for the top 200 keyword candidates and a flat int8 dot-product scan over the in-memory vector matrix for the top 200 nearest links, then fuses the two lists with reciprocal rank fusion (k = 60). If the query's model differs from the stored one, or the matrix is still loading after boot, it answers from keywords alone and clears `vector_used`.
 
 **Vectors.** The web tier embeds text with `bge-small-en-v1.5` (int8 ONNX, CLS pooling, 384 dimensions) and writes link vectors with `put_link_vectors`; dmozdb never runs a model. A title or description edit, or a delete, removes the link's vector in the same apply, and a write carrying a stale text fingerprint is refused, so a stored vector always matches the link's current text. The matrix is rebuilt from `link_vectors` by a background thread after the port opens.
+
+**Graph facts.** `query_links` answers filter, count and group questions that ranking cannot ("how many sites
+are hosted on tripod.com"). An in-memory facts index, loaded after the port opens and kept in step by the
+apply path, holds per link its host, registrable domain, site and ccTLD country, and per category its parent,
+the country it is named for, its top-level branch and its place in a depth-first order, so a subtree test is
+two integer comparisons. A site is the unit a person publishes: a subdomain on hosting platforms such as
+tripod or blogspot, the leading path segments on path platforms (`members.tripod.com/{name}`,
+`angelfire.com/{area}/{name}`, `groups.yahoo.com/group/{name}`), a `~user` path on any host, and otherwise
+the registrable domain. A category named for a country ties its subtree to it, outermost name first
+(`United_States > Georgia` is the US), except under alphabet buckets and breed or food categories.
+
+**Entity facts.** The web tier reads each link's title and description for the places, religions, people and
+organisations it names (ONNX `bert-base-NER` spans, a gazetteer built from GeoNames, a religion lexicon) and writes
+them with `put_link_entities`; as with vectors, dmozdb never runs a model, and a title or description change or a
+delete drops the record. A named place is a third country edge beside the ccTLD and the category, so `query_links`
+can ask for links tied to Pakistan by any edge, about Islam, or naming Jamia Farooqia.
+
+**Asking in words.** The search page reads a query for the things `query_links` can filter on and targets them,
+so "show me links in art category under Pakistan for islam" lists links in Arts, tied to Pakistan and about Islam.
+It finds domains by shape, countries by name, alias or nationality, and religions by name, using the extractor's
+own lexicons. `match_names` finds categories and people or organisations. A category is targeted when the
+sentence points at it ("in jazz", "the arts category") or its name has a word that is not in the corpus's
+common lowercase words ("pink floyd"); a person or organisation needs two or more words, one of them uncommon,
+so "web design" stays words. Each target shows as a chip that removes it, the words left over must appear in a
+link, and when nothing matches the page offers the count with each target dropped. `site:`, `country:`, `in:`,
+`religion:` and `name:` state a target outright and are what the chips link to.
 
 **Materialisation.** The first `limit` (at most 50) IDs are hydrated via `getLink` / `getCategory` (memtable → primary B+Tree). Documents that no longer exist (deleted between indexing and search) are silently skipped. Each link row carries a `match_field` byte telling the client whether the title, URL or description matched, or that only the vector half found it.
 

@@ -1,4 +1,5 @@
 import { Tokenizer } from "@huggingface/tokenizers";
+import { onnxRuntime } from "./onnx-runtime.ts";
 import {
   type DmozClient,
   EMBEDDING_DIMS,
@@ -41,8 +42,7 @@ function embedder(): Promise<Embed> {
 }
 
 async function loadEmbedder(dir: string): Promise<Embed> {
-  Deno.env.set("ORT_DISABLE_TELEMETRY", "1");
-  const ort = await import("onnxruntime-node");
+  const ort = await onnxRuntime();
   const tokenizer = new Tokenizer(
     JSON.parse(await Deno.readTextFile(`${dir}/tokenizer.json`)),
     JSON.parse(await Deno.readTextFile(`${dir}/tokenizer_config.json`)),

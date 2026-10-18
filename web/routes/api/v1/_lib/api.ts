@@ -8,7 +8,6 @@ import { formatCategoryName } from "../../../../lib/format.ts";
 
 const MAX_PAGE_SIZE = 50;
 const DEFAULT_PAGE_SIZE = 20;
-const ROOT_SLUG = "top";
 
 const HTTP_STATUS_BY_DMOZ_STATUS: Record<number, number> = {
   [Status.NotFound]: 404,
@@ -25,12 +24,6 @@ export function pageSize(raw: string | null): number {
 export function nonNegativeInt(raw: string | null): number {
   const n = parseInt(raw ?? "", 10);
   return Number.isFinite(n) && n >= 0 ? n : 0;
-}
-
-export function categoryPath(chain: Array<{ slug: string }>): string {
-  const [root, ...rest] = chain;
-  const visible = root?.slug === ROOT_SLUG ? rest : chain;
-  return visible.map((c) => c.slug).join("/");
 }
 
 export function categoryJson(c: Category, path: string) {

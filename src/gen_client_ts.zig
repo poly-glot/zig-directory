@@ -3,6 +3,7 @@ const zigstore = @import("zigstore");
 const tsgen = zigstore.tsgen;
 const protocol = @import("binary_protocol.zig");
 const schema = @import("schema.zig");
+const entities = @import("facts/entities.zig");
 
 const FixedStringMeta = struct { capacity: usize };
 
@@ -63,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     try writeStructSize(w, "CATEGORY_SIZE", schema.Category);
     try writeStructSize(w, "LINK_SIZE", schema.Link);
     try writeLinkStatusEnum(w);
+    try writeReligions(w);
     try tsgen.writeStructInterface(w, FieldTable, "Category", schema.Category);
     try tsgen.writeStructInterface(w, FieldTable, "Link", schema.Link);
     try tsgen.writeStructReader(w, FieldTable, "Category", schema.Category);
@@ -85,6 +87,14 @@ fn writeHeader(w: *std.Io.Writer) !void {
 
 fn writeStructSize(w: *std.Io.Writer, comptime name: []const u8, comptime T: type) !void {
     try w.print("export const {s} = {d};\n", .{ name, @sizeOf(T) });
+}
+
+fn writeReligions(w: *std.Io.Writer) !void {
+    try w.writeAll("export const RELIGIONS = [\n");
+    inline for (comptime std.enums.values(entities.Religion)) |religion| {
+        try w.print("  \"{s}\",\n", .{@tagName(religion)});
+    }
+    try w.writeAll("] as const;\nexport type Religion = typeof RELIGIONS[number];\n");
 }
 
 fn writeLinkStatusEnum(w: *std.Io.Writer) !void {

@@ -3,7 +3,7 @@ import { define } from "../../utils.ts";
 import { type Category, getClient } from "../../lib/dmoz-client.ts";
 import type { User } from "../../lib/kv-users.ts";
 import { userIdToSubmitterId } from "../../lib/utils.ts";
-import { storeLinkVector } from "../../lib/embedder.ts";
+import { enrichLink } from "../../lib/link-enrichment.ts";
 import Eyebrow from "../../components/common/Eyebrow/Eyebrow.tsx";
 import { EMPTY_STATE, type FormState, type Step } from "./_lib/types.ts";
 import { parseFormState, parseStep } from "./_lib/parseForm.ts";
@@ -99,7 +99,7 @@ async function finalizeSubmission(
       state.description,
       userIdToSubmitterId(user.id),
     );
-    await storeLinkVector(client, referenceId);
+    await enrichLink(client, referenceId);
     return await buildData(user, "done", state, {}, referenceId);
   } catch (e) {
     console.error("Failed to create submission:", e);

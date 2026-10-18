@@ -1,7 +1,8 @@
 import { define } from "../../../utils.ts";
 import { type DmozClient, getClient } from "../../../lib/dmoz-client.ts";
 import { loadEntryCategories } from "../../../lib/entry-categories.ts";
-import { categoryJson, categoryPath, errorResponse } from "./_lib/api.ts";
+import { categoryPath } from "../../../lib/format.ts";
+import { categoryJson, errorResponse } from "./_lib/api.ts";
 
 async function browseRoot(client: DmozClient) {
   const { root, categories } = await loadEntryCategories(client);
