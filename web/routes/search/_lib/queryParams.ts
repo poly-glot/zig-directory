@@ -21,17 +21,19 @@ interface BuildHrefOverride {
   year?: number | null;
 }
 
+export function searchHref(params: Record<string, string>): string {
+  const qs = new URLSearchParams(params).toString();
+  return qs ? `/search?${qs}` : "/search";
+}
+
 export function buildHref(
   base: BuildHrefBase,
   override: BuildHrefOverride,
 ): string {
-  const params = new URLSearchParams();
-  if (base.q) params.set("q", base.q);
-  if (base.sort !== "relevance") params.set("sort", base.sort);
-  if (override.cat && override.cat > 0) params.set("cat", String(override.cat));
-  if (override.year && override.year > 0) {
-    params.set("year", String(override.year));
-  }
-  const qs = params.toString();
-  return qs ? `/search?${qs}` : "/search";
+  const params: Record<string, string> = {};
+  if (base.q) params.q = base.q;
+  if (base.sort !== "relevance") params.sort = base.sort;
+  if (override.cat && override.cat > 0) params.cat = String(override.cat);
+  if (override.year && override.year > 0) params.year = String(override.year);
+  return searchHref(params);
 }

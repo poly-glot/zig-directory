@@ -258,11 +258,11 @@ test "hybrid search adds a vector-only match, and falls back to keywords for ano
     try loadVectorIndex(db);
 
     var buf: [8]schema.Link = undefined;
-    const hybrid = try search.searchLinksHybrid(db, "miniature trees", MODEL, &axisEmbedding(1), 8, &buf);
+    const hybrid = try search.searchLinksHybrid(db, "miniature trees", MODEL, &axisEmbedding(1), 8, &buf, null);
     try testing.expect(hybrid.vector_used);
     try testing.expectEqual(@as(usize, 2), hybrid.links.len);
 
-    const fallback = try search.searchLinksHybrid(db, "miniature trees", MODEL + 1, &axisEmbedding(1), 8, &buf);
+    const fallback = try search.searchLinksHybrid(db, "miniature trees", MODEL + 1, &axisEmbedding(1), 8, &buf, null);
     try testing.expect(!fallback.vector_used);
     try testing.expectEqual(@as(usize, 1), fallback.links.len);
     try testing.expectEqual(keyword_hit, fallback.links[0].id);

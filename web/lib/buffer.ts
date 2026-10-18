@@ -61,6 +61,13 @@ export class BufferReader {
   }
 
   /** Read an i64 unix-seconds timestamp and return a Date. */
+  str(): string {
+    const len = this.u16();
+    const start = this.dv.byteOffset + this.pos;
+    this.pos += len;
+    return decoder.decode(new Uint8Array(this.dv.buffer, start, len));
+  }
+
   timestamp(): Date {
     return new Date(this.i64() * 1000);
   }

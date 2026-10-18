@@ -31,7 +31,11 @@ export function buildPathLabel(
   ].join(" › ");
 }
 
-export function applyFilters(links: Link[], cat: number, year: number): Link[] {
+export function applyFilters<T extends Link>(
+  links: T[],
+  cat: number,
+  year: number,
+): T[] {
   return links.filter((l) => {
     if (cat > 0 && l.categoryId !== cat) return false;
     if (year > 0) {
@@ -42,7 +46,7 @@ export function applyFilters(links: Link[], cat: number, year: number): Link[] {
   });
 }
 
-export function applySort(links: Link[], sort: Sort): Link[] {
+export function applySort<T extends Link>(links: T[], sort: Sort): T[] {
   if (sort === "relevance") return links;
   const out = [...links];
   if (sort === "recent") {

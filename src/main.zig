@@ -89,10 +89,16 @@ test {
     _ = @import("operations/operations_search.zig");
     _ = @import("operations/operations_slug.zig");
     _ = @import("operations/operations_vector.zig");
+    _ = @import("operations/operations_facts.zig");
     _ = @import("repair/repair.zig");
     _ = @import("header_upgrade.zig");
     _ = @import("ranking.zig");
     _ = @import("vector_index.zig");
+    _ = @import("facts/countries.zig");
+    _ = @import("facts/url_facts.zig");
+    _ = @import("facts/sites.zig");
+    _ = @import("facts/facts_index.zig");
+    _ = @import("facts/entities.zig");
 }
 
 test "Config: every tuning knob has its documented default" {

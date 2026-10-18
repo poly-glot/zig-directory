@@ -10,6 +10,7 @@ speaks the binary protocol or touches Deno KV.
 | `browse_category` | none | breadcrumb, child categories, subtree counts |
 | `list_links` | none | approved links from a category and everything beneath it, cursor-paged |
 | `search_directory` | none | matching categories and links, each link with its category path |
+| `query_links` | none | counts, distinct sites and groupings of links by domain, hosting, country, category and keywords, with a cursor-paged page of links |
 | `review_submission` | admin | approves or rejects a link; the updated link |
 
 Categories are addressed by slug path only, the same `path` the website uses.
@@ -277,8 +278,8 @@ redirect past naive matching.
    "
    ```
 6. Confirm the reads are open and the write is *visible* —
-   `fastmcp list http://127.0.0.1:8765/mcp` with no `--auth` lists all 4
-   tools and `browse_category` returns data. The count is 4 for every
+   `fastmcp list http://127.0.0.1:8765/mcp` with no `--auth` lists all 5
+   tools and `browse_category` returns data. The count is 5 for every
    caller — anonymous, `role=user` and `role=admin` alike — and a
    `role=user` token must still be refused by `review_submission` itself.
 7. Confirm the write asks for a sign-in rather than failing. Posting a

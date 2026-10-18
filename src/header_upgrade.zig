@@ -5,19 +5,25 @@ const directory = @import("directory.zig");
 const log = std.log.scoped(.header_upgrade);
 
 const HeaderV5 = zigstore.Engine(directory.schema_v5).Header;
-const HeaderV6 = directory.Store.Header;
-const PAGE_SIZE = @sizeOf(HeaderV6);
+const HeaderV6 = zigstore.Engine(directory.schema_v6).Header;
+const Header = directory.Store.Header;
+const PAGE_SIZE = @sizeOf(Header);
 const INVALID_PAGE: u64 = std.math.maxInt(u32);
-const SIDE_FILE = "store.dat.v6-header";
+const SIDE_FILE = "store.dat.header-upgrade";
 const SIDE_FILE_LEN = PAGE_SIZE + 8;
 
+const steps = .{
+    .{ HeaderV5, HeaderV6, directory.schema_v6.format_version },
+    .{ HeaderV6, Header, directory.schema.format_version },
+};
+
 comptime {
-    if (@sizeOf(HeaderV5) != PAGE_SIZE) @compileError("v5 and v6 headers must both fill one page");
+    if (@sizeOf(HeaderV5) != PAGE_SIZE or @sizeOf(HeaderV6) != PAGE_SIZE) @compileError("every header version must fill one page");
 }
 
 pub const UpgradeError = error{CheckpointJournalPending};
 
-pub fn upgradeToV6(io: std.Io, data_dir: []const u8) !void {
+pub fn upgradeHeader(io: std.Io, data_dir: []const u8) !void {
     var dir = std.Io.Dir.openDirAbsolute(io, data_dir, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -32,31 +38,41 @@ pub fn upgradeToV6(io: std.Io, data_dir: []const u8) !void {
 
     if (try redoSideFile(io, dir, store, data_dir)) return;
 
-    var page0: [PAGE_SIZE]u8 = undefined;
-    if (try store.readPositionalAll(io, &page0, 0) < PAGE_SIZE) return;
-    const v5 = std.mem.bytesToValue(HeaderV5, &page0);
-    if (v5.magic != directory.schema_v5.magic or v5.format_version != directory.schema_v5.format_version) return;
+    var page: [PAGE_SIZE]u8 = undefined;
+    if (try store.readPositionalAll(io, &page, 0) < PAGE_SIZE) return;
+    const found = std.mem.bytesToValue(HeaderV5, &page);
+    if (found.magic != directory.schema.magic) return;
+    if (found.format_version < directory.schema_v5.format_version or found.format_version >= directory.schema.format_version) return;
 
     if (try checkpointJournalPending(io, dir)) return UpgradeError.CheckpointJournalPending;
 
-    const v6_bytes = std.mem.toBytes(upgradedHeader(v5));
-    try writeSideFile(io, dir, data_dir, &v6_bytes);
-    try writePage0(io, store, &v6_bytes);
+    var version = found.format_version;
+    inline for (steps) |step| {
+        if (version + 1 == step[2]) {
+            page = upgraded(step[0], step[1], step[2], &page);
+            version = step[2];
+        }
+    }
+
+    try writeSideFile(io, dir, data_dir, &page);
+    try writePage0(io, store, &page);
     try removeSideFile(io, dir, data_dir);
-    log.info("store.dat header upgraded from format 5 to 6", .{});
+    log.info("store.dat header upgraded from format {d} to {d}", .{ found.format_version, version });
 }
 
-fn upgradedHeader(v5: HeaderV5) HeaderV6 {
-    var v6 = std.mem.zeroes(HeaderV6);
-    inline for (@typeInfo(HeaderV5).@"struct".fields) |field| {
+fn upgraded(comptime From: type, comptime To: type, to_version: u32, page: *const [PAGE_SIZE]u8) [PAGE_SIZE]u8 {
+    const old = std.mem.bytesToValue(From, page);
+    var new = std.mem.zeroes(To);
+    inline for (@typeInfo(To).@"struct".fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "_reserved")) continue;
-        @field(v6, field.name) = @field(v5, field.name);
+        if (comptime @hasField(From, field.name)) {
+            @field(new, field.name) = @field(old, field.name);
+        } else if (comptime std.mem.endsWith(u8, field.name, "_root")) {
+            @field(new, field.name) = INVALID_PAGE;
+        }
     }
-    v6.format_version = directory.schema.format_version;
-    v6.link_vectors_root = INVALID_PAGE;
-    v6.link_vectors_count = 0;
-    v6.embedding_model = 0;
-    return v6;
+    new.format_version = to_version;
+    return std.mem.toBytes(new);
 }
 
 fn redoSideFile(io: std.Io, dir: std.Io.Dir, store: std.Io.File, data_dir: []const u8) !bool {
@@ -131,19 +147,22 @@ fn writeV5Store(io: std.Io, dir: std.Io.Dir) !HeaderV5 {
     v5.next_link_id = 92_001;
     v5.links_approved = 91_000;
     v5.derived_counts_version = 1;
-
-    const file = try dir.createFile(io, "store.dat", .{});
-    defer file.close(io);
-    try file.writePositionalAll(io, &std.mem.toBytes(v5), 0);
+    try writePage(io, dir, &std.mem.toBytes(v5));
     return v5;
 }
 
-fn readHeaderV6(io: std.Io, dir: std.Io.Dir) !HeaderV6 {
+fn writePage(io: std.Io, dir: std.Io.Dir, page: *const [PAGE_SIZE]u8) !void {
+    const file = try dir.createFile(io, "store.dat", .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, page, 0);
+}
+
+fn readHeader(io: std.Io, dir: std.Io.Dir) !Header {
     const file = try dir.openFile(io, "store.dat", .{});
     defer file.close(io);
     var page0: [PAGE_SIZE]u8 = undefined;
     _ = try file.readPositionalAll(io, &page0, 0);
-    return std.mem.bytesToValue(HeaderV6, &page0);
+    return std.mem.bytesToValue(Header, &page0);
 }
 
 fn tmpPath(tmp: *std.testing.TmpDir, buf: *[std.Io.Dir.max_path_bytes]u8) ![]const u8 {
@@ -151,46 +170,74 @@ fn tmpPath(tmp: *std.testing.TmpDir, buf: *[std.Io.Dir.max_path_bytes]u8) ![]con
     return buf[0..len];
 }
 
-fn expectCarriedOver(v5: HeaderV5, v6: HeaderV6) !void {
-    try testing.expectEqual(directory.schema.format_version, v6.format_version);
-    try testing.expectEqual(v5.page_count, v6.page_count);
-    try testing.expectEqual(v5.free_list_head, v6.free_list_head);
-    try testing.expectEqual(v5.seq, v6.seq);
-    try testing.expectEqual(v5.links_by_id_root, v6.links_by_id_root);
-    try testing.expectEqual(v5.links_by_id_count, v6.links_by_id_count);
-    try testing.expectEqual(v5.slug_path_repair_queue_root, v6.slug_path_repair_queue_root);
-    try testing.expectEqual(v5.slug_path_repair_queue_count, v6.slug_path_repair_queue_count);
-    try testing.expectEqual(v5.next_link_id, v6.next_link_id);
-    try testing.expectEqual(v5.links_approved, v6.links_approved);
-    try testing.expectEqual(v5.derived_counts_version, v6.derived_counts_version);
-    try testing.expectEqual(INVALID_PAGE, v6.link_vectors_root);
-    try testing.expectEqual(@as(u64, 0), v6.link_vectors_count);
-    try testing.expectEqual(@as(u64, 0), v6.embedding_model);
+fn expectCarriedOver(v5: HeaderV5, upgraded_header: Header) !void {
+    try testing.expectEqual(directory.schema.format_version, upgraded_header.format_version);
+    try testing.expectEqual(v5.page_count, upgraded_header.page_count);
+    try testing.expectEqual(v5.free_list_head, upgraded_header.free_list_head);
+    try testing.expectEqual(v5.seq, upgraded_header.seq);
+    try testing.expectEqual(v5.links_by_id_root, upgraded_header.links_by_id_root);
+    try testing.expectEqual(v5.links_by_id_count, upgraded_header.links_by_id_count);
+    try testing.expectEqual(v5.slug_path_repair_queue_root, upgraded_header.slug_path_repair_queue_root);
+    try testing.expectEqual(v5.slug_path_repair_queue_count, upgraded_header.slug_path_repair_queue_count);
+    try testing.expectEqual(v5.next_link_id, upgraded_header.next_link_id);
+    try testing.expectEqual(v5.links_approved, upgraded_header.links_approved);
+    try testing.expectEqual(v5.derived_counts_version, upgraded_header.derived_counts_version);
+    try testing.expectEqual(INVALID_PAGE, upgraded_header.link_vectors_root);
+    try testing.expectEqual(@as(u64, 0), upgraded_header.link_vectors_count);
+    try testing.expectEqual(@as(u64, 0), upgraded_header.embedding_model);
+    try testing.expectEqual(INVALID_PAGE, upgraded_header.link_entities_root);
+    try testing.expectEqual(@as(u64, 0), upgraded_header.link_entities_count);
 }
 
-test "header upgrade: a v5 page 0 becomes v6 with every root and counter copied by name" {
+test "header upgrade: a v5 page 0 walks every step to the current format, roots and counters copied by name" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
     const v5 = try writeV5Store(testing.io, tmp.dir);
-    try upgradeToV6(testing.io, try tmpPath(&tmp, &path_buf));
+    try upgradeHeader(testing.io, try tmpPath(&tmp, &path_buf));
 
-    try expectCarriedOver(v5, try readHeaderV6(testing.io, tmp.dir));
+    try expectCarriedOver(v5, try readHeader(testing.io, tmp.dir));
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, SIDE_FILE, .{}));
 }
 
-test "header upgrade: running it again on a v6 store changes nothing" {
+test "header upgrade: a v6 page 0 keeps its vector root and model and gains an empty entities index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+    const v5_page = std.mem.toBytes(std.mem.zeroes(HeaderV5));
+    const v6_page = upgraded(HeaderV5, HeaderV6, directory.schema_v6.format_version, &v5_page);
+    var v6 = std.mem.bytesToValue(HeaderV6, &v6_page);
+    v6.magic = directory.schema_v6.magic;
+    v6.link_vectors_root = 12;
+    v6.link_vectors_count = 91_994;
+    v6.embedding_model = 0xB6E5;
+    v6.next_link_id = 92_001;
+    try writePage(testing.io, tmp.dir, &std.mem.toBytes(v6));
+
+    try upgradeHeader(testing.io, try tmpPath(&tmp, &path_buf));
+
+    const header = try readHeader(testing.io, tmp.dir);
+    try testing.expectEqual(directory.schema.format_version, header.format_version);
+    try testing.expectEqual(@as(u64, 12), header.link_vectors_root);
+    try testing.expectEqual(@as(u64, 91_994), header.link_vectors_count);
+    try testing.expectEqual(@as(u64, 0xB6E5), header.embedding_model);
+    try testing.expectEqual(@as(u64, 92_001), header.next_link_id);
+    try testing.expectEqual(INVALID_PAGE, header.link_entities_root);
+}
+
+test "header upgrade: running it again on a current store changes nothing" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tmpPath(&tmp, &path_buf);
 
     const v5 = try writeV5Store(testing.io, tmp.dir);
-    try upgradeToV6(testing.io, path);
-    try upgradeToV6(testing.io, path);
+    try upgradeHeader(testing.io, path);
+    try upgradeHeader(testing.io, path);
 
-    try expectCarriedOver(v5, try readHeaderV6(testing.io, tmp.dir));
+    try expectCarriedOver(v5, try readHeader(testing.io, tmp.dir));
 }
 
 test "header upgrade: a complete side file left by a crash is redone over a torn page 0" {
@@ -200,17 +247,19 @@ test "header upgrade: a complete side file left by a crash is redone over a torn
     const path = try tmpPath(&tmp, &path_buf);
 
     const v5 = try writeV5Store(testing.io, tmp.dir);
-    const v6_bytes = std.mem.toBytes(upgradedHeader(v5));
-    try writeSideFile(testing.io, tmp.dir, path, &v6_bytes);
+    const v5_page = std.mem.toBytes(v5);
+    const v6_page = upgraded(HeaderV5, HeaderV6, directory.schema_v6.format_version, &v5_page);
+    const current_page = upgraded(HeaderV6, Header, directory.schema.format_version, &v6_page);
+    try writeSideFile(testing.io, tmp.dir, path, &current_page);
     {
         const file = try tmp.dir.openFile(testing.io, "store.dat", .{ .mode = .read_write });
         defer file.close(testing.io);
-        try file.writePositionalAll(testing.io, v6_bytes[0 .. PAGE_SIZE / 2], 0);
+        try file.writePositionalAll(testing.io, current_page[0 .. PAGE_SIZE / 2], 0);
     }
 
-    try upgradeToV6(testing.io, path);
+    try upgradeHeader(testing.io, path);
 
-    try expectCarriedOver(v5, try readHeaderV6(testing.io, tmp.dir));
+    try expectCarriedOver(v5, try readHeader(testing.io, tmp.dir));
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, SIDE_FILE, .{}));
 }
 
@@ -227,12 +276,12 @@ test "header upgrade: a truncated side file is discarded and the upgrade runs fr
         try side.writePositionalAll(testing.io, &@as([100]u8, @splat(0xAB)), 0);
     }
 
-    try upgradeToV6(testing.io, path);
+    try upgradeHeader(testing.io, path);
 
-    try expectCarriedOver(v5, try readHeaderV6(testing.io, tmp.dir));
+    try expectCarriedOver(v5, try readHeader(testing.io, tmp.dir));
 }
 
-test "header upgrade: refuses while a checkpoint journal could still redo a v5 page 0" {
+test "header upgrade: refuses while a checkpoint journal could still redo an old page 0" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -245,9 +294,8 @@ test "header upgrade: refuses while a checkpoint journal could still redo a v5 p
         try journal.writePositionalAll(testing.io, "pending", 0);
     }
 
-    try testing.expectError(UpgradeError.CheckpointJournalPending, upgradeToV6(testing.io, path));
-    const still_v5 = try readHeaderV6(testing.io, tmp.dir);
-    try testing.expectEqual(directory.schema_v5.format_version, still_v5.format_version);
+    try testing.expectError(UpgradeError.CheckpointJournalPending, upgradeHeader(testing.io, path));
+    try testing.expectEqual(directory.schema_v5.format_version, (try readHeader(testing.io, tmp.dir)).format_version);
 }
 
 test "header upgrade: an upgraded v5 store opens and serves its data" {
@@ -276,4 +324,5 @@ test "header upgrade: an upgraded v5 store opens and serves its data" {
     try testing.expectEqualStrings("kept across the upgrade", value);
     try testing.expectEqual(@as(u64, 6), db.store.counter("next_link_id").*);
     try testing.expectEqual(@as(u64, 0), db.link_vectors().entryCount());
+    try testing.expectEqual(@as(u64, 0), db.link_entities().entryCount());
 }

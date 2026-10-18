@@ -1,13 +1,8 @@
 import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
+import { categoryPath } from "../../../lib/format.ts";
 import { embedQuery } from "../../../lib/embedder.ts";
-import {
-  categoryJson,
-  categoryPath,
-  errorResponse,
-  linkJson,
-  pageSize,
-} from "./_lib/api.ts";
+import { categoryJson, errorResponse, linkJson, pageSize } from "./_lib/api.ts";
 
 type Scope = "both" | "links" | "categories";
 
@@ -36,6 +31,7 @@ export const handler = define.handlers({
         limit: pageSize(searchParams.get("limit")),
         scope,
         mode: "ranked",
+        capPerSite: true,
         queryEmbedding: scope === "categories"
           ? undefined
           : await embedQuery(query),
@@ -53,6 +49,8 @@ export const handler = define.handlers({
           ...linkJson(l),
           categoryPath: categoryPath(chains.get(l.categoryId) ?? []),
           matchedField: MATCHED_FIELD[l.matchField] ?? "title",
+          site: l.site,
+          moreFromSite: l.moreFromSite,
         })),
       });
     } catch (e) {

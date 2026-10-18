@@ -34,7 +34,10 @@ def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[st
         lines += [formatting.category_summary(category) for category in categories]
     if links:
         lines.append("Links:")
-        lines += [formatting.link_summary(link) for link in links]
+        for link in links:
+            lines.append(formatting.link_summary(link))
+            if link.get("moreFromSite"):
+                lines.append(f"  +{link['moreFromSite']} more from {link['site']}")
     if not categories and not links:
         lines.append("No matches.")
     return lines
