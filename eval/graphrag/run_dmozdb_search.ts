@@ -4,6 +4,7 @@ const LIMIT = 20;
 
 const host = Deno.env.get("DMOZDB_HOST") ?? "127.0.0.1";
 const port = Number(Deno.env.get("DMOZDB_PORT") ?? 18080);
+const mode = Deno.env.get("SEARCH_MODE") === "ranked" ? "ranked" : "all_terms";
 const outDir = new URL("./out/", import.meta.url);
 const client = new DmozClient(host, port);
 
@@ -15,7 +16,11 @@ const questions = (await Deno.readTextFile(new URL("questions.jsonl", outDir)))
 const rows: string[] = [];
 for (const q of questions) {
   const started = performance.now();
-  const result = await client.search(q.query, { limit: LIMIT, scope: "links" })
+  const result = await client.search(q.query, {
+    limit: LIMIT,
+    scope: "links",
+    mode,
+  })
     .catch(() => ({ links: [] }));
   rows.push(
     JSON.stringify({
@@ -27,7 +32,10 @@ for (const q of questions) {
 }
 
 await Deno.writeTextFile(
-  new URL("run_dmozdb.jsonl", outDir),
+  new URL(
+    mode === "ranked" ? "run_dmozdb_ranked.jsonl" : "run_dmozdb.jsonl",
+    outDir,
+  ),
   rows.join("\n") + "\n",
 );
 console.log(`searched ${rows.length} questions`);

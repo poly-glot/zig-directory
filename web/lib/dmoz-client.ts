@@ -74,6 +74,9 @@ export interface Crumb {
 /** A search-hit link carries which field matched: 0=title, 1=url, 2=description. */
 export type SearchLink = Link & { matchField: number };
 
+const SEARCH_SCOPE_CODE = { both: 0, links: 1, categories: 2 } as const;
+const SEARCH_MODE_RANKED = 1;
+
 export interface SearchResult {
   categories: Category[];
   links: SearchLink[];
@@ -852,13 +855,17 @@ export class DmozClient {
 
   async search(
     query: string,
-    opts: { limit?: number; scope?: "both" | "links" | "categories" } = {},
+    opts: {
+      limit?: number;
+      scope?: "both" | "links" | "categories";
+      mode?: "all_terms" | "ranked";
+    } = {},
   ): Promise<SearchResult> {
     const limit = opts.limit ?? 20;
     const w = new BufferWriter().str(query).u32(limit);
-    if (opts.scope === "links") w.u8(1);
-    else if (opts.scope === "categories") w.u8(2);
-    // scope=both (default) → omit the byte; the server treats absent as both.
+    const scope = SEARCH_SCOPE_CODE[opts.scope ?? "both"];
+    if (opts.mode === "ranked") w.u8(scope).u8(SEARCH_MODE_RANKED);
+    else if (scope !== SEARCH_SCOPE_CODE.both) w.u8(scope);
     const resp = await this.request(Op.Search, w.build());
     this.assertOk(resp);
 

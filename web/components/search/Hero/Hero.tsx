@@ -98,8 +98,8 @@ export default function Hero(
         <Eyebrow label="Search the index" muted />
         <h1 class="display mt-16">Find a site by keyword.</h1>
         <p class="lede mt-16">
-          Editor-vetted results from the directory's full-text index. AND-of-
-          tokens, ID-ordered.
+          Editor-vetted results from the directory's full-text index, ranked by
+          how many of your words match and how rare they are.
         </p>
         <form
           action="/search"

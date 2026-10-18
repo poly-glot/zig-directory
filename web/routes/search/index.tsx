@@ -49,7 +49,10 @@ async function buildSearchResult(
   year: number,
 ): Promise<Data> {
   const client = getClient();
-  const rawResults = await client.search(q, { limit: 50 });
+  const rawResults = await client.search(q, {
+    limit: 50,
+    mode: "ranked",
+  });
   const crumbIds = new Set<number>();
   for (const c of rawResults.categories) crumbIds.add(c.id);
   for (const l of rawResults.links) crumbIds.add(l.categoryId);
