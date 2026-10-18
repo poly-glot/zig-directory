@@ -753,6 +753,7 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
 }
 
 const SearchScope = enum(u8) { both = 0, links_only = 1, categories_only = 2 };
+const SearchMode = enum(u8) { all_terms = 0, ranked = 1 };
 
 const inverted = @import("zigstore").inverted_index;
 
@@ -767,6 +768,20 @@ fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     return 0;
 }
 
+fn searchCategoriesInMode(db: *Directory, mode: SearchMode, query: []const u8, max: u32, buf: []schema.Category) ![]schema.Category {
+    return switch (mode) {
+        .all_terms => operations.searchCategories(db, query, max, buf),
+        .ranked => operations.searchCategoriesRanked(db, query, max, buf),
+    };
+}
+
+fn searchLinksInMode(db: *Directory, mode: SearchMode, query: []const u8, max: u32, buf: []schema.Link) ![]schema.Link {
+    return switch (mode) {
+        .all_terms => operations.searchLinks(db, query, max, buf),
+        .ranked => operations.searchLinksRanked(db, query, max, buf),
+    };
+}
+
 fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
     if (payload.len < 6) return writeErrorResp(resp, op_byte, .invalid);
     const query_len: usize = std.mem.readInt(u16, payload[0..2], .little);
@@ -775,12 +790,16 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const query = payload[2..][0..query_len];
     const limit = std.mem.readInt(u32, payload[2 + query_len ..][0..4], .little);
 
-    const consumed: usize = 2 + query_len + 4;
-    const scope: SearchScope = switch (payload.len - consumed) {
-        0 => .both,
-        1 => std.enums.fromInt(SearchScope, payload[consumed]) orelse return writeErrorResp(resp, op_byte, .invalid),
-        else => return writeErrorResp(resp, op_byte, .invalid),
-    };
+    const trailing = payload[2 + query_len + 4 ..];
+    if (trailing.len > 2) return writeErrorResp(resp, op_byte, .invalid);
+    const scope: SearchScope = if (trailing.len >= 1)
+        std.enums.fromInt(SearchScope, trailing[0]) orelse return writeErrorResp(resp, op_byte, .invalid)
+    else
+        .both;
+    const mode: SearchMode = if (trailing.len == 2)
+        std.enums.fromInt(SearchMode, trailing[1]) orelse return writeErrorResp(resp, op_byte, .invalid)
+    else
+        .all_terms;
 
     if (resp.len < RESPONSE_HEADER_SIZE + 4) return writeErrorResp(resp, op_byte, .err);
 
@@ -790,14 +809,14 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const cats = if (scope == .links_only)
         cat_buf[0..0]
     else
-        operations.searchCategories(db, query, max, &cat_buf) catch &[0]schema.Category{};
+        searchCategoriesInMode(db, mode, query, max, &cat_buf) catch &[0]schema.Category{};
     var off = writeCountedCategoryRows(resp, RESPONSE_HEADER_SIZE, cats, 2);
 
     var link_buf: [SEARCH_MAX_RESULTS]schema.Link = undefined;
     const links = if (scope == .categories_only)
         link_buf[0..0]
     else
-        operations.searchLinks(db, query, max, &link_buf) catch &[0]schema.Link{};
+        searchLinksInMode(db, mode, query, max, &link_buf) catch &[0]schema.Link{};
     const link_count_off = off;
     off += 2;
     var links_written: u16 = 0;
@@ -2142,6 +2161,57 @@ test "search (op=14): scope byte filters sections and links carry match_field" {
     p = parse(&resp);
     try std.testing.expectEqual(@as(u16, 1), p.link_count);
     try std.testing.expectEqual(@as(u8, 1), p.first_match_field);
+}
+
+test "search (op=14): mode byte selects ranked matching and absent mode keeps all-terms" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try operations.createCategory(db, 0, "Top", "top", "");
+    _ = try operations.createLink(db, top_id, "https://example.com/x", "Bonsai Nursery", "");
+
+    const linkCount = struct {
+        fn run(resp: []const u8) u16 {
+            var off: usize = RESPONSE_HEADER_SIZE;
+            const cc = std.mem.readInt(u16, resp[off..][0..2], .little);
+            off += 2 + @as(usize, cc) * @sizeOf(schema.Category);
+            return std.mem.readInt(u16, resp[off..][0..2], .little);
+        }
+    }.run;
+
+    const query = "bonsai trees";
+    var pbuf: [64]u8 = undefined;
+    std.mem.writeInt(u16, pbuf[0..2], query.len, .little);
+    @memcpy(pbuf[2..][0..query.len], query);
+    std.mem.writeInt(u32, pbuf[2 + query.len ..][0..4], 50, .little);
+    const base = 2 + query.len + 4;
+
+    var resp: [16384]u8 = undefined;
+
+    pbuf[base] = @intFromEnum(SearchScope.links_only);
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 1]);
+    try std.testing.expectEqual(@as(u16, 0), linkCount(&resp));
+
+    pbuf[base + 1] = @intFromEnum(SearchMode.all_terms);
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 2]);
+    try std.testing.expectEqual(@as(u16, 0), linkCount(&resp));
+
+    pbuf[base + 1] = @intFromEnum(SearchMode.ranked);
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 2]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 1), linkCount(&resp));
+
+    pbuf[base + 1] = 9;
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 2]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    pbuf[base + 1] = @intFromEnum(SearchMode.ranked);
+    pbuf[base + 2] = 0;
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 3]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
 }
 
 test "list_all_links with out-of-range status returns invalid" {

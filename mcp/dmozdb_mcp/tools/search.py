@@ -44,7 +44,9 @@ def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[st
     app=PrefabAppConfig(),
     description=(
         "Search the directory for categories and approved links, matching on "
-        "category names and on link titles, URLs and descriptions. Use it to "
+        "category names and on link titles, URLs and descriptions. Results "
+        "are ranked by relevance and need not contain every word, so a "
+        "natural-language description of what you want works. Use it to "
         "find an entry point when you do not know the category path."
     ),
     annotations=ToolAnnotations(

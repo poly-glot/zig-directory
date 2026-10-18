@@ -41,6 +41,8 @@ pub const LinkPage = link_mod.LinkPage;
 
 pub const searchCategories = search.searchCategories;
 pub const searchLinks = search.searchLinks;
+pub const searchCategoriesRanked = search.searchCategoriesRanked;
+pub const searchLinksRanked = search.searchLinksRanked;
 
 pub const resolveSlugPath = slug_mod.resolveSlugPath;
 pub const buildSlugPath = slug_mod.buildSlugPath;

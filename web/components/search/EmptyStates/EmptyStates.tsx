@@ -7,7 +7,7 @@ export function EmptyPrompt() {
       <div>
         <span class={styles.title}>Start typing to search</span>
         <p class={`${styles.meta} mt-8`}>
-          AND-of-tokens, ID-ordered. Try one of these queries:
+          Describe what you want in plain words, or try one of these:
         </p>
         <div class="row mt-16 gap-8 flex-wrap">
           <a class="chip" href="/search?q=archive">archive</a>

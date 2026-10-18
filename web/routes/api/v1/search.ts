@@ -33,6 +33,7 @@ export const handler = define.handlers({
       const result = await client.search(query, {
         limit: pageSize(searchParams.get("limit")),
         scope: parseScope(searchParams.get("scope")),
+        mode: "ranked",
       });
       const chains = await client.breadcrumbsByIds([
         ...result.categories.map((c) => c.id),
