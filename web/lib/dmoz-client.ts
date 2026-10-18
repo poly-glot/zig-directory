@@ -76,10 +76,77 @@ export type SearchLink = Link & { matchField: number };
 
 const SEARCH_SCOPE_CODE = { both: 0, links: 1, categories: 2 } as const;
 const SEARCH_MODE_RANKED = 1;
+const SEARCH_MODE_HYBRID = 2;
+
+export const EMBEDDING_DIMS = 384;
+export const MAX_VECTORS_PER_WRITE = 32;
 
 export interface SearchResult {
   categories: Category[];
   links: SearchLink[];
+  vectorUsed: boolean;
+}
+
+export interface QueryEmbedding {
+  model: bigint;
+  vector: Float32Array;
+}
+
+export interface LinkVectorWrite {
+  linkId: number;
+  textFingerprint: bigint;
+  vector: Float32Array;
+}
+
+export type LinkVectorWriteCode =
+  | "ok"
+  | "not_found"
+  | "stale_text"
+  | "invalid_vector";
+
+const LINK_VECTOR_WRITE_CODES: LinkVectorWriteCode[] = [
+  "ok",
+  "not_found",
+  "stale_text",
+  "invalid_vector",
+];
+
+const FNV_OFFSET = 0xcbf29ce484222325n;
+const FNV_PRIME = 0x100000001b3n;
+const U64_MASK = 0xffffffffffffffffn;
+
+export function fnv1a64(bytes: Uint8Array): bigint {
+  let hash = FNV_OFFSET;
+  for (const b of bytes) hash = ((hash ^ BigInt(b)) * FNV_PRIME) & U64_MASK;
+  return hash;
+}
+
+export function linkTextFingerprint(
+  title: string,
+  description: string,
+): bigint {
+  const t = encoder.encode(title);
+  const d = encoder.encode(description);
+  const joined = new Uint8Array(t.length + 1 + d.length);
+  joined.set(t);
+  joined.set(d, t.length + 1);
+  return fnv1a64(joined);
+}
+
+function u64Bytes(v: bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, v, true);
+  return out;
+}
+
+function f32Bytes(vector: Float32Array): Uint8Array {
+  if (vector.length !== EMBEDDING_DIMS) {
+    throw new Error(`embedding must have ${EMBEDDING_DIMS} dimensions`);
+  }
+  const out = new Uint8Array(vector.length * 4);
+  const view = new DataView(out.buffer);
+  vector.forEach((x, i) => view.setFloat32(i * 4, x, true));
+  return out;
 }
 
 /** A cursor-paged list response: a page of links plus the cursor for the
@@ -859,12 +926,18 @@ export class DmozClient {
       limit?: number;
       scope?: "both" | "links" | "categories";
       mode?: "all_terms" | "ranked";
+      queryEmbedding?: QueryEmbedding;
     } = {},
   ): Promise<SearchResult> {
     const limit = opts.limit ?? 20;
     const w = new BufferWriter().str(query).u32(limit);
     const scope = SEARCH_SCOPE_CODE[opts.scope ?? "both"];
-    if (opts.mode === "ranked") w.u8(scope).u8(SEARCH_MODE_RANKED);
+    const embedding = opts.queryEmbedding;
+    if (embedding) {
+      w.u8(scope).u8(SEARCH_MODE_HYBRID).raw(u64Bytes(embedding.model)).raw(
+        f32Bytes(embedding.vector),
+      );
+    } else if (opts.mode === "ranked") w.u8(scope).u8(SEARCH_MODE_RANKED);
     else if (scope !== SEARCH_SCOPE_CODE.both) w.u8(scope);
     const resp = await this.request(Op.Search, w.build());
     this.assertOk(resp);
@@ -890,7 +963,33 @@ export class DmozClient {
       links.push({ ...link, matchField });
     }
 
-    return { categories, links };
+    const vectorUsed = embedding !== undefined && r.u8() === 1;
+    return { categories, links, vectorUsed };
+  }
+
+  async putLinkVectors(
+    model: bigint,
+    writes: LinkVectorWrite[],
+  ): Promise<Array<{ linkId: number; code: LinkVectorWriteCode }>> {
+    if (writes.length === 0) return [];
+    if (writes.length > MAX_VECTORS_PER_WRITE) {
+      throw new Error(`putLinkVectors: cap is ${MAX_VECTORS_PER_WRITE}`);
+    }
+    const w = new BufferWriter().raw(u64Bytes(model)).u16(writes.length);
+    for (const item of writes) {
+      w.u64(item.linkId).raw(u64Bytes(item.textFingerprint)).raw(
+        f32Bytes(item.vector),
+      );
+    }
+    const resp = await this.request(Op.PutLinkVectors, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const total = r.u16() + r.u16();
+    return Array.from({ length: total }, () => ({
+      linkId: Number(r.u64()),
+      code: LINK_VECTOR_WRITE_CODES[r.u8()] ?? "invalid_vector",
+    }));
   }
 
   /**

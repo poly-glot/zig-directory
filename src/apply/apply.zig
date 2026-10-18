@@ -14,6 +14,7 @@ pub fn apply(db: *Directory, cs: changeset.ChangeSet) !void {
         .link_deleted => |e| apply_link.applyLinkDeleted(db, e),
         .link_text_updated => |e| apply_link.applyLinkTextUpdated(db, e),
         .link_recategorized => |e| apply_link.applyLinkRecategorized(db, e),
+        .link_vectors_put => |e| apply_link.applyLinkVectorsPut(db, e),
         .category_inserted => |e| apply_category.applyCategoryInserted(db, e),
         .category_deleted => |e| apply_category.applyCategoryDeleted(db, e),
         .category_text_updated => |e| apply_category.applyCategoryTextUpdated(db, e),

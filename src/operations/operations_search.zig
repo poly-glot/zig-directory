@@ -6,11 +6,16 @@ const inverted = @import("zigstore").inverted_index;
 const category = @import("operations_category.zig");
 const link_mod = @import("operations_link.zig");
 const shared = @import("operations_shared.zig");
+const ranking = @import("../ranking.zig");
+const vector_index = @import("../vector_index.zig");
 
 const log = shared.log;
 
 pub const MAX_POSTINGS_PER_TOKEN: usize = 20_000;
 const MAX_QUERY_TOKENS: usize = 32;
+pub const HYBRID_CANDIDATES: usize = 200;
+
+const ScoredId = ranking.ScoredId;
 
 pub fn searchCategories(
     db: *Directory,
@@ -171,16 +176,6 @@ fn inverseDocumentFrequency(corpus_size: u64, document_frequency: usize) f64 {
     return @log(1.0 + (n - df + 0.5) / (df + 0.5));
 }
 
-const ScoredId = struct {
-    id: u64,
-    score: f64,
-
-    fn ranksBefore(_: void, a: ScoredId, b: ScoredId) bool {
-        if (a.score != b.score) return a.score > b.score;
-        return a.id < b.id;
-    }
-};
-
 fn searchRanked(
     comptime T: type,
     db: *Directory,
@@ -192,40 +187,58 @@ fn searchRanked(
     buf: []T,
     comptime getter: fn (*Directory, u64) anyerror!?T,
 ) ![]T {
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    if (max == 0) return buf[0..0];
+    const ranked = try rankedIds(db.allocator, tree, corpus_size, postings_cap, query);
+    defer db.allocator.free(ranked);
+    return fetchInRankOrder(T, db, ranked, limit, buf, getter);
+}
 
+fn rankedIds(
+    allocator: std.mem.Allocator,
+    tree: *@import("zigstore").BPlusTree,
+    corpus_size: u64,
+    postings_cap: usize,
+    query: []const u8,
+) ![]ScoredId {
     var scores: std.AutoHashMapUnmanaged(u64, f64) = .empty;
-    defer scores.deinit(db.allocator);
+    defer scores.deinit(allocator);
 
     const tokens = QueryTokens.init(query);
     for (0..tokens.count) |i| {
-        const ids = postingsForToken(tree, tokens.get(i), db.allocator, postings_cap) catch |err| switch (err) {
+        const ids = postingsForToken(tree, tokens.get(i), allocator, postings_cap) catch |err| switch (err) {
             error.PostingsCapExceeded => continue,
             else => {
-                log.err("searchRanked: rangeScan failed for token='{s}': {}", .{ tokens.get(i), err });
+                log.err("rankedIds: rangeScan failed for token='{s}': {}", .{ tokens.get(i), err });
                 return err;
             },
         };
-        defer db.allocator.free(ids);
+        defer allocator.free(ids);
 
         const idf = inverseDocumentFrequency(corpus_size, ids.len);
         for (ids) |id| {
-            const entry = try scores.getOrPutValue(db.allocator, id, 0);
+            const entry = try scores.getOrPutValue(allocator, id, 0);
             entry.value_ptr.* += idf;
         }
     }
 
-    const ranked = try db.allocator.alloc(ScoredId, scores.count());
-    defer db.allocator.free(ranked);
-
+    const ranked = try allocator.alloc(ScoredId, scores.count());
     var it = scores.iterator();
     var n: usize = 0;
     while (it.next()) |entry| : (n += 1) {
         ranked[n] = .{ .id = entry.key_ptr.*, .score = entry.value_ptr.* };
     }
     std.sort.pdq(ScoredId, ranked, {}, ScoredId.ranksBefore);
+    return ranked;
+}
 
+fn fetchInRankOrder(
+    comptime T: type,
+    db: *Directory,
+    ranked: []const ScoredId,
+    limit: u32,
+    buf: []T,
+    comptime getter: fn (*Directory, u64) anyerror!?T,
+) []T {
+    const max = @min(limit, @as(u32, @intCast(buf.len)));
     var count: u32 = 0;
     for (ranked) |hit| {
         if (count >= max) break;
@@ -234,8 +247,47 @@ fn searchRanked(
             count += 1;
         }
     }
-
     return buf[0..count];
+}
+
+pub const HybridLinks = struct {
+    links: []schema.Link,
+    vector_used: bool,
+};
+
+pub fn searchLinksHybrid(
+    db: *Directory,
+    query: []const u8,
+    model: u64,
+    query_embedding: *const vector_index.Embedding,
+    limit: u32,
+    buf: []schema.Link,
+) !HybridLinks {
+    const keyword = try rankedIds(db.allocator, db.links_index_tree(), linkCorpusSize(db), MAX_POSTINGS_PER_TOKEN, query);
+    defer db.allocator.free(keyword);
+    const keyword_top = keyword[0..@min(keyword.len, HYBRID_CANDIDATES)];
+
+    const quantized = if (vectorHalfUsable(db, model)) vector_index.quantize(query_embedding) else null;
+    const q = quantized orelse return .{
+        .links = fetchInRankOrder(schema.Link, db, keyword, limit, buf, link_mod.getLink),
+        .vector_used = false,
+    };
+
+    var nearest_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
+    const nearest = db.vectors.nearest(db.io, &q, &nearest_buf);
+
+    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest });
+    defer db.allocator.free(fused);
+    return .{
+        .links = fetchInRankOrder(schema.Link, db, fused, limit, buf, link_mod.getLink),
+        .vector_used = true,
+    };
+}
+
+fn vectorHalfUsable(db: *Directory, model: u64) bool {
+    return model != 0 and
+        db.vectors.ready.load(.acquire) and
+        db.vectors.model.load(.acquire) == model;
 }
 
 fn searchViaIndexTree(

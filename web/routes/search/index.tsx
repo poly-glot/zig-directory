@@ -96,7 +96,7 @@ export const handler = define.handlers<Data>({
     if (!q) {
       return page({
         query: "",
-        rawResults: { categories: [], links: [] },
+        rawResults: { categories: [], links: [], vectorUsed: false },
         filteredLinks: [],
         facets: emptyFacets(q, sort, cat, year),
         sort,
@@ -110,7 +110,7 @@ export const handler = define.handlers<Data>({
       console.error("Search failed:", e);
       return page({
         query: q,
-        rawResults: { categories: [], links: [] },
+        rawResults: { categories: [], links: [], vectorUsed: false },
         filteredLinks: [],
         facets: emptyFacets(q, sort, cat, year),
         sort,
