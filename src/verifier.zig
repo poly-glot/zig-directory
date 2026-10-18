@@ -14,6 +14,7 @@ pub const InvariantId = enum(u8) {
     no_orphans = 4,
     single_top = 5,
     link_category_exists = 6,
+    link_vectors_have_links = 7,
 };
 
 pub const INVARIANT_COUNT = std.enums.values(InvariantId).len;
@@ -48,6 +49,7 @@ pub const VerifierState = struct {
         .{ .name = "no_orphans", .expected = 0, .observed = 0 },
         .{ .name = "single_top", .expected = 0, .observed = 0 },
         .{ .name = "link_category_exists", .expected = 0, .observed = 0 },
+        .{ .name = "link_vectors_have_links", .expected = 0, .observed = 0 },
     },
     mutex: std.Io.Mutex = .init,
 
@@ -132,6 +134,15 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
         .expected = link_count,
         .observed = link_count -| link_orphan_count,
     };
+
+    const vector_count = try countTree(db.link_vectors(), codec.encodeU64(0)[0..]);
+    const vector_orphan_count = try countVectorsWithMissingLink(db);
+    indices[@intFromEnum(InvariantId.link_vectors_have_links)] = .{
+        .name = "link_vectors_have_links",
+        .expected = vector_count,
+        .observed = vector_count -| vector_orphan_count,
+    };
+    log.info("verifier: {d} of {d} links carry a vector", .{ vector_count, link_count });
 
     state.mutex.lockUncancelable(db.io);
     state.last_run_at = db.nowSeconds();
@@ -250,6 +261,20 @@ fn countLinksWithMissingCategory(db: *Directory) !u64 {
             gop.value_ptr.* = (ops.getCategory(db, link.category_id) catch null) != null;
         }
         if (!gop.value_ptr.*) orphans += 1;
+    }
+    return orphans;
+}
+
+fn countVectorsWithMissingLink(db: *Directory) !u64 {
+    const ops = @import("operations/operations.zig");
+
+    var orphans: u64 = 0;
+    const min_key = codec.encodeU64(0);
+    var iter = try db.link_vectors().rangeScan(&min_key, null);
+    defer iter.deinit();
+    while (try iter.next()) |entry| {
+        const link_id = codec.decodeU64(entry.key[0..8]);
+        if ((ops.getLink(db, link_id) catch null) == null) orphans += 1;
     }
     return orphans;
 }

@@ -8,28 +8,42 @@ const wal_apply = @import("wal/wal_apply.zig");
 const repair_worker = @import("repair/repair_worker.zig");
 const histogram = zigstore.histogram;
 const binary_protocol = @import("binary_protocol.zig");
+const header_upgrade = @import("header_upgrade.zig");
+const vector_index = @import("vector_index.zig");
 const Config = @import("main.zig").Config;
 
 const log = std.log.scoped(.directory);
 
-pub const schema = zigstore.schema(.{
+const v5_indexes = .{
+    .{ .name = "categories_by_id", .key = .u64 },
+    .{ .name = "cat_by_parent", .key = .{ .composite = &.{ "parent_id", "child_id" } } },
+    .{ .name = "links_by_id", .key = .u64 },
+    .{ .name = "link_by_category", .key = .{ .composite = &.{ "category_id", "link_id" } } },
+    .{ .name = "link_by_url_hash", .key = .u64 },
+    .{ .name = "link_by_submitter", .key = .{ .composite = &.{ "submitter_id", "link_id" } } },
+    .{ .name = "categories_by_slug_path", .key = .bytes },
+    .{ .name = "categories_by_slug_only", .key = .bytes },
+    .{ .name = "categories_index_tree", .key = .bytes },
+    .{ .name = "links_index_tree", .key = .bytes },
+    .{ .name = "slug_path_repair_queue", .key = .u64 },
+};
+const memtable_indexes = &.{ "categories_by_id", "cat_by_parent", "links_by_id", "link_by_category", "link_by_url_hash", "link_by_submitter" };
+const v5_counters = .{ "next_category_id", "next_link_id", "next_repair_seq", "links_pending", "links_approved", "links_rejected", "derived_counts_version" };
+
+pub const schema_v5 = zigstore.schema(.{
     .magic = 0x444D4F5A,
     .format_version = 5,
-    .indexes = .{
-        .{ .name = "categories_by_id", .key = .u64 },
-        .{ .name = "cat_by_parent", .key = .{ .composite = &.{ "parent_id", "child_id" } } },
-        .{ .name = "links_by_id", .key = .u64 },
-        .{ .name = "link_by_category", .key = .{ .composite = &.{ "category_id", "link_id" } } },
-        .{ .name = "link_by_url_hash", .key = .u64 },
-        .{ .name = "link_by_submitter", .key = .{ .composite = &.{ "submitter_id", "link_id" } } },
-        .{ .name = "categories_by_slug_path", .key = .bytes },
-        .{ .name = "categories_by_slug_only", .key = .bytes },
-        .{ .name = "categories_index_tree", .key = .bytes },
-        .{ .name = "links_index_tree", .key = .bytes },
-        .{ .name = "slug_path_repair_queue", .key = .u64 },
-    },
-    .memtable_indexes = &.{ "categories_by_id", "cat_by_parent", "links_by_id", "link_by_category", "link_by_url_hash", "link_by_submitter" },
-    .counters = &.{ "next_category_id", "next_link_id", "next_repair_seq", "links_pending", "links_approved", "links_rejected", "derived_counts_version" },
+    .indexes = v5_indexes,
+    .memtable_indexes = memtable_indexes,
+    .counters = &v5_counters,
+});
+
+pub const schema = zigstore.schema(.{
+    .magic = schema_v5.magic,
+    .format_version = 6,
+    .indexes = v5_indexes ++ .{.{ .name = "link_vectors", .key = .u64 }},
+    .memtable_indexes = memtable_indexes,
+    .counters = &(v5_counters ++ .{"embedding_model"}),
 });
 
 pub const Store = zigstore.Engine(schema);
@@ -76,6 +90,9 @@ pub const Directory = struct {
     url_bloom_ready: std.atomic.Value(bool),
     url_bloom_seeder: ?std.Thread,
     url_bloom_seeder_stop: std.atomic.Value(bool),
+
+    vectors: vector_index.VectorIndex,
+    vector_loader: ?std.Thread,
 
     next_category_id: std.atomic.Value(u64),
     next_link_id: std.atomic.Value(u64),
@@ -152,6 +169,9 @@ pub const Directory = struct {
     pub fn slug_path_repair_queue(self: *Self) *zigstore.BPlusTree {
         return self.store.tree("slug_path_repair_queue");
     }
+    pub fn link_vectors(self: *Self) *zigstore.BPlusTree {
+        return self.store.tree("link_vectors");
+    }
 
     pub fn mt_categories_by_id(self: *Self) *zigstore.MemTable {
         return self.store.memtable("categories_by_id");
@@ -197,6 +217,8 @@ pub const Directory = struct {
     }
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config) !*Self {
+        try header_upgrade.upgradeToV6(io, config.data_dir);
+
         const store = try Store.init(io, allocator, .{
             .data_dir = config.data_dir,
             .cache_size_mb = config.server.cache_size_mb,
@@ -241,6 +263,8 @@ pub const Directory = struct {
             .url_bloom_ready = std.atomic.Value(bool).init(false),
             .url_bloom_seeder = null,
             .url_bloom_seeder_stop = std.atomic.Value(bool).init(false),
+            .vectors = .{ .model = .init(store.counter("embedding_model").*) },
+            .vector_loader = null,
             .next_category_id = std.atomic.Value(u64).init(store.counter("next_category_id").*),
             .next_link_id = std.atomic.Value(u64).init(store.counter("next_link_id").*),
             .next_repair_seq = std.atomic.Value(u64).init(store.counter("next_repair_seq").*),
@@ -283,6 +307,21 @@ pub const Directory = struct {
             log.warn("url bloom seeder failed to start — duplicate checks keep reading the url index", .{});
             break :blk null;
         };
+        self.vector_loader = std.Thread.spawn(.{}, loadVectorsInBackground, .{self}) catch blk: {
+            log.warn("vector loader failed to start — hybrid search stays keyword-only", .{});
+            break :blk null;
+        };
+    }
+
+    fn loadVectorsInBackground(self: *Self) void {
+        const started = std.Io.Clock.awake.now(self.io);
+        @import("operations/operations.zig").loadVectorIndex(self) catch |err| {
+            log.warn("vector index load stopped: {} — hybrid search stays keyword-only", .{err});
+            return;
+        };
+        if (self.vectors.ready.load(.acquire)) {
+            log.info("vector index loaded {d} vectors in {d} ms", .{ self.vectors.count(self.io), started.untilNow(self.io, .awake).toMilliseconds() });
+        }
     }
 
     fn seedUrlBloomInBackground(self: *Self) void {
@@ -377,6 +416,8 @@ pub const Directory = struct {
     fn shutdown(self: *Self, persist: bool) void {
         self.url_bloom_seeder_stop.store(true, .release);
         if (self.url_bloom_seeder) |t| t.join();
+        self.vectors.loader_stop.store(true, .release);
+        if (self.vector_loader) |t| t.join();
         if (self.checkpointer) |w| w.stop();
         if (self.repair_worker) |w| w.stop();
         if (self.verifier_worker) |w| w.stop();
@@ -391,6 +432,7 @@ pub const Directory = struct {
         }
 
         self.url_bloom.deinit();
+        self.vectors.deinit(self.allocator);
         self.subtree_cache.deinit();
 
         const allocator = self.allocator;

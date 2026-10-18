@@ -73,3 +73,26 @@ binary postings; vectors from the ONNX int8 bge-small that transformers.js runs.
 | IDF-OR + ONNX int8 | 0.913 | 0.171 | 0.187 |
 
 ONNX int8 vs MLX embeddings: mean cosine 0.996 (documents and queries).
+
+## Native search check (`native_vectors.py`, `backfill_vectors.ts`)
+
+The same questions against dmozdb's own search op on a v6 copy of the store,
+with all 91,994 vectors written through `put_link_vectors` (op 37).
+
+```bash
+uv run python native_vectors.py
+cd ../../web
+deno run -A --config deno.json ../eval/graphrag/backfill_vectors.ts
+for mode in all_terms ranked hybrid; do
+  SEARCH_MODE=$mode deno run -A --config deno.json ../eval/graphrag/run_dmozdb_search.ts
+done
+```
+
+| Search op mode | Lookup recall@10 | Coverage@20 | Multi-hop both@10 | p50 / p95 |
+|---|---|---|---|---|
+| 0 all terms (today) | 0.077 | 0.000 | — | 2 / 8 ms |
+| 1 ranked keywords | 0.853 | 0.059 | — | 26 / 36 ms |
+| 2 hybrid | 0.910 | 0.172 | 0.187 | 30 / 37 ms |
+
+Backfill took 14 s. After a SIGKILL restart the vector index reloaded in
+301 ms and all 570 result lists were identical.

@@ -4,6 +4,7 @@ const category = @import("operations_category.zig");
 const link_mod = @import("operations_link.zig");
 const search = @import("operations_search.zig");
 const slug_mod = @import("operations_slug.zig");
+const vector_mod = @import("operations_vector.zig");
 
 pub const OperationError = shared.OperationError;
 pub const MAX_URL_LEN = shared.MAX_URL_LEN;
@@ -43,6 +44,15 @@ pub const searchCategories = search.searchCategories;
 pub const searchLinks = search.searchLinks;
 pub const searchCategoriesRanked = search.searchCategoriesRanked;
 pub const searchLinksRanked = search.searchLinksRanked;
+pub const searchLinksHybrid = search.searchLinksHybrid;
+pub const HybridLinks = search.HybridLinks;
+
+pub const putLinkVectors = vector_mod.putLinkVectors;
+pub const getLinkVector = vector_mod.getLinkVector;
+pub const loadVectorIndex = vector_mod.loadVectorIndex;
+pub const VectorWrite = vector_mod.VectorWrite;
+pub const VectorWriteResult = vector_mod.VectorWriteResult;
+pub const MAX_VECTORS_PER_WRITE = vector_mod.MAX_VECTORS_PER_WRITE;
 
 pub const resolveSlugPath = slug_mod.resolveSlugPath;
 pub const buildSlugPath = slug_mod.buildSlugPath;

@@ -81,6 +81,32 @@ comptime {
         @compileError("RepairTask size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(RepairTask)}) ++ ", expected 2080");
 }
 
+pub const EMBEDDING_DIMS: usize = 384;
+
+pub const LinkVector = extern struct {
+    link_id: u64 = 0,
+    scale: f32 = 0,
+    values: [EMBEDDING_DIMS]i8 = @splat(0),
+    _pad: [4]u8 = @splat(0),
+};
+
+comptime {
+    if (@sizeOf(LinkVector) != 400)
+        @compileError("LinkVector size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(LinkVector)}) ++ ", expected 400");
+}
+
+pub fn linkTextFingerprint(link: Link) u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    hasher.update(link.title.slice());
+    hasher.update(&.{0});
+    hasher.update(link.description.slice());
+    return hasher.final();
+}
+
+pub fn embeddedTextChanged(old: Link, new: Link) bool {
+    return linkTextFingerprint(old) != linkTextFingerprint(new);
+}
+
 pub const ParentChildKey = CompositeKey(&.{ "parent_id", "child_id" });
 pub const CategoryLinkKey = CompositeKey(&.{ "category_id", "link_id" });
 pub const SubmitterLinkKey = CompositeKey(&.{ "submitter_id", "link_id" });
@@ -173,4 +199,30 @@ test "RepairTask: round-trip via std.mem bytesToValue" {
     try std.testing.expectEqual(@as(u64, 42), decoded.cat_id);
     try std.testing.expectEqual(RepairOp.renamed_slug, decoded.op);
     try std.testing.expectEqualStrings("top/old", decoded.old_slug_prefix.slice());
+}
+
+test "linkTextFingerprint is FNV-1a 64 over title, a zero byte, then description" {
+    var link = Link{};
+    link.title = FixedString(128).fromSlice("ab");
+    link.description = FixedString(256).fromSlice("c");
+    try std.testing.expectEqual(std.hash.Fnv1a_64.hash("ab\x00c"), linkTextFingerprint(link));
+}
+
+test "embeddedTextChanged ignores status and url, sees title and description" {
+    var old = Link{};
+    old.title = FixedString(128).fromSlice("Bonsai");
+    old.description = FixedString(256).fromSlice("Trees");
+
+    var status_flip = old;
+    status_flip.status = @intFromEnum(LinkStatus.rejected);
+    status_flip.url = FixedString(64).fromSlice("https://moved.example");
+    try std.testing.expect(!embeddedTextChanged(old, status_flip));
+
+    var retitled = old;
+    retitled.title = FixedString(128).fromSlice("Bonsai Club");
+    try std.testing.expect(embeddedTextChanged(old, retitled));
+
+    var redescribed = old;
+    redescribed.description = FixedString(256).fromSlice("Small trees");
+    try std.testing.expect(embeddedTextChanged(old, redescribed));
 }

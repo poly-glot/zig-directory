@@ -33,6 +33,7 @@ pub const SubStatus = enum(u8) {
     offset_too_large = 8,
     already_in_progress = 9,
     duplicate_slug = 10,
+    embedding_model_mismatch = 11,
 };
 
 pub const StatusPair = struct {
@@ -54,6 +55,8 @@ pub fn mapErrorWithSubStatus(err: anyerror) StatusPair {
         error.UnsupportedOrder => .{ .status = .invalid, .sub_status = .unsupported_order },
         error.OffsetTooLarge => .{ .status = .invalid, .sub_status = .offset_too_large },
         error.SnapshotInProgress => .{ .status = .err, .sub_status = .already_in_progress },
+        error.EmbeddingModelMismatch => .{ .status = .invalid, .sub_status = .embedding_model_mismatch },
+        error.InvalidEmbeddingModel, error.TooManyVectors => .{ .status = .invalid, .sub_status = .none },
         else => .{ .status = .err, .sub_status = .none },
     };
 }
@@ -91,6 +94,7 @@ pub const Op = enum(u8) {
     bulk_update_link_status = 34,
     bulk_delete_links = 35,
     counts_by_status = 36,
+    put_link_vectors = 37,
     ping = 255,
 };
 
@@ -294,6 +298,7 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
         .bulk_update_link_status => handleBulkUpdateLinkStatus(db, resp, op_byte, payload),
         .bulk_delete_links => handleBulkDeleteLinks(db, resp, op_byte, payload),
         .counts_by_status => handleCountsByStatus(db, resp, op_byte),
+        .put_link_vectors => handlePutLinkVectors(db, resp, op_byte, payload),
     };
 }
 
@@ -753,9 +758,13 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
 }
 
 const SearchScope = enum(u8) { both = 0, links_only = 1, categories_only = 2 };
-const SearchMode = enum(u8) { all_terms = 0, ranked = 1 };
+const SearchMode = enum(u8) { all_terms = 0, ranked = 1, hybrid = 2 };
+const EMBEDDING_BYTES: usize = schema.EMBEDDING_DIMS * 4;
+const HYBRID_QUERY_BYTES: usize = 8 + EMBEDDING_BYTES;
+const VECTOR_WRITE_BYTES: usize = 8 + 8 + EMBEDDING_BYTES;
 
 const inverted = @import("zigstore").inverted_index;
+const vector_index = @import("vector_index.zig");
 
 fn linkMatchField(link: schema.Link, query: []const u8) u8 {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
@@ -771,14 +780,20 @@ fn linkMatchField(link: schema.Link, query: []const u8) u8 {
 fn searchCategoriesInMode(db: *Directory, mode: SearchMode, query: []const u8, max: u32, buf: []schema.Category) ![]schema.Category {
     return switch (mode) {
         .all_terms => operations.searchCategories(db, query, max, buf),
-        .ranked => operations.searchCategoriesRanked(db, query, max, buf),
+        .ranked, .hybrid => operations.searchCategoriesRanked(db, query, max, buf),
     };
 }
 
-fn searchLinksInMode(db: *Directory, mode: SearchMode, query: []const u8, max: u32, buf: []schema.Link) ![]schema.Link {
+fn searchLinksInMode(db: *Directory, mode: SearchMode, query: []const u8, query_vector: []const u8, max: u32, buf: []schema.Link) !operations.HybridLinks {
     return switch (mode) {
-        .all_terms => operations.searchLinks(db, query, max, buf),
-        .ranked => operations.searchLinksRanked(db, query, max, buf),
+        .all_terms => .{ .links = try operations.searchLinks(db, query, max, buf), .vector_used = false },
+        .ranked => .{ .links = try operations.searchLinksRanked(db, query, max, buf), .vector_used = false },
+        .hybrid => {
+            const model = std.mem.readInt(u64, query_vector[0..8], .little);
+            var embedding: vector_index.Embedding = undefined;
+            vector_index.readEmbedding(query_vector[8..][0..EMBEDDING_BYTES], &embedding);
+            return operations.searchLinksHybrid(db, query, model, &embedding, max, buf);
+        },
     };
 }
 
@@ -791,15 +806,18 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const limit = std.mem.readInt(u32, payload[2 + query_len ..][0..4], .little);
 
     const trailing = payload[2 + query_len + 4 ..];
-    if (trailing.len > 2) return writeErrorResp(resp, op_byte, .invalid);
-    const scope: SearchScope = if (trailing.len >= 1)
-        std.enums.fromInt(SearchScope, trailing[0]) orelse return writeErrorResp(resp, op_byte, .invalid)
+    const options = trailing[0..@min(trailing.len, 2)];
+    const query_vector = trailing[options.len..];
+    const scope: SearchScope = if (options.len >= 1)
+        std.enums.fromInt(SearchScope, options[0]) orelse return writeErrorResp(resp, op_byte, .invalid)
     else
         .both;
-    const mode: SearchMode = if (trailing.len == 2)
-        std.enums.fromInt(SearchMode, trailing[1]) orelse return writeErrorResp(resp, op_byte, .invalid)
+    const mode: SearchMode = if (options.len == 2)
+        std.enums.fromInt(SearchMode, options[1]) orelse return writeErrorResp(resp, op_byte, .invalid)
     else
         .all_terms;
+    const expected_vector_len: usize = if (mode == .hybrid) HYBRID_QUERY_BYTES else 0;
+    if (query_vector.len != expected_vector_len) return writeErrorResp(resp, op_byte, .invalid);
 
     if (resp.len < RESPONSE_HEADER_SIZE + 4) return writeErrorResp(resp, op_byte, .err);
 
@@ -813,10 +831,11 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     var off = writeCountedCategoryRows(resp, RESPONSE_HEADER_SIZE, cats, 2);
 
     var link_buf: [SEARCH_MAX_RESULTS]schema.Link = undefined;
-    const links = if (scope == .categories_only)
-        link_buf[0..0]
+    const found: operations.HybridLinks = if (scope == .categories_only)
+        .{ .links = link_buf[0..0], .vector_used = false }
     else
-        searchLinksInMode(db, mode, query, max, &link_buf) catch &[0]schema.Link{};
+        searchLinksInMode(db, mode, query, query_vector, max, &link_buf) catch .{ .links = link_buf[0..0], .vector_used = false };
+    const links = found.links;
     const link_count_off = off;
     off += 2;
     var links_written: u16 = 0;
@@ -829,6 +848,45 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     }
     std.mem.writeInt(u16, resp[link_count_off..][0..2], links_written, .little);
 
+    if (mode == .hybrid) {
+        if (off + 1 > resp.len) return writeErrorResp(resp, op_byte, .err);
+        resp[off] = @intFromBool(found.vector_used);
+        off += 1;
+    }
+
+    writeOkHeader(resp, op_byte, off, 0);
+    return off;
+}
+
+fn handlePutLinkVectors(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    if (payload.len < 10) return writeErrorResp(resp, op_byte, .invalid);
+    const model = std.mem.readInt(u64, payload[0..8], .little);
+    const count = std.mem.readInt(u16, payload[8..10], .little);
+    if (count == 0 or count > operations.MAX_VECTORS_PER_WRITE) return writeErrorResp(resp, op_byte, .invalid);
+    if (payload.len != 10 + @as(usize, count) * VECTOR_WRITE_BYTES) return writeErrorResp(resp, op_byte, .invalid);
+    if (resp.len < RESPONSE_HEADER_SIZE + 4 + @as(usize, count) * 9) return writeErrorResp(resp, op_byte, .err);
+
+    var writes: [operations.MAX_VECTORS_PER_WRITE]operations.VectorWrite = undefined;
+    for (writes[0..count], 0..) |*w, i| {
+        const item = payload[10 + i * VECTOR_WRITE_BYTES ..][0..VECTOR_WRITE_BYTES];
+        w.link_id = std.mem.readInt(u64, item[0..8], .little);
+        w.text_fingerprint = std.mem.readInt(u64, item[8..16], .little);
+        vector_index.readEmbedding(item[16..][0..EMBEDDING_BYTES], &w.embedding);
+    }
+
+    var results: [operations.MAX_VECTORS_PER_WRITE]operations.VectorWriteResult = undefined;
+    operations.putLinkVectors(db, model, writes[0..count], results[0..count]) catch |err| return writeMappedError(resp, op_byte, err);
+
+    var ok_count: u16 = 0;
+    var off: usize = RESPONSE_HEADER_SIZE + 4;
+    for (writes[0..count], results[0..count]) |w, result| {
+        std.mem.writeInt(u64, resp[off..][0..8], w.link_id, .little);
+        resp[off + 8] = @intFromEnum(result);
+        off += 9;
+        if (result == .ok) ok_count += 1;
+    }
+    std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], ok_count, .little);
+    std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE + 2 ..][0..2], count - ok_count, .little);
     writeOkHeader(resp, op_byte, off, 0);
     return off;
 }
@@ -2212,6 +2270,64 @@ test "search (op=14): mode byte selects ranked matching and absent mode keeps al
     pbuf[base + 2] = 0;
     _ = handleSearch(db, &resp, @intFromEnum(Op.search), pbuf[0 .. base + 3]);
     try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+}
+
+test "put_link_vectors (op=37) and hybrid search (op=14 mode 2) frames" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try operations.createCategory(db, 0, "Top", "top", "");
+    const link_id = try operations.createLink(db, top_id, "https://bonsai.example", "Bonsai Nursery", "");
+    const link = (try operations.getLink(db, link_id)).?;
+    const model: u64 = 0xB6E5;
+
+    var put: [10 + VECTOR_WRITE_BYTES]u8 = @splat(0);
+    std.mem.writeInt(u64, put[0..8], model, .little);
+    std.mem.writeInt(u16, put[8..10], 1, .little);
+    std.mem.writeInt(u64, put[10..18], link_id, .little);
+    std.mem.writeInt(u64, put[18..26], schema.linkTextFingerprint(link), .little);
+    std.mem.writeInt(u32, put[26..30], @bitCast(@as(f32, 1)), .little);
+
+    var resp: [16384]u8 = undefined;
+    _ = handlePutLinkVectors(db, &resp, @intFromEnum(Op.put_link_vectors), put[0 .. put.len - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    _ = handlePutLinkVectors(db, &resp, @intFromEnum(Op.put_link_vectors), &put);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], .little));
+    try std.testing.expectEqual(link_id, std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE + 4 ..][0..8], .little));
+    try std.testing.expectEqual(@as(u8, 0), resp[RESPONSE_HEADER_SIZE + 12]);
+
+    std.mem.writeInt(u64, put[0..8], model + 1, .little);
+    _ = handlePutLinkVectors(db, &resp, @intFromEnum(Op.put_link_vectors), &put);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+    try std.testing.expectEqual(@intFromEnum(SubStatus.embedding_model_mismatch), resp[6]);
+
+    try operations.loadVectorIndex(db);
+
+    const query = "zzzz";
+    var search: [2 + query.len + 4 + 2 + HYBRID_QUERY_BYTES]u8 = @splat(0);
+    std.mem.writeInt(u16, search[0..2], query.len, .little);
+    @memcpy(search[2..][0..query.len], query);
+    std.mem.writeInt(u32, search[2 + query.len ..][0..4], 10, .little);
+    const opts = 2 + query.len + 4;
+    search[opts] = @intFromEnum(SearchScope.links_only);
+    search[opts + 1] = @intFromEnum(SearchMode.hybrid);
+    std.mem.writeInt(u64, search[opts + 2 ..][0..8], model, .little);
+    std.mem.writeInt(u32, search[opts + 10 ..][0..4], @bitCast(@as(f32, 1)), .little);
+
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), search[0 .. search.len - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    const len = handleSearch(db, &resp, @intFromEnum(Op.search), &search);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    const links_off = RESPONSE_HEADER_SIZE + 2;
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[links_off..][0..2], .little));
+    try std.testing.expectEqual(link_id, std.mem.readInt(u64, resp[links_off + 2 ..][0..8], .little));
+    try std.testing.expectEqual(@as(u8, 1), resp[len - 1]);
 }
 
 test "list_all_links with out-of-range status returns invalid" {

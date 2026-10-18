@@ -73,6 +73,23 @@ pub fn applyLinkInserted(db: *Directory, e: changeset.LinkInsertEffect) !void {
     db.subtree_cache.invalidateAll();
 }
 
+pub fn applyLinkVectorsPut(db: *Directory, e: changeset.LinkVectorsPutEffect) !void {
+    db.store.counter("embedding_model").* = e.model;
+    db.vectors.model.store(e.model, .release);
+
+    for (e.vectors) |v| {
+        const key = codec.encodeU64(v.link_id);
+        try db.link_vectors().insert(&key, std.mem.asBytes(&v));
+        try db.vectors.put(db.io, db.allocator, v);
+    }
+}
+
+fn deleteLinkVector(db: *Directory, link_id: u64) !void {
+    const key = codec.encodeU64(link_id);
+    _ = try db.link_vectors().delete(&key);
+    db.vectors.remove(db.io, link_id);
+}
+
 pub fn applyLinkDeleted(db: *Directory, e: changeset.LinkDeleteEffect) !void {
     const id_key = codec.encodeU64(e.link.id);
 
@@ -89,6 +106,7 @@ pub fn applyLinkDeleted(db: *Directory, e: changeset.LinkDeleteEffect) !void {
     try apply.writeTokens(db.links_index_tree(), e.tokens, e.link.id, .delete);
 
     try db.mt_links_by_id().delete(&id_key);
+    try deleteLinkVector(db, e.link.id);
 
     try apply.cascadeAncestorCounts(db, e.ancestor_updates, e.link.category_id, .link_count, false);
 
@@ -104,6 +122,8 @@ pub fn applyLinkTextUpdated(db: *Directory, e: changeset.LinkTextUpdateEffect) !
 
     try apply.writeTokens(db.links_index_tree(), e.old_tokens, e.new_link.id, .delete);
     try apply.writeTokens(db.links_index_tree(), e.new_tokens, e.new_link.id, .insert);
+
+    if (schema.embeddedTextChanged(e.old_link, e.new_link)) try deleteLinkVector(db, e.new_link.id);
 
     if (!std.mem.eql(u8, e.old_link.url.slice(), e.new_link.url.slice())) {
         try deleteUrlHashIfOwnedBy(db, e.old_link.url.slice(), e.new_link.id);
