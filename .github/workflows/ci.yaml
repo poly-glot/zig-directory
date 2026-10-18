@@ -87,6 +87,9 @@ jobs:
       - name: deno task check
         run: deno task check
 
+      - name: Fetch embedding model
+        run: deno run -A scripts/fetch-embedding-model.ts
+
       - name: deno task test
         run: deno task test
 

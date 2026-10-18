@@ -2,6 +2,7 @@ import { page } from "fresh";
 import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
 import { isHttpUrl } from "../../../lib/url.ts";
+import { storeLinkVector } from "../../../lib/embedder.ts";
 import { formField } from "../../../lib/utils.ts";
 import CreatePageShell from "../../../components/admin/CreatePageShell/CreatePageShell.tsx";
 import CategoryPicker from "../../../islands/CategoryPicker.tsx";
@@ -89,12 +90,13 @@ export const handler = define.handlers<Data>({
     }
 
     try {
-      await client.createLink(
+      const id = await client.createLink(
         values.categoryId,
         values.url,
         values.title,
         values.description,
       );
+      await storeLinkVector(client, id);
     } catch (e) {
       return page({
         values,

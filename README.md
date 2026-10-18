@@ -107,12 +107,13 @@ worker and the binary-protocol op handlers.
 
 The store lives in `DMOZDB_DATA_DIR` as `store.dat` (16 KB pages), `wal.bin` and `snapshot.meta`:
 
-- **Page 0**: file header (magic `DMOZ` / `0x444D4F5A`, `format_version` 5, a root page + entry count per index, the
-  three ID counters `next_category_id`, `next_link_id`, `next_repair_seq`)
+- **Page 0**: file header (magic `DMOZ` / `0x444D4F5A`, `format_version` 6, a root page + entry count per index, the
+  three ID counters `next_category_id`, `next_link_id`, `next_repair_seq`, and the `embedding_model` id). A format 5
+  header is rewritten to format 6 at boot; data pages are untouched
 - **Pages 1+**: B+Tree nodes. Every root is allocated lazily on first insert and recorded in the header, so no page
   number is fixed beyond page 0
 
-Eleven B+Trees back the read and write paths; the first six are also fronted by a memtable:
+Twelve B+Trees back the read and write paths; the first six are also fronted by a memtable:
 
 | Index                       | Key                       | Value                     | Memtable | Purpose                                            |
 |-----------------------------|---------------------------|---------------------------|----------|----------------------------------------------------|
@@ -127,6 +128,7 @@ Eleven B+Trees back the read and write paths; the first six are also fronted by 
 | `categories_index_tree`     | token ‖ category ID (BE)  | (empty)                   | no       | Posting list for category text search              |
 | `links_index_tree`          | token ‖ link ID (BE)      | (empty)                   | no       | Posting list for link text search                  |
 | `slug_path_repair_queue`    | repair_seq (BE)           | RepairTask (2,080 bytes)  | no       | Pending descendant slug-path cleanups              |
+| `link_vectors`              | link ID                   | LinkVector (400 bytes)    | no       | int8 embedding per link for hybrid search          |
 
 ### Network Layer
 
@@ -340,6 +342,7 @@ Response: [u32 len][u8 op][u8 status][u8 sub_status][u8 pad][u16 count][payload.
 | 34     | `bulk_update_link_status` | no      | Set status on up to 200 links, per-item result codes                     |
 | 35     | `bulk_delete_links`       | no      | Delete up to 200 links, per-item result codes                            |
 | 36     | `counts_by_status`        | no      | Link counts per status                                                   |
+| 37     | `put_link_vectors`        | no      | Store up to 32 link embeddings, per-item result codes                    |
 | 255    | `ping`                    | no      | Ping/pong                                                                |
 
 Codes 21 and 31–33 are unassigned.
@@ -374,6 +377,7 @@ Codes 21 and 31–33 are unassigned.
 | 8      | `offset_too_large`    | `invalid`            | `list_subtree_links` offset above 5000               |
 | 9      | `already_in_progress` | `err`                | A snapshot is already running                        |
 | 10     | `duplicate_slug`      | `duplicate`          | A sibling category already has that slug (create, rename, or move) |
+| 11     | `embedding_model_mismatch` | `invalid`       | `put_link_vectors` model differs from the one the store already holds |
 
 ### CRUD Operations
 
@@ -464,10 +468,23 @@ Each crumb list runs root-first and ends with the category itself; an unknown ID
 **Search (op=14)**
 ```
 Request:  [u16 query_len (>= 2)][query][u32 limit][optional u8 scope: 0=both 1=links_only 2=categories_only]
+          [optional u8 mode: 0=all_terms 1=ranked 2=hybrid][hybrid only: u64 model][384 x f32 LE query embedding]
 Response: [u16 cat_count][categories...][u16 link_count][link_count x ([Link bytes][u8 match_field])]
+          [hybrid only: u8 vector_used]
 ```
 
-`limit` is capped at 50 per kind. `match_field` is 0=title, 1=url, 2=description.
+`limit` is capped at 50 per kind. `match_field` is 0=title, 1=url, 2=description, 3=semantic (found by the vector half
+only). An absent mode byte means `all_terms`. `vector_used` is 0 when the server answered from keywords alone.
+
+**Put link vectors (op=37)**
+```
+Request:  [u64 model][u16 count (1..32)][count x ([u64 link_id][u64 text_fingerprint][384 x f32 LE])]
+Response: [u16 ok][u16 err][(ok + err) x ([u64 link_id][u8 code])]
+```
+
+`text_fingerprint` is FNV-1a 64 over `title ++ 0x00 ++ description`. Codes: 0=ok, 1=not_found, 2=stale_text (the
+link's text changed since it was embedded), 3=invalid_vector (non-finite or zero). The server L2-normalises and
+quantises to int8. A `model` of 0, or one different from the stored model, is refused for the whole frame.
 
 ### Update Operations
 
@@ -588,7 +605,7 @@ This compiles the test graph rooted at `src/main.zig`, which pulls in every modu
 - **ChangeSet**: encode/decode of every effect variant
 - **Apply**: effect handlers, ancestor count cascades, token writes, repair-queue writes
 - **Operations**: categories (CRUD, hierarchy, circular-move rejection), links (CRUD, duplicate URL, status counts),
-  slug-path resolution and validation gate, search (AND intersection), subtree listing
+  slug-path resolution and validation gate, search (all-terms, ranked, hybrid), link vectors, subtree listing
 - **Binary protocol**: payload parsing, sub-status mapping, response headers, `list_subtree_links`, `snapshot`,
   `op_latency_stats`, `stats`
 - **Directory**: header round-trips, counters across reopen, recovery boot path
@@ -708,6 +725,9 @@ zig-directory/
 │   ├── changeset.zig                     Typed ChangeSet effects + encoder/decoder (WAL op 100)
 │   ├── subtree.zig                       Descendant collection and cache for browse_path / list_subtree_links
 │   ├── verifier.zig                      Background invariant verifier (warn-only)
+│   ├── header_upgrade.zig                Boot-time store.dat header rewrite, format 5 → 6
+│   ├── ranking.zig                       Scored ids, bounded top-k, reciprocal rank fusion
+│   ├── vector_index.zig                  In-memory int8 link-vector matrix and nearest scan
 │   ├── e2e_test.zig                      End-to-end tests against a temp data dir
 │   ├── test_support.zig                  Test-only fixtures: category/link builders, isPresent, tokenKey
 │   ├── gen_client_ts.zig                 Driver for `zig build gen-client-ts`
@@ -723,7 +743,8 @@ zig-directory/
 │   │   ├── operations_changeset_compute.zig  Builds a ChangeSet per mutation
 │   │   ├── operations_category.zig       Category CRUD, move, listing, ancestors
 │   │   ├── operations_link.zig           Link CRUD, status, duplicate check, status recount
-│   │   ├── operations_search.zig         Posting-list search with AND intersection
+│   │   ├── operations_search.zig         Posting-list search: all-terms, IDF-ranked, hybrid
+│   │   ├── operations_vector.zig         put_link_vectors and the background matrix load
 │   │   └── operations_slug.zig           Slug validation and slug-path resolution
 │   ├── repair/
 │   │   ├── repair.zig                    rebuild_index (op 20)
@@ -735,7 +756,7 @@ zig-directory/
 │   ├── workloads/                        seed, create_link, bulk_import, get_link, browse, search, mixed, cold
 │   ├── run-constrained.sh, run-server-constrained.sh
 │   └── README.md
-├── web/                                  Deno/Fresh frontend; web/lib/dmoz-protocol.gen.ts is generated
+├── web/                                  Deno/Fresh frontend and query/link embedder; web/lib/dmoz-protocol.gen.ts is generated
 ├── mcp/                                  FastMCP server over the frontend's /api/v1
 ├── e2e/                                  Playwright suite for the web frontend
 ├── k6/                                   k6 stress script
@@ -913,11 +934,17 @@ Full-text search is served by two on-disk B+Trees: `categories_index_tree` and `
 
 **Per-token posting list.** For each query token the search emits one B+Tree range scan, accumulating document IDs. Posting lists are sorted by ID, so results stream in order without an explicit sort.
 
-**AND-of-tokens intersection.** When the query has multiple tokens, the search intersects the posting lists, yielding only documents that contain every token. The first posting list serves as the candidate set; subsequent posting lists prune it. The query "green solutions" returns documents containing both tokens, not either-or.
+**Modes.** The mode byte picks one of three strategies:
 
-**Materialisation.** The first `limit` (at most 50) surviving IDs are hydrated via `getLink` / `getCategory` (memtable → primary B+Tree). Documents that no longer exist (deleted between indexing and search) are silently skipped. Each link row carries a `match_field` byte telling the client whether the title, URL or description matched.
+- `all_terms` (the default, used by the admin screens) intersects the posting lists, so only documents containing every token match, returned in ID order.
+- `ranked` scores every document containing any token by the sum of its tokens' IDF, `ln(1 + (N − df + 0.5)/(df + 0.5))`, highest first, ties on ascending ID. A token whose posting list passes 20,000 entries contributes nothing, which bounds the cost of tokens like `www`.
+- `hybrid` runs `ranked` for the top 200 keyword candidates and a flat int8 dot-product scan over the in-memory vector matrix for the top 200 nearest links, then fuses the two lists with reciprocal rank fusion (k = 60). If the query's model differs from the stored one, or the matrix is still loading after boot, it answers from keywords alone and clears `vector_used`.
 
-**What the search does not do.** There is no relevance ranking: results are returned in ID order. No TF-IDF, no BM25, no field boosting, no phrase queries or fuzzy matching. Non-ASCII characters are not lowercased; a search for "blüm" will not match a document containing "Blüm" because the tokeniser only handles ASCII case folding.
+**Vectors.** The web tier embeds text with `bge-small-en-v1.5` (int8 ONNX, CLS pooling, 384 dimensions) and writes link vectors with `put_link_vectors`; dmozdb never runs a model. A title or description edit, or a delete, removes the link's vector in the same apply, and a write carrying a stale text fingerprint is refused, so a stored vector always matches the link's current text. The matrix is rebuilt from `link_vectors` by a background thread after the port opens.
+
+**Materialisation.** The first `limit` (at most 50) IDs are hydrated via `getLink` / `getCategory` (memtable → primary B+Tree). Documents that no longer exist (deleted between indexing and search) are silently skipped. Each link row carries a `match_field` byte telling the client whether the title, URL or description matched, or that only the vector half found it.
+
+**What the search does not do.** No term frequency or document length (IDF over binary postings measured within noise of BM25 on this corpus), no field boosting, no phrase queries or fuzzy matching. Non-ASCII characters are not lowercased; a search for "blüm" will not match a document containing "Blüm" because the tokeniser only handles ASCII case folding.
 
 ---
 

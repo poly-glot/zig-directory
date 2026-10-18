@@ -5,6 +5,7 @@ import {
   type Link,
   type SearchResult,
 } from "../../lib/dmoz-client.ts";
+import { embedQuery } from "../../lib/embedder.ts";
 import { tokensFor } from "./_lib/highlight.tsx";
 import { buildHref, parsePositiveInt, parseSort } from "./_lib/queryParams.ts";
 import {
@@ -52,6 +53,7 @@ async function buildSearchResult(
   const rawResults = await client.search(q, {
     limit: 50,
     mode: "ranked",
+    queryEmbedding: await embedQuery(q),
   });
   const crumbIds = new Set<number>();
   for (const c of rawResults.categories) crumbIds.add(c.id);

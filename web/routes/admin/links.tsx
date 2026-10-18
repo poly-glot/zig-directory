@@ -5,6 +5,7 @@ import {
   type Link,
   type LinkStatus,
 } from "../../lib/dmoz-client.ts";
+import { storeLinkVector } from "../../lib/embedder.ts";
 import AdminShell from "../../components/admin/AdminShell/AdminShell.tsx";
 import AdminStatusChip from "../../components/admin/AdminStatusChip/AdminStatusChip.tsx";
 import Banner from "../../components/admin/Banner/Banner.tsx";
@@ -184,6 +185,7 @@ async function applyAction(
       if (urlVal) updates.url = urlVal;
       updates.description = formField(form, "description");
       await client.updateLink(id, updates);
+      await storeLinkVector(client, id);
       return "Link updated";
     }
     case "delete":
