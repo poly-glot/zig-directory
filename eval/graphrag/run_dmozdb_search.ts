@@ -1,5 +1,5 @@
-import { DmozClient, type QueryEmbedding } from "../../web/lib/dmoz-client.ts";
-import { EMBEDDING_MODEL } from "./embedding_model.ts";
+import { DmozClient } from "../../web/lib/dmoz-client.ts";
+import { embedQuery } from "../../web/lib/embedder.ts";
 
 const LIMIT = 20;
 const OUTPUT_FILE = {
@@ -23,46 +23,50 @@ async function readJsonl(name: string): Promise<Record<string, unknown>[]> {
   );
 }
 
-async function queryEmbeddings(): Promise<Map<string, QueryEmbedding>> {
-  const rows = await readJsonl("query_vectors.jsonl");
-  return new Map(rows.map((row) => [
-    row.qid as string,
-    {
-      model: EMBEDDING_MODEL,
-      vector: Float32Array.from(row.vector as number[]),
-    },
-  ]));
+function percentile(values: number[], p: number): number {
+  const sorted = values.toSorted((a, b) => a - b);
+  return Math.round(sorted[Math.floor((sorted.length - 1) * p)] ?? 0);
 }
 
 const questions = [
   ...await readJsonl("questions.jsonl"),
   ...(mode === "hybrid" ? await readJsonl("multihop_questions.jsonl") : []),
 ];
-const embeddings = mode === "hybrid" ? await queryEmbeddings() : new Map();
 
 const rows: string[] = [];
+const searchMs: number[] = [];
+const embedMs: number[] = [];
 let vectorUsed = 0;
 for (const q of questions) {
+  const query = q.query as string;
+
+  const embedStarted = performance.now();
+  const queryEmbedding = mode === "hybrid"
+    ? await embedQuery(query)
+    : undefined;
+  embedMs.push(performance.now() - embedStarted);
+
   const started = performance.now();
-  const result = await client.search(q.query as string, {
+  const result = await client.search(query, {
     limit: LIMIT,
     scope: "links",
     mode: mode === "all_terms" ? "all_terms" : "ranked",
-    queryEmbedding: embeddings.get(q.qid as string),
+    queryEmbedding,
   }).catch(() => ({ links: [], vectorUsed: false }));
+  searchMs.push(performance.now() - started);
+
   if (result.vectorUsed) vectorUsed++;
-  rows.push(
-    JSON.stringify({
-      qid: q.qid,
-      ids: result.links.map((l) => l.id),
-      ms: performance.now() - started,
-    }),
-  );
+  rows.push(JSON.stringify({ qid: q.qid, ids: result.links.map((l) => l.id) }));
 }
 
 await Deno.writeTextFile(
   new URL(OUTPUT_FILE[mode], outDir),
   rows.join("\n") + "\n",
 );
-console.log(`searched ${rows.length} questions (${vectorUsed} used vectors)`);
+console.log(JSON.stringify({
+  searched: rows.length,
+  vectorUsed,
+  searchMs: { p50: percentile(searchMs, 0.5), p95: percentile(searchMs, 0.95) },
+  embedMs: { p50: percentile(embedMs, 0.5), p95: percentile(embedMs, 0.95) },
+}));
 Deno.exit(0);

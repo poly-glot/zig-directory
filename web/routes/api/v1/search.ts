@@ -1,5 +1,6 @@
 import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
+import { embedQuery } from "../../../lib/embedder.ts";
 import {
   categoryJson,
   categoryPath,
@@ -11,7 +12,7 @@ import {
 type Scope = "both" | "links" | "categories";
 
 const MIN_QUERY_LENGTH = 2;
-const MATCHED_FIELD = ["title", "url", "description"] as const;
+const MATCHED_FIELD = ["title", "url", "description", "semantic"] as const;
 
 function parseScope(raw: string | null): Scope {
   if (raw === "links" || raw === "categories") return raw;
@@ -30,10 +31,14 @@ export const handler = define.handlers({
     }
     try {
       const client = getClient();
+      const scope = parseScope(searchParams.get("scope"));
       const result = await client.search(query, {
         limit: pageSize(searchParams.get("limit")),
-        scope: parseScope(searchParams.get("scope")),
+        scope,
         mode: "ranked",
+        queryEmbedding: scope === "categories"
+          ? undefined
+          : await embedQuery(query),
       });
       const chains = await client.breadcrumbsByIds([
         ...result.categories.map((c) => c.id),

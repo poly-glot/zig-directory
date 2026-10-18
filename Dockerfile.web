@@ -38,6 +38,11 @@ COPY web/ ./
 # ~65 MB of unused node_modules into the binary (verified: it still boots, serves,
 # and opens KV without them).
 RUN deno task build && rm -rf node_modules
+RUN deno install --entrypoint _fresh/compiled-entry.js && \
+    cd node_modules/.deno/onnxruntime-node@*/node_modules/onnxruntime-node/bin/napi-v6 && \
+    rm -rf darwin win32 linux/x64 && \
+    mv linux/arm64/libonnxruntime.so.1 /web/
+RUN deno run -A scripts/fetch-embedding-model.ts
 RUN deno compile \
     --output dmozdb-web \
     --include _fresh \
@@ -61,6 +66,10 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=web-builder /web/dmozdb-web /usr/local/bin/dmozdb-web
+COPY --from=web-builder /web/libonnxruntime.so.1 /usr/local/lib/
+RUN ldconfig
+COPY --from=web-builder /web/data/models /opt/models
+ENV EMBEDDING_MODEL_DIR=/opt/models/bge-small-en-v1.5
 
 # compiled-entry.js reads PORT and HOSTNAME; bind all interfaces in-container.
 ENV HOSTNAME=0.0.0.0

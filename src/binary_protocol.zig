@@ -766,15 +766,17 @@ const VECTOR_WRITE_BYTES: usize = 8 + 8 + EMBEDDING_BYTES;
 const inverted = @import("zigstore").inverted_index;
 const vector_index = @import("vector_index.zig");
 
-fn linkMatchField(link: schema.Link, query: []const u8) u8 {
+const MatchField = enum(u8) { title = 0, url = 1, description = 2, semantic = 3 };
+
+fn linkMatchField(link: schema.Link, query: []const u8) MatchField {
     var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     var it = inverted.TokenIterator.init(query);
     while (it.next(&tok_buf)) |tok| {
-        if (std.ascii.findIgnoreCase(link.title.slice(), tok) != null) return 0;
-        if (std.ascii.findIgnoreCase(link.url.slice(), tok) != null) return 1;
-        if (std.ascii.findIgnoreCase(link.description.slice(), tok) != null) return 2;
+        if (std.ascii.findIgnoreCase(link.title.slice(), tok) != null) return .title;
+        if (std.ascii.findIgnoreCase(link.url.slice(), tok) != null) return .url;
+        if (std.ascii.findIgnoreCase(link.description.slice(), tok) != null) return .description;
     }
-    return 0;
+    return .semantic;
 }
 
 fn searchCategoriesInMode(db: *Directory, mode: SearchMode, query: []const u8, max: u32, buf: []schema.Category) ![]schema.Category {
@@ -842,7 +844,7 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     for (links) |*link| {
         if (off + @sizeOf(schema.Link) + 1 > resp.len) break;
         off = appendRow(resp, off, link);
-        resp[off] = linkMatchField(link.*, query);
+        resp[off] = @intFromEnum(linkMatchField(link.*, query));
         off += 1;
         links_written += 1;
     }
@@ -2327,6 +2329,7 @@ test "put_link_vectors (op=37) and hybrid search (op=14 mode 2) frames" {
     const links_off = RESPONSE_HEADER_SIZE + 2;
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[links_off..][0..2], .little));
     try std.testing.expectEqual(link_id, std.mem.readInt(u64, resp[links_off + 2 ..][0..8], .little));
+    try std.testing.expectEqual(@intFromEnum(MatchField.semantic), resp[links_off + 2 + @sizeOf(schema.Link)]);
     try std.testing.expectEqual(@as(u8, 1), resp[len - 1]);
 }
 

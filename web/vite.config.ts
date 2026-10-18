@@ -5,6 +5,11 @@ import { fresh } from "@fresh/plugin-vite";
 // and to avoid breaking any external scripts that hit the dev server.
 export default defineConfig({
   plugins: [fresh()],
+  environments: {
+    ssr: {
+      build: { rollupOptions: { external: ["onnxruntime-node"] } },
+    },
+  },
   server: {
     port: 8000,
     host: "0.0.0.0",

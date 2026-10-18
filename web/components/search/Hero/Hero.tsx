@@ -96,10 +96,10 @@ export default function Hero(
     <section class={styles.hero}>
       <div class="container">
         <Eyebrow label="Search the index" muted />
-        <h1 class="display mt-16">Find a site by keyword.</h1>
+        <h1 class="display mt-16">Find a site by describing it.</h1>
         <p class="lede mt-16">
-          Editor-vetted results from the directory's full-text index, ranked by
-          how many of your words match and how rare they are.
+          Editor-vetted results ranked by your words and by what they mean, so a
+          site can match without using your exact terms.
         </p>
         <form
           action="/search"
