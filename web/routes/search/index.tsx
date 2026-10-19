@@ -2,13 +2,11 @@ import { page } from "fresh";
 import { define } from "../../utils.ts";
 import {
   type DmozClient,
-  DmozError,
   getClient,
   type Link,
   QUERY_LINKS_MAX_ROWS,
   type SearchLink,
   type SearchResult,
-  Status,
 } from "../../lib/dmoz-client.ts";
 import { embedQuery } from "../../lib/embedder.ts";
 import { tokensFor } from "./_lib/highlight.tsx";
@@ -97,20 +95,6 @@ function emptyData(q: string, sort: Sort, cat: number, year: number): Data {
   };
 }
 
-async function categoryIdAt(
-  client: DmozClient,
-  path: string,
-): Promise<number | undefined> {
-  try {
-    return (await client.browsePath(path)).category.id;
-  } catch (e) {
-    if (e instanceof DmozError && e.status === Status.NotFound) {
-      return undefined;
-    }
-    throw e;
-  }
-}
-
 async function understand(q: string): Promise<Understanding> {
   const vocabulary = await queryVocabulary();
   const typed = typedTargets(q, vocabulary);
@@ -134,7 +118,8 @@ async function withCategoryPath(
   if (at < 0) return { targets, label: "" };
 
   const target = targets[at];
-  const id = target.categoryId ?? await categoryIdAt(client, target.value);
+  const id = target.categoryId ??
+    (await client.browsePathIfFound(target.value))?.category.id;
   if (id === undefined) return { missing: target.value };
 
   const chains = await client.breadcrumbsByIds([id]);

@@ -25,6 +25,7 @@ pub const LinkFact = struct {
     cctld: countries.Code,
     status: u8,
     hosted: bool,
+    subdomain: bool,
 };
 
 pub const CategoryFact = struct {
@@ -77,6 +78,7 @@ pub const Query = struct {
     religions: u16 = 0,
     entity_name: []const u8 = "",
     hosted_only: bool = false,
+    subdomain_only: bool = false,
     status: ?u8 = @intFromEnum(schema.LinkStatus.approved),
     allowed_ids: ?*const IdSet = null,
     group_by: GroupBy = .none,
@@ -401,6 +403,7 @@ pub const FactsIndex = struct {
             .cctld = url_facts.cctldCountry(url.host) orelse countries.none,
             .status = link.status,
             .hosted = site.hosted,
+            .subdomain = site.hosted and std.mem.findScalar(u8, site.key, '/') == null,
         });
     }
 
@@ -612,6 +615,7 @@ const Evaluator = struct {
         const q = self.query;
         if (q.status) |status| if (fact.status != status) return null;
         if (q.hosted_only and !fact.hosted) return null;
+        if (q.subdomain_only and !fact.subdomain) return null;
         if (q.allowed_ids) |allowed| if (!allowed.contains(id)) return null;
         if (q.domain_suffix.len > 0 and !url_facts.hasSuffix(self.index.strings.get(fact.host), q.domain_suffix)) return null;
 
@@ -872,6 +876,31 @@ test "a category is found by its name in any case or number, and a rename or del
 
     try index.dropCategory(io, allocator, 2);
     try testing.expectEqualSlices(u64, &.{4}, try index.categoriesNamed(io, arena, "arts"));
+}
+
+test "subdomain_only keeps whole-host sites on a hosting platform and leaves out path sites" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    try buildTree(&index, io, allocator, &.{ testCategory(1, 0, "Top"), testCategory(2, 1, "Arts") });
+    try index.observe(io, allocator, inserted(testLink(10, 2, "http://samvak.tripod.com/")));
+    try index.observe(io, allocator, inserted(testLink(11, 2, "http://samvak.tripod.com/poems.html")));
+    try index.observe(io, allocator, inserted(testLink(12, 2, "http://members.tripod.com/~a/")));
+    try index.observe(io, allocator, inserted(testLink(13, 2, "http://www.tripod.com/")));
+    try index.observe(io, allocator, inserted(testLink(14, 2, "http://www.cs.example.edu/~ada/")));
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const on_tripod = try index.query(io, allocator, arena, .{ .domain_suffix = "tripod.com", .subdomain_only = true, .page_limit = 5 });
+    try testing.expectEqual(@as(u64, 2), on_tripod.total);
+    try testing.expectEqual(@as(u64, 1), on_tripod.sites);
+
+    const anywhere = try index.query(io, allocator, arena, .{ .subdomain_only = true, .page_limit = 5 });
+    try testing.expectEqual(@as(u64, 2), anywhere.total);
 }
 
 test "a query counts links, distinct sites and hosts, groups by site, and pages after the cursor" {

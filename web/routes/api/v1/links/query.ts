@@ -9,7 +9,12 @@ import {
 } from "../../../../lib/dmoz-client.ts";
 import { type Religion, RELIGIONS } from "../../../../lib/dmoz-protocol.gen.ts";
 import { categoryPath } from "../../../../lib/format.ts";
-import { errorResponse, linkJson, nonNegativeInt } from "../_lib/api.ts";
+import {
+  categoryNotFound,
+  errorResponse,
+  linkJson,
+  nonNegativeInt,
+} from "../_lib/api.ts";
 
 const GROUP_BY: readonly LinkQueryGroupBy[] = [
   "none",
@@ -97,9 +102,12 @@ export const handler = define.handlers({
     try {
       const client = getClient();
       const path = (params.get("category") ?? "").trim();
-      const categoryId = path === ""
-        ? 0
-        : (await client.browsePath(path)).category.id;
+      let categoryId = 0;
+      if (path !== "") {
+        const browsed = await client.browsePathIfFound(path);
+        if (!browsed) return categoryNotFound(path);
+        categoryId = browsed.category.id;
+      }
 
       const result = await client.queryLinks({
         categoryId,
@@ -107,6 +115,7 @@ export const handler = define.handlers({
         country: country.toUpperCase(),
         via,
         hostedOnly: ["1", "true"].includes(params.get("hosted") ?? ""),
+        subdomainOnly: ["1", "true"].includes(params.get("subdomain") ?? ""),
         words: (params.get("words") ?? "").trim(),
         allWords: match === "all",
         religions,

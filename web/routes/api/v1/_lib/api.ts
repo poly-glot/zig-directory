@@ -26,6 +26,12 @@ export function nonNegativeInt(raw: string | null): number {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+export function categoryNotFound(path: string): Response {
+  return Response.json({ error: `No category at "${path}"` }, {
+    status: 404,
+  });
+}
+
 export function categoryJson(c: Category, path: string) {
   return {
     id: c.id,

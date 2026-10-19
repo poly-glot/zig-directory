@@ -894,7 +894,8 @@ const QueryLinksOptions = packed struct(u64) {
     group_limit: u8 = 0,
     limit: u8 = 0,
     religions: u16 = 0,
-    _unused: u14 = 0,
+    subdomain_only: bool = false,
+    _unused: u13 = 0,
 };
 
 const query_links_fields = &[_]struct { []const u8, type }{
@@ -951,6 +952,7 @@ fn linkQueryFrom(p: anytype, domain_buf: *[url_facts.MAX_HOST_LEN]u8) ?operation
             .religions = options.religions,
             .entity_name = p.entity,
             .hosted_only = options.hosted_only,
+            .subdomain_only = options.subdomain_only,
             .status = if (options.status == ANY_STATUS) null else options.status,
             .group_by = group_by,
             .group_limit = options.group_limit,
