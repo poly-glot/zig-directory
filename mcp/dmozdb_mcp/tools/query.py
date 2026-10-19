@@ -154,6 +154,17 @@ async def query_links(
             )
         ),
     ] = False,
+    subdomain_sites_only: Annotated[
+        bool,
+        Field(
+            description=(
+                "Only sites that are a whole subdomain on a hosting platform, "
+                "such as x.tripod.com, leaving out path sites such as "
+                "members.tripod.com/~x. With domain, this counts a platform's "
+                "subdomain sites."
+            )
+        ),
+    ] = False,
     words: Annotated[
         str,
         Field(
@@ -202,6 +213,8 @@ async def query_links(
         ),
     ] = 0,
 ) -> ToolResult:
+    if category_path:
+        await client.category_at(category_path)
     found = await client.fetch(
         "/api/v1/links/query",
         domain=domain,
@@ -211,6 +224,7 @@ async def query_links(
         entity=entity,
         category=category_path,
         hosted="1" if hosted_only else "",
+        subdomain="1" if subdomain_sites_only else "",
         words=words,
         match="all" if match_all_words else "any",
         group=group_by,
@@ -228,6 +242,7 @@ async def query_links(
         "entity": entity,
         "category_path": category_path,
         "hosted_only": hosted_only,
+        "subdomain_sites_only": subdomain_sites_only,
         "words": words,
         "match_all_words": match_all_words,
         "group_by": group_by,

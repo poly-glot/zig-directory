@@ -125,6 +125,7 @@ export interface LinkQuery {
   country?: string;
   via?: readonly CountryEdge[];
   hostedOnly?: boolean;
+  subdomainOnly?: boolean;
   status?: LinkStatus | "any";
   words?: string;
   allWords?: boolean;
@@ -236,6 +237,7 @@ function linkQueryOptions(q: LinkQuery): bigint {
     [q.groupLimit ?? 10, 8],
     [q.limit ?? 20, 8],
     [religionMask(q.religions ?? []), 16],
+    [q.subdomainOnly ? 1 : 0, 1],
   ];
   let packed = 0n;
   let shift = 0n;
@@ -1072,6 +1074,17 @@ export class DmozClient {
   }
 
   // -- Browse & Search --
+
+  async browsePathIfFound(path: string): Promise<BrowseResult | undefined> {
+    try {
+      return await this.browsePath(path);
+    } catch (e) {
+      if (e instanceof DmozError && e.status === Status.NotFound) {
+        return undefined;
+      }
+      throw e;
+    }
+  }
 
   async browsePath(path: string): Promise<BrowseResult> {
     const resp = await this.request(

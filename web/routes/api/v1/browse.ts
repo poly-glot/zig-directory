@@ -2,7 +2,7 @@ import { define } from "../../../utils.ts";
 import { type DmozClient, getClient } from "../../../lib/dmoz-client.ts";
 import { loadEntryCategories } from "../../../lib/entry-categories.ts";
 import { categoryPath } from "../../../lib/format.ts";
-import { categoryJson, errorResponse } from "./_lib/api.ts";
+import { categoryJson, categoryNotFound, errorResponse } from "./_lib/api.ts";
 
 async function browseRoot(client: DmozClient) {
   const { root, categories } = await loadEntryCategories(client);
@@ -18,7 +18,9 @@ async function browseRoot(client: DmozClient) {
 }
 
 async function browseCategory(client: DmozClient, path: string) {
-  const result = await client.browsePath(path);
+  const result = await client.browsePathIfFound(path);
+  if (!result) return undefined;
+
   const chain = [...result.ancestors, result.category];
   return {
     category: categoryJson(result.category, categoryPath(chain)),
@@ -37,11 +39,9 @@ export const handler = define.handlers({
     const path = (ctx.url.searchParams.get("path") ?? "").trim();
     const client = getClient();
     try {
-      return Response.json(
-        path === ""
-          ? await browseRoot(client)
-          : await browseCategory(client, path),
-      );
+      if (path === "") return Response.json(await browseRoot(client));
+      const browsed = await browseCategory(client, path);
+      return browsed ? Response.json(browsed) : categoryNotFound(path);
     } catch (e) {
       return errorResponse(e);
     }

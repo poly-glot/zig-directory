@@ -501,7 +501,8 @@ Request:  [u64 category_id (0 = all)][u16 len][domain suffix][u16 len][ISO count
 Options:  bits 0-3 country edges (1 ccTLD, 2 category, 4 entity; 0 all), bit 4 hosted sites only,
           bit 5 all words, bits 6-9 group by (0 none, 1 domain, 2 site, 3 host, 4 branch, 5 country,
           6 religion, 7 person, 8 organisation), bits 10-17 status (0xFF any), bits 18-25 group limit (<= 50),
-          bits 26-33 page limit (<= 50), bits 34-49 religions (one bit each; 0 any)
+          bits 26-33 page limit (<= 50), bits 34-49 religions (one bit each; 0 any),
+          bit 50 subdomain sites only (a whole host on a hosting platform, not a path site)
 Response: [u8 ready][u64 links][u64 sites][u64 hosts][u64 domains]
           [u16 group_count][group_count x ([u16 len][label][u64 branch_id][u64 links][u64 sites])]
           [u16 link_count][link_count x ([Link bytes][u16 len][site][2 ccTLD country][2 category country]
