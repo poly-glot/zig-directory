@@ -219,3 +219,21 @@ letters. A nationality word inside a longer place name the model finds
 Columbia links to the UK. GeoNames files Kosovo under the user-assigned `XK`,
 which dmozdb refuses, so the gazetteer keeps only countries `countries.tsv`
 assigns.
+
+## Query-shape gate (2026-10-24)
+
+Three scripts measure search by the shapes a directory invites, not by a
+handful of hand-typed probes.
+
+- `corpus_study.py` — the corpus as it is: branches, depth, the facet
+  vocabulary (place, aspect, role, person, title nodes), text conventions,
+  ambiguity, morphology. Pure Python, reads `data/`.
+- `query_shapes.py` — generates 300 queries per shape from the tree itself
+  (person, title, topic, topic+place, topic+aspect, topic+role, NL wrappers,
+  plural swap, dropped letter), gold = the source node's links, and scores
+  the production design against alternatives offline (needs the MLX venv;
+  caches embeddings under `out/`). Writes `out/shape_queries.json`.
+- `live_shapes.py [n]` — replays `n` of those queries per shape against a
+  running app (`BASE=http://localhost:8000`, default prod) and reports
+  hit@10, so an offline delta is checked against the real pipeline before
+  and after a change.
