@@ -15,6 +15,8 @@ const log = shared.log;
 pub const MAX_POSTINGS_PER_TOKEN: usize = 20_000;
 const MAX_QUERY_TOKENS: usize = 32;
 pub const HYBRID_CANDIDATES: usize = 200;
+pub const CATEGORY_CANDIDATES: usize = 3;
+const CATEGORY_NEAREST: usize = 50;
 
 const ScoredId = ranking.ScoredId;
 
@@ -156,6 +158,75 @@ const QueryTokens = struct {
     }
 };
 
+const NOT_PLURALS = std.StaticStringMap(void).initComptime(.{ .{"news"}, .{"series"}, .{"species"}, .{"lens"}, .{"chess"}, .{"athletics"}, .{"physics"}, .{"mathematics"}, .{"economics"}, .{"politics"}, .{"ethics"}, .{"linguistics"}, .{"genetics"}, .{"graphics"}, .{"electronics"}, .{"aerobics"}, .{"gymnastics"}, .{"texas"}, .{"kansas"}, .{"paris"}, .{"wales"}, .{"jesus"}, .{"blues"}, .{"jeans"}, .{"glasses"} });
+
+fn isVowel(c: u8) bool {
+    return c == 'a' or c == 'e' or c == 'i' or c == 'o' or c == 'u';
+}
+
+fn endsWith(token: []const u8, suffix: []const u8) bool {
+    return std.mem.endsWith(u8, token, suffix);
+}
+
+fn takesEs(stem: []const u8) bool {
+    return endsWith(stem, "s") or endsWith(stem, "x") or endsWith(stem, "z") or endsWith(stem, "ch") or endsWith(stem, "sh");
+}
+
+fn inflection(token: []const u8, buf: *[inverted.MAX_TOKEN_LEN]u8) ?[]const u8 {
+    if (token.len < 3 or NOT_PLURALS.has(token)) return null;
+    if (endsWith(token, "ss") or endsWith(token, "us") or endsWith(token, "is")) return null;
+    for (token) |c| if (c < 'a' or c > 'z') return null;
+
+    if (endsWith(token, "ies") and token.len >= 5) return inflected(buf, token[0 .. token.len - 3], "y");
+    if (endsWith(token, "es") and token.len >= 5 and takesEs(token[0 .. token.len - 2])) return inflected(buf, token[0 .. token.len - 2], "");
+    if (endsWith(token, "s")) return inflected(buf, token[0 .. token.len - 1], "");
+    if (endsWith(token, "y") and !isVowel(token[token.len - 2])) return inflected(buf, token[0 .. token.len - 1], "ies");
+    if (takesEs(token)) return inflected(buf, token, "es");
+    return inflected(buf, token, "s");
+}
+
+fn inflected(buf: *[inverted.MAX_TOKEN_LEN]u8, stem: []const u8, suffix: []const u8) ?[]const u8 {
+    if (stem.len + suffix.len > buf.len) return null;
+    @memcpy(buf[0..stem.len], stem);
+    @memcpy(buf[stem.len..][0..suffix.len], suffix);
+    return buf[0 .. stem.len + suffix.len];
+}
+
+fn postingsForTerm(
+    tree: *@import("zigstore").BPlusTree,
+    token: []const u8,
+    allocator: std.mem.Allocator,
+    postings_cap: usize,
+) ![]u64 {
+    var ids: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer ids.deinit(allocator);
+
+    var variant_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    const forms = [_]?[]const u8{ token, inflection(token, &variant_buf) };
+    for (forms) |form| {
+        const some = form orelse continue;
+        const found = postingsForToken(tree, some, allocator, postings_cap) catch |err| switch (err) {
+            error.PostingsCapExceeded => continue,
+            else => {
+                log.err("rankedIds: rangeScan failed for token='{s}': {}", .{ some, err });
+                return err;
+            },
+        };
+        defer allocator.free(found);
+        try ids.appendSlice(allocator, found);
+    }
+
+    std.sort.pdq(u64, ids.items, {}, std.sort.asc(u64));
+    var unique: usize = 0;
+    for (ids.items) |id| {
+        if (unique > 0 and ids.items[unique - 1] == id) continue;
+        ids.items[unique] = id;
+        unique += 1;
+    }
+    ids.items.len = unique;
+    return ids.toOwnedSlice(allocator);
+}
+
 fn inverseDocumentFrequency(corpus_size: u64, document_frequency: usize) f64 {
     const df: f64 = @floatFromInt(document_frequency);
     const n: f64 = @floatFromInt(@max(corpus_size, document_frequency));
@@ -174,13 +245,7 @@ fn rankedIds(
 
     const tokens = QueryTokens.init(query);
     for (0..tokens.count) |i| {
-        const ids = postingsForToken(tree, tokens.get(i), allocator, postings_cap) catch |err| switch (err) {
-            error.PostingsCapExceeded => continue,
-            else => {
-                log.err("rankedIds: rangeScan failed for token='{s}': {}", .{ tokens.get(i), err });
-                return err;
-            },
-        };
+        const ids = try postingsForTerm(tree, tokens.get(i), allocator, postings_cap);
         defer allocator.free(ids);
 
         const idf = inverseDocumentFrequency(corpus_size, ids.len);
@@ -300,7 +365,10 @@ pub fn searchLinksHybrid(
     var nearest_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
     const nearest = db.vectors.nearest(db.io, &q, &nearest_buf);
 
-    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest });
+    var subtree_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
+    const subtree = try subtreeCandidates(db, &q, &subtree_buf);
+
+    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest, subtree });
     defer db.allocator.free(fused);
     return .{
         .links = try fetchLinks(db, fused, limit, buf, site_rows),
@@ -308,10 +376,51 @@ pub fn searchLinksHybrid(
     };
 }
 
+fn subtreeCandidates(db: *Directory, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
+    if (!db.cat_vectors.ready.load(.acquire) or !db.facts.ready.load(.acquire)) return out[0..0];
+
+    var roots_buf: [CATEGORY_CANDIDATES]ScoredId = undefined;
+    const roots = db.cat_vectors.nearest(db.io, q, &roots_buf);
+    var root_ids: [CATEGORY_CANDIDATES]u64 = undefined;
+    for (roots, root_ids[0..roots.len]) |root, *id| id.* = root.id;
+
+    const ids = try db.facts.subtreeLinkIds(db.io, db.allocator, root_ids[0..roots.len]);
+    defer db.allocator.free(ids);
+    return db.vectors.scoreIds(db.io, ids, q, out);
+}
+
+pub fn searchCategoriesHybrid(
+    db: *Directory,
+    query: []const u8,
+    model: u64,
+    query_embedding: *const vector_index.Embedding,
+    limit: u32,
+    buf: []schema.Category,
+) ![]schema.Category {
+    const ranked = try rankedIds(db.allocator, db.categories_index_tree(), db.next_category_id.load(.monotonic), MAX_POSTINGS_PER_TOKEN, query);
+    defer db.allocator.free(ranked);
+
+    const quantized = if (categoryHalfUsable(db, model)) vector_index.quantize(query_embedding) else null;
+    const q = quantized orelse return fetchInRankOrder(schema.Category, db, ranked, limit, buf, category.getCategory);
+
+    var nearest_buf: [CATEGORY_NEAREST]ScoredId = undefined;
+    const nearest = db.cat_vectors.nearest(db.io, &q, &nearest_buf);
+
+    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ ranked[0..@min(ranked.len, CATEGORY_NEAREST)], nearest });
+    defer db.allocator.free(fused);
+    return fetchInRankOrder(schema.Category, db, fused, limit, buf, category.getCategory);
+}
+
 fn vectorHalfUsable(db: *Directory, model: u64) bool {
     return model != 0 and
         db.vectors.ready.load(.acquire) and
         db.vectors.model.load(.acquire) == model;
+}
+
+fn categoryHalfUsable(db: *Directory, model: u64) bool {
+    return model != 0 and
+        db.cat_vectors.ready.load(.acquire) and
+        db.cat_vectors.model.load(.acquire) == model;
 }
 
 fn searchViaIndexTree(
@@ -629,4 +738,48 @@ test "ranked search: the per-site cap keeps two links a site, folds a domain's h
     try std.testing.expectEqualStrings("members.tripod.com/~ada", rows[2].key());
     try std.testing.expectEqualStrings("members.tripod.com/~bob", rows[3].key());
     try std.testing.expectEqual(@as(u16, 0), rows[3].more);
+}
+
+test "inflection pairs a word with its plural or singular and leaves non-plural s-words alone" {
+    var buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    const cases = [_]struct { token: []const u8, variant: ?[]const u8 }{
+        .{ .token = "biography", .variant = "biographies" },
+        .{ .token = "biographies", .variant = "biography" },
+        .{ .token = "politicians", .variant = "politician" },
+        .{ .token = "poet", .variant = "poets" },
+        .{ .token = "churches", .variant = "church" },
+        .{ .token = "church", .variant = "churches" },
+        .{ .token = "news", .variant = null },
+        .{ .token = "status", .variant = null },
+        .{ .token = "days", .variant = "day" },
+        .{ .token = "day", .variant = "days" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualDeep(case.variant, inflection(case.token, &buf));
+    }
+}
+
+test "ranked search scores a word and its plural as one term, so either spelling finds both links" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try Directory.openTestInstance(std.testing.allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top = try category.createCategory(db, 0, "Top", "top", "");
+    const singular = try link_mod.createLink(db, top, "https://one.example", "Keats biography", "");
+    const plural = try link_mod.createLink(db, top, "https://two.example", "Famous biographies", "");
+    const other = try link_mod.createLink(db, top, "https://three.example", "New arrivals", "");
+
+    var buf: [8]schema.Link = undefined;
+    for ([_][]const u8{ "biography", "biographies" }) |query| {
+        const found = try searchLinksRanked(db, query, 8, &buf, null);
+        try std.testing.expectEqual(@as(usize, 2), found.len);
+        const ids = [_]u64{ found[0].id, found[1].id };
+        try std.testing.expect(std.mem.indexOfScalar(u64, &ids, singular) != null);
+        try std.testing.expect(std.mem.indexOfScalar(u64, &ids, plural) != null);
+    }
+
+    const news = try searchLinksRanked(db, "news", 8, &buf, null);
+    try std.testing.expectEqual(@as(usize, 0), news.len);
+    _ = other;
 }

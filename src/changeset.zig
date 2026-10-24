@@ -10,6 +10,7 @@ pub const Op = enum(u8) {
     link_recategorized = 4,
     link_vectors_put = 5,
     link_entities_put = 6,
+    category_vectors_put = 7,
     category_inserted = 10,
     category_deleted = 11,
     category_text_updated = 12,
@@ -83,6 +84,11 @@ pub const LinkVectorsPutEffect = struct {
     vectors: []const schema.LinkVector,
 };
 
+pub const CategoryVectorsPutEffect = struct {
+    model: u64,
+    vectors: []const schema.StoredVector,
+};
+
 pub const CategoryInsertEffect = struct {
     cat: schema.Category,
     ancestor_updates: []const AncestorUpdate,
@@ -146,6 +152,7 @@ pub const ChangeSet = union(Op) {
     link_recategorized: LinkRecatEffect,
     link_vectors_put: LinkVectorsPutEffect,
     link_entities_put: LinkEntitiesPutEffect,
+    category_vectors_put: CategoryVectorsPutEffect,
     category_inserted: CategoryInsertEffect,
     category_deleted: CategoryDeleteEffect,
     category_text_updated: CategoryTextUpdateEffect,
@@ -358,7 +365,7 @@ test "encode/decode roundtrip — link_entities_put" {
 
 test "encode/decode roundtrip — link_vectors_put" {
     const allocator = std.testing.allocator;
-    var vector = schema.LinkVector{ .link_id = 12, .scale = 0.25 };
+    var vector = schema.LinkVector{ .id = 12, .scale = 0.25 };
     vector.values[0] = -127;
     vector.values[383] = 64;
     const cs = ChangeSet{ .link_vectors_put = .{ .model = 0xB6E5, .vectors = &.{vector} } };
@@ -373,10 +380,30 @@ test "encode/decode roundtrip — link_vectors_put" {
     const e = decoded.link_vectors_put;
     try std.testing.expectEqual(@as(u64, 0xB6E5), e.model);
     try std.testing.expectEqual(@as(usize, 1), e.vectors.len);
-    try std.testing.expectEqual(@as(u64, 12), e.vectors[0].link_id);
+    try std.testing.expectEqual(@as(u64, 12), e.vectors[0].id);
     try std.testing.expectEqual(@as(f32, 0.25), e.vectors[0].scale);
     try std.testing.expectEqual(@as(i8, -127), e.vectors[0].values[0]);
     try std.testing.expectEqual(@as(i8, 64), e.vectors[0].values[383]);
+}
+
+test "encode/decode roundtrip — category_vectors_put" {
+    var vector = schema.StoredVector{ .id = 3_000, .scale = 0.5 };
+    vector.values[7] = 101;
+    const cs = ChangeSet{ .category_vectors_put = .{ .model = 0xB6E5, .vectors = &.{vector} } };
+
+    const bytes = try encode(std.testing.allocator, cs);
+    defer std.testing.allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decoded = try decode(arena.allocator(), bytes);
+
+    try std.testing.expectEqual(Op.category_vectors_put, std.meta.activeTag(decoded));
+    const e = decoded.category_vectors_put;
+    try std.testing.expectEqual(@as(u64, 0xB6E5), e.model);
+    try std.testing.expectEqual(@as(usize, 1), e.vectors.len);
+    try std.testing.expectEqual(@as(u64, 3_000), e.vectors[0].id);
+    try std.testing.expectEqual(@as(f32, 0.5), e.vectors[0].scale);
+    try std.testing.expectEqual(@as(i8, 101), e.vectors[0].values[7]);
 }
 
 test "encode/decode roundtrip — category_inserted" {

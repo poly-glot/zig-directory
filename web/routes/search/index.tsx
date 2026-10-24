@@ -28,6 +28,7 @@ import {
   constraintsOf,
   linkQueryFor,
   namePhrases,
+  rankedQuery,
   recognise,
   type Target,
   typedTargets,
@@ -196,11 +197,12 @@ async function buildSearchResult(
   year: number,
 ): Promise<Data> {
   const client = getClient();
-  const rawResults = await client.search(q, {
+  const ranked = rankedQuery(q);
+  const rawResults = await client.search(ranked, {
     limit: 50,
     mode: "ranked",
     capPerSite: true,
-    queryEmbedding: await embedQuery(q),
+    queryEmbedding: await embedQuery(ranked),
   });
   const crumbIds = new Set<number>();
   for (const c of rawResults.categories) crumbIds.add(c.id);
@@ -232,6 +234,22 @@ async function buildSearchResult(
   return { query: q, rawResults, filteredLinks, facets, sort, categoryPaths };
 }
 
+function logSearch(
+  q: string,
+  path: "targeted" | "ranked",
+  links: number,
+  categories: number,
+  started: number,
+): void {
+  console.log(JSON.stringify({
+    search: q,
+    path,
+    links,
+    categories,
+    ms: Math.round(performance.now() - started),
+  }));
+}
+
 export const handler = define.handlers<Data>({
   async GET(ctx) {
     const url = ctx.url;
@@ -245,6 +263,7 @@ export const handler = define.handlers<Data>({
     if (!q) return page(emptyData(q, sort, cat, year));
 
     try {
+      const started = performance.now();
       if (url.searchParams.get("plain") !== "1") {
         const understanding = await understand(q);
         const base = emptyData(q, sort, cat, year);
@@ -253,10 +272,26 @@ export const handler = define.handlers<Data>({
         }
         if (understanding.targets.length > 0) {
           const after = parsePositiveInt(url.searchParams.get("after"));
-          return page(await buildTargetedResult(base, understanding, after));
+          const data = await buildTargetedResult(base, understanding, after);
+          logSearch(
+            q,
+            "targeted",
+            data.filtered?.links.length ?? 0,
+            0,
+            started,
+          );
+          return page(data);
         }
       }
-      return page(await buildSearchResult(q, sort, cat, year));
+      const data = await buildSearchResult(q, sort, cat, year);
+      logSearch(
+        q,
+        "ranked",
+        data.rawResults.links.length,
+        data.rawResults.categories.length,
+        started,
+      );
+      return page(data);
     } catch (e) {
       console.error("Search failed:", e);
       return page({

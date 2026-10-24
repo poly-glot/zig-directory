@@ -7,6 +7,7 @@ import {
   linkTextFingerprint,
   type QueryEmbedding,
 } from "./dmoz-client.ts";
+import { categoryNames } from "./format.ts";
 
 export const EMBEDDING_MODEL_REPO = "Xenova/bge-small-en-v1.5";
 export const EMBEDDING_MODEL_REVISION =
@@ -84,8 +85,17 @@ function truncated(ids: number[]): number[] {
   return [...ids.slice(0, MAX_TOKENS - 1), ids[ids.length - 1]];
 }
 
-export function linkDocumentText(title: string, description: string): string {
-  return `${title}. ${description}`.trim();
+export function linkDocumentText(
+  categoryNames: readonly string[],
+  title: string,
+  description: string,
+): string {
+  const path = categoryNames.join(" > ");
+  return [path, title, description].filter(Boolean).join(". ").trim();
+}
+
+export function categoryDocumentText(categoryNames: readonly string[]): string {
+  return categoryNames.join(" > ");
 }
 
 export async function embedText(text: string): Promise<Float32Array> {
@@ -109,14 +119,40 @@ export async function embedQuery(
   }
 }
 
+export async function storeCategoryVector(
+  client: DmozClient,
+  categoryId: number,
+): Promise<void> {
+  try {
+    const chains = await client.breadcrumbsByIds([categoryId]);
+    const vector = await embedText(
+      categoryDocumentText(categoryNames(chains.get(categoryId) ?? [])),
+    );
+    const [result] = await client.putCategoryVectors(EMBEDDING_MODEL, [{
+      categoryId,
+      vector,
+    }]);
+    if (result.code !== "ok") {
+      console.error(`storeCategoryVector ${categoryId}: ${result.code}`);
+    }
+  } catch (e) {
+    console.error(`storeCategoryVector ${categoryId}: search ignores it:`, e);
+  }
+}
+
 export async function storeLinkVector(
   client: DmozClient,
   linkId: number,
 ): Promise<void> {
   try {
     const link = await client.getLink(linkId);
+    const chains = await client.breadcrumbsByIds([link.categoryId]);
     const vector = await embedText(
-      linkDocumentText(link.title, link.description),
+      linkDocumentText(
+        categoryNames(chains.get(link.categoryId) ?? []),
+        link.title,
+        link.description,
+      ),
     );
     const [result] = await client.putLinkVectors(EMBEDDING_MODEL, [{
       linkId,

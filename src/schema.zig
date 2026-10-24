@@ -83,16 +83,18 @@ comptime {
 
 pub const EMBEDDING_DIMS: usize = 384;
 
-pub const LinkVector = extern struct {
-    link_id: u64 = 0,
+pub const StoredVector = extern struct {
+    id: u64 = 0,
     scale: f32 = 0,
     values: [EMBEDDING_DIMS]i8 = @splat(0),
     _pad: [4]u8 = @splat(0),
 };
 
+pub const LinkVector = StoredVector;
+
 comptime {
-    if (@sizeOf(LinkVector) != 400)
-        @compileError("LinkVector size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(LinkVector)}) ++ ", expected 400");
+    if (@sizeOf(StoredVector) != 400)
+        @compileError("StoredVector size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(StoredVector)}) ++ ", expected 400");
 }
 
 pub fn linkTextFingerprint(link: Link) u64 {

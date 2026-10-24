@@ -6,6 +6,7 @@ const log = std.log.scoped(.header_upgrade);
 
 const HeaderV5 = zigstore.Engine(directory.schema_v5).Header;
 const HeaderV6 = zigstore.Engine(directory.schema_v6).Header;
+const HeaderV7 = zigstore.Engine(directory.schema_v7).Header;
 const Header = directory.Store.Header;
 const PAGE_SIZE = @sizeOf(Header);
 const INVALID_PAGE: u64 = std.math.maxInt(u32);
@@ -14,11 +15,12 @@ const SIDE_FILE_LEN = PAGE_SIZE + 8;
 
 const steps = .{
     .{ HeaderV5, HeaderV6, directory.schema_v6.format_version },
-    .{ HeaderV6, Header, directory.schema.format_version },
+    .{ HeaderV6, HeaderV7, directory.schema_v7.format_version },
+    .{ HeaderV7, Header, directory.schema.format_version },
 };
 
 comptime {
-    if (@sizeOf(HeaderV5) != PAGE_SIZE or @sizeOf(HeaderV6) != PAGE_SIZE) @compileError("every header version must fill one page");
+    if (@sizeOf(HeaderV5) != PAGE_SIZE or @sizeOf(HeaderV6) != PAGE_SIZE or @sizeOf(HeaderV7) != PAGE_SIZE) @compileError("every header version must fill one page");
 }
 
 pub const UpgradeError = error{CheckpointJournalPending};
@@ -187,6 +189,8 @@ fn expectCarriedOver(v5: HeaderV5, upgraded_header: Header) !void {
     try testing.expectEqual(@as(u64, 0), upgraded_header.embedding_model);
     try testing.expectEqual(INVALID_PAGE, upgraded_header.link_entities_root);
     try testing.expectEqual(@as(u64, 0), upgraded_header.link_entities_count);
+    try testing.expectEqual(INVALID_PAGE, upgraded_header.category_vectors_root);
+    try testing.expectEqual(@as(u64, 0), upgraded_header.category_vectors_count);
 }
 
 test "header upgrade: a v5 page 0 walks every step to the current format, roots and counters copied by name" {
@@ -225,6 +229,35 @@ test "header upgrade: a v6 page 0 keeps its vector root and model and gains an e
     try testing.expectEqual(@as(u64, 0xB6E5), header.embedding_model);
     try testing.expectEqual(@as(u64, 92_001), header.next_link_id);
     try testing.expectEqual(INVALID_PAGE, header.link_entities_root);
+    try testing.expectEqual(INVALID_PAGE, header.category_vectors_root);
+}
+
+test "header upgrade: a v7 page 0 keeps its entities root and gains an empty category vectors index" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+    const v5_page = std.mem.toBytes(std.mem.zeroes(HeaderV5));
+    const v6_page = upgraded(HeaderV5, HeaderV6, directory.schema_v6.format_version, &v5_page);
+    const v7_page = upgraded(HeaderV6, HeaderV7, directory.schema_v7.format_version, &v6_page);
+    var v7 = std.mem.bytesToValue(HeaderV7, &v7_page);
+    v7.magic = directory.schema_v7.magic;
+    v7.link_vectors_root = 12;
+    v7.link_entities_root = 13;
+    v7.link_entities_count = 91_995;
+    v7.embedding_model = 0xB6E5;
+    try writePage(testing.io, tmp.dir, &std.mem.toBytes(v7));
+
+    try upgradeHeader(testing.io, try tmpPath(&tmp, &path_buf));
+
+    const header = try readHeader(testing.io, tmp.dir);
+    try testing.expectEqual(directory.schema.format_version, header.format_version);
+    try testing.expectEqual(@as(u64, 12), header.link_vectors_root);
+    try testing.expectEqual(@as(u64, 13), header.link_entities_root);
+    try testing.expectEqual(@as(u64, 91_995), header.link_entities_count);
+    try testing.expectEqual(@as(u64, 0xB6E5), header.embedding_model);
+    try testing.expectEqual(INVALID_PAGE, header.category_vectors_root);
+    try testing.expectEqual(@as(u64, 0), header.category_vectors_count);
 }
 
 test "header upgrade: running it again on a current store changes nothing" {
@@ -249,7 +282,8 @@ test "header upgrade: a complete side file left by a crash is redone over a torn
     const v5 = try writeV5Store(testing.io, tmp.dir);
     const v5_page = std.mem.toBytes(v5);
     const v6_page = upgraded(HeaderV5, HeaderV6, directory.schema_v6.format_version, &v5_page);
-    const current_page = upgraded(HeaderV6, Header, directory.schema.format_version, &v6_page);
+    const v7_page = upgraded(HeaderV6, HeaderV7, directory.schema_v7.format_version, &v6_page);
+    const current_page = upgraded(HeaderV7, Header, directory.schema.format_version, &v7_page);
     try writeSideFile(testing.io, tmp.dir, path, &current_page);
     {
         const file = try tmp.dir.openFile(testing.io, "store.dat", .{ .mode = .read_write });

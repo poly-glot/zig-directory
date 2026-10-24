@@ -62,7 +62,27 @@ pub fn applyCategoryDeleted(db: *Directory, e: changeset.CategoryDeleteEffect) !
 
     try apply.cascadeAncestorCounts(db, e.ancestor_updates, e.cat.parent_id, .child_count, false);
 
+    try deleteCategoryVector(db, e.cat.id);
+
     db.subtree_cache.invalidateAll();
+}
+
+pub fn applyCategoryVectorsPut(db: *Directory, e: changeset.CategoryVectorsPutEffect) !void {
+    db.store.counter("embedding_model").* = e.model;
+    db.vectors.model.store(e.model, .release);
+    db.cat_vectors.model.store(e.model, .release);
+
+    for (e.vectors) |v| {
+        const key = codec.encodeU64(v.id);
+        try db.category_vectors().insert(&key, std.mem.asBytes(&v));
+        try db.cat_vectors.put(db.io, db.allocator, v);
+    }
+}
+
+fn deleteCategoryVector(db: *Directory, category_id: u64) !void {
+    const key = codec.encodeU64(category_id);
+    _ = try db.category_vectors().delete(&key);
+    db.cat_vectors.remove(db.io, category_id);
 }
 
 pub fn applyCategoryTextUpdated(db: *Directory, e: changeset.CategoryTextUpdateEffect) !void {
@@ -104,6 +124,8 @@ pub fn applyCategoryRenamed(db: *Directory, e: changeset.CategoryRenameEffect) !
 
     try enqueueRepairTask(db, e.new_cat.id, e.enqueue);
 
+    try deleteCategoryVector(db, e.new_cat.id);
+
     db.subtree_cache.invalidateAll();
 }
 
@@ -127,6 +149,8 @@ pub fn applyCategoryMoved(db: *Directory, e: changeset.CategoryMoveEffect) !void
     }
 
     try enqueueRepairTask(db, e.cat.id, e.enqueue);
+
+    try deleteCategoryVector(db, e.cat.id);
 
     try apply.cascadeAncestorCounts(db, e.old_chain_updates, e.old_parent_id, .child_count, false);
 

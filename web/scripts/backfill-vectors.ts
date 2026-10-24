@@ -9,6 +9,7 @@ import {
   embedText,
   linkDocumentText,
 } from "../lib/embedder.ts";
+import { categoryNames } from "../lib/format.ts";
 
 const PROGRESS_EVERY_PAGES = 100;
 
@@ -24,12 +25,19 @@ do {
     limit: MAX_VECTORS_PER_WRITE,
   });
 
+  const chains = await client.breadcrumbsByIds([
+    ...new Set(page.links.map((link) => link.categoryId)),
+  ]);
   const writes: LinkVectorWrite[] = [];
   for (const link of page.links) {
     writes.push({
       linkId: link.id,
       textFingerprint: linkTextFingerprint(link.title, link.description),
-      vector: await embedText(linkDocumentText(link.title, link.description)),
+      vector: await embedText(linkDocumentText(
+        categoryNames(chains.get(link.categoryId) ?? []),
+        link.title,
+        link.description,
+      )),
     });
   }
   for (const { code } of await client.putLinkVectors(EMBEDDING_MODEL, writes)) {

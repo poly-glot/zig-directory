@@ -61,14 +61,14 @@ pub const VectorIndex = struct {
         self.position.deinit(allocator);
     }
 
-    pub fn put(self: *VectorIndex, io: std.Io, allocator: std.mem.Allocator, v: schema.LinkVector) !void {
+    pub fn put(self: *VectorIndex, io: std.Io, allocator: std.mem.Allocator, v: schema.StoredVector) !void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         try self.putLocked(allocator, v);
     }
 
-    pub fn putLocked(self: *VectorIndex, allocator: std.mem.Allocator, v: schema.LinkVector) !void {
-        if (self.position.get(v.link_id)) |at| {
+    pub fn putLocked(self: *VectorIndex, allocator: std.mem.Allocator, v: schema.StoredVector) !void {
+        if (self.position.get(v.id)) |at| {
             self.scales.items[at] = v.scale;
             self.rows.items[at] = v.values;
             return;
@@ -76,17 +76,17 @@ pub const VectorIndex = struct {
         try self.ids.ensureUnusedCapacity(allocator, 1);
         try self.scales.ensureUnusedCapacity(allocator, 1);
         try self.rows.ensureUnusedCapacity(allocator, 1);
-        try self.position.put(allocator, v.link_id, @intCast(self.ids.items.len));
-        self.ids.appendAssumeCapacity(v.link_id);
+        try self.position.put(allocator, v.id, @intCast(self.ids.items.len));
+        self.ids.appendAssumeCapacity(v.id);
         self.scales.appendAssumeCapacity(v.scale);
         self.rows.appendAssumeCapacity(v.values);
     }
 
-    pub fn remove(self: *VectorIndex, io: std.Io, link_id: u64) void {
+    pub fn remove(self: *VectorIndex, io: std.Io, id: u64) void {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
 
-        const removed = self.position.fetchRemove(link_id) orelse return;
+        const removed = self.position.fetchRemove(id) orelse return;
         const at = removed.value;
         const last = self.ids.items.len - 1;
         if (at != last) {
@@ -118,6 +118,19 @@ pub const VectorIndex = struct {
         }
         return top.sorted();
     }
+
+    pub fn scoreIds(self: *VectorIndex, io: std.Io, ids: []const u64, query: *const Quantized, out: []ranking.ScoredId) []ranking.ScoredId {
+        self.lock.lockSharedUncancelable(io);
+        defer self.lock.unlockShared(io);
+
+        var top = ranking.TopK.init(out);
+        for (ids) |id| {
+            const at = self.position.get(id) orelse continue;
+            const similarity = @as(f64, @floatFromInt(dot(&self.rows.items[at], &query.values))) * self.scales.items[at];
+            top.offer(.{ .id = id, .score = similarity });
+        }
+        return top.sorted();
+    }
 };
 
 fn unitVector(axis: usize) Embedding {
@@ -126,9 +139,9 @@ fn unitVector(axis: usize) Embedding {
     return e;
 }
 
-fn storedVector(link_id: u64, embedding: *const Embedding) schema.LinkVector {
+fn storedVector(id: u64, embedding: *const Embedding) schema.StoredVector {
     const q = quantize(embedding).?;
-    return .{ .link_id = link_id, .scale = q.scale, .values = q.values };
+    return .{ .id = id, .scale = q.scale, .values = q.values };
 }
 
 test "dot over extreme i8 rows equals the scalar widened sum" {
@@ -186,4 +199,25 @@ test "nearest ranks by dot product and remove keeps the remaining rows addressab
     hits = index.nearest(io, &query, &buf);
     try std.testing.expectEqual(@as(u64, 2), hits[0].id);
     try std.testing.expectEqual(@as(usize, 2), index.count(io));
+}
+
+test "scoreIds ranks only the asked ids and skips ids without a vector" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var index: VectorIndex = .{};
+    defer index.deinit(allocator);
+
+    try index.put(io, allocator, storedVector(1, &unitVector(0)));
+    try index.put(io, allocator, storedVector(2, &unitVector(1)));
+    var mixed: Embedding = @splat(0);
+    mixed[0] = 1;
+    mixed[1] = 1;
+    try index.put(io, allocator, storedVector(3, &mixed));
+
+    const query = quantize(&unitVector(0)).?;
+    var buf: [4]ranking.ScoredId = undefined;
+    const hits = index.scoreIds(io, &.{ 3, 2, 99 }, &query, &buf);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(@as(u64, 3), hits[0].id);
+    try std.testing.expectEqual(@as(u64, 2), hits[1].id);
 }

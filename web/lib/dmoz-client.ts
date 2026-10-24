@@ -281,6 +281,11 @@ export interface LinkVectorWrite {
   vector: Float32Array;
 }
 
+export interface CategoryVectorWrite {
+  categoryId: number;
+  vector: Float32Array;
+}
+
 export type LinkVectorWriteCode =
   | "ok"
   | "not_found"
@@ -1290,6 +1295,29 @@ export class DmozClient {
     const total = r.u16() + r.u16();
     return Array.from({ length: total }, () => ({
       linkId: Number(r.u64()),
+      code: LINK_VECTOR_WRITE_CODES[r.u8()] ?? "invalid_vector",
+    }));
+  }
+
+  async putCategoryVectors(
+    model: bigint,
+    writes: CategoryVectorWrite[],
+  ): Promise<Array<{ categoryId: number; code: LinkVectorWriteCode }>> {
+    if (writes.length === 0) return [];
+    if (writes.length > MAX_VECTORS_PER_WRITE) {
+      throw new Error(`putCategoryVectors: cap is ${MAX_VECTORS_PER_WRITE}`);
+    }
+    const w = new BufferWriter().raw(u64Bytes(model)).u16(writes.length);
+    for (const item of writes) {
+      w.u64(item.categoryId).raw(f32Bytes(item.vector));
+    }
+    const resp = await this.request(Op.PutCategoryVectors, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const total = r.u16() + r.u16();
+    return Array.from({ length: total }, () => ({
+      categoryId: Number(r.u64()),
       code: LINK_VECTOR_WRITE_CODES[r.u8()] ?? "invalid_vector",
     }));
   }
