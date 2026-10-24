@@ -96,13 +96,13 @@ export const handler = define.handlers<Data>({
             url: formField(form, "url"),
             description: formField(form, "description"),
           });
-          await enrichLink(client, id);
           if (newStatus !== link.status) {
             await client.updateLinkStatus(id, newStatus);
           }
           if (newCategoryId !== link.categoryId) {
             await client.moveLink(id, newCategoryId);
           }
+          await enrichLink(client, id);
 
           message = "Link updated";
           break;

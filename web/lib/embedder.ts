@@ -7,6 +7,7 @@ import {
   linkTextFingerprint,
   type QueryEmbedding,
 } from "./dmoz-client.ts";
+import { categoryNames } from "./format.ts";
 
 export const EMBEDDING_MODEL_REPO = "Xenova/bge-small-en-v1.5";
 export const EMBEDDING_MODEL_REVISION =
@@ -84,8 +85,13 @@ function truncated(ids: number[]): number[] {
   return [...ids.slice(0, MAX_TOKENS - 1), ids[ids.length - 1]];
 }
 
-export function linkDocumentText(title: string, description: string): string {
-  return `${title}. ${description}`.trim();
+export function linkDocumentText(
+  categoryNames: readonly string[],
+  title: string,
+  description: string,
+): string {
+  const path = categoryNames.join(" > ");
+  return [path, title, description].filter(Boolean).join(". ").trim();
 }
 
 export async function embedText(text: string): Promise<Float32Array> {
@@ -115,8 +121,13 @@ export async function storeLinkVector(
 ): Promise<void> {
   try {
     const link = await client.getLink(linkId);
+    const chains = await client.breadcrumbsByIds([link.categoryId]);
     const vector = await embedText(
-      linkDocumentText(link.title, link.description),
+      linkDocumentText(
+        categoryNames(chains.get(link.categoryId) ?? []),
+        link.title,
+        link.description,
+      ),
     );
     const [result] = await client.putLinkVectors(EMBEDDING_MODEL, [{
       linkId,

@@ -84,8 +84,17 @@ export function formatCategoryName(name: string): string {
 
 const ROOT_SLUG = "top";
 
-export function categoryPath(chain: Array<{ slug: string }>): string {
+function belowRoot<T extends { slug: string }>(chain: readonly T[]): T[] {
   const [root, ...rest] = chain;
-  const visible = root?.slug === ROOT_SLUG ? rest : chain;
-  return visible.map((c) => c.slug).join("/");
+  return root?.slug === ROOT_SLUG ? rest : [...chain];
+}
+
+export function categoryPath(chain: Array<{ slug: string }>): string {
+  return belowRoot(chain).map((c) => c.slug).join("/");
+}
+
+export function categoryNames(
+  chain: ReadonlyArray<{ slug: string; name: string }>,
+): string[] {
+  return belowRoot(chain).map((c) => c.name.replaceAll("_", " "));
 }
