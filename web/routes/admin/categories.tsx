@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
 import { type Category, getClient } from "../../lib/dmoz-client.ts";
+import { storeCategoryVector } from "../../lib/embedder.ts";
 import AdminShell from "../../components/admin/AdminShell/AdminShell.tsx";
 import AdminStatusChip from "../../components/admin/AdminStatusChip/AdminStatusChip.tsx";
 import Banner from "../../components/admin/Banner/Banner.tsx";
@@ -70,6 +71,7 @@ async function applyAction(
       if (slug) updates.slug = slug;
       updates.description = formField(form, "description");
       await client.updateCategory(id, updates);
+      await storeCategoryVector(client, id);
       return "Category updated";
     }
     case "delete":

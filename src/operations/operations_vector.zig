@@ -21,6 +21,11 @@ pub const VectorWriteResult = enum(u8) {
     invalid_vector = 3,
 };
 
+pub const CategoryVectorWrite = struct {
+    category_id: u64,
+    embedding: vector_index.Embedding,
+};
+
 pub fn putLinkVectors(db: *Directory, model: u64, writes: []const VectorWrite, results: []VectorWriteResult) !void {
     std.debug.assert(writes.len == results.len);
     if (model == 0) return error.InvalidEmbeddingModel;
@@ -47,7 +52,36 @@ fn checkWrite(db: *Directory, w: *const VectorWrite, out: *schema.LinkVector) !V
     const link = (try link_mod.getLink(db, w.link_id)) orelse return .not_found;
     if (schema.linkTextFingerprint(link) != w.text_fingerprint) return .stale_text;
     const q = vector_index.quantize(&w.embedding) orelse return .invalid_vector;
-    out.* = .{ .link_id = w.link_id, .scale = q.scale, .values = q.values };
+    out.* = .{ .id = w.link_id, .scale = q.scale, .values = q.values };
+    return .ok;
+}
+
+pub fn putCategoryVectors(db: *Directory, model: u64, writes: []const CategoryVectorWrite, results: []VectorWriteResult) !void {
+    std.debug.assert(writes.len == results.len);
+    if (model == 0) return error.InvalidEmbeddingModel;
+    if (writes.len > MAX_VECTORS_PER_WRITE) return error.TooManyVectors;
+
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
+
+    const current = db.vectors.model.load(.acquire);
+    if (current != 0 and current != model) return error.EmbeddingModelMismatch;
+
+    var accepted: [MAX_VECTORS_PER_WRITE]schema.StoredVector = undefined;
+    var accepted_len: usize = 0;
+    for (writes, results) |*w, *result| {
+        result.* = try checkCategoryWrite(db, w, &accepted[accepted_len]);
+        if (result.* == .ok) accepted_len += 1;
+    }
+    if (accepted_len == 0) return;
+
+    try db.commit(.{ .category_vectors_put = .{ .model = model, .vectors = accepted[0..accepted_len] } });
+}
+
+fn checkCategoryWrite(db: *Directory, w: *const CategoryVectorWrite, out: *schema.StoredVector) !VectorWriteResult {
+    if ((try category.getCategory(db, w.category_id)) == null) return .not_found;
+    const q = vector_index.quantize(&w.embedding) orelse return .invalid_vector;
+    out.* = .{ .id = w.category_id, .scale = q.scale, .values = q.values };
     return .ok;
 }
 
@@ -60,29 +94,37 @@ pub fn getLinkVector(db: *Directory, link_id: u64) !?schema.LinkVector {
 }
 
 pub fn loadVectorIndex(db: *Directory) !void {
+    try loadIndex(db, db.link_vectors(), &db.vectors);
+}
+
+pub fn loadCategoryVectorIndex(db: *Directory) !void {
+    try loadIndex(db, db.category_vectors(), &db.cat_vectors);
+}
+
+fn loadIndex(db: *Directory, tree: *@import("zigstore").BPlusTree, index: *vector_index.VectorIndex) !void {
     var next_id: u64 = 0;
-    while (!db.vectors.loader_stop.load(.acquire)) {
-        if (try loadVectorChunk(db, &next_id) < LOAD_CHUNK) {
-            db.vectors.ready.store(true, .release);
+    while (!index.loader_stop.load(.acquire)) {
+        if (try loadChunk(db, tree, index, &next_id) < LOAD_CHUNK) {
+            index.ready.store(true, .release);
             return;
         }
     }
 }
 
-fn loadVectorChunk(db: *Directory, next_id: *u64) !usize {
-    db.vectors.lock.lockUncancelable(db.io);
-    defer db.vectors.lock.unlock(db.io);
+fn loadChunk(db: *Directory, tree: *@import("zigstore").BPlusTree, index: *vector_index.VectorIndex, next_id: *u64) !usize {
+    index.lock.lockUncancelable(db.io);
+    defer index.lock.unlock(db.io);
 
     const start_key = codec.encodeU64(next_id.*);
-    var iter = try db.link_vectors().rangeScan(&start_key, null);
+    var iter = try tree.rangeScan(&start_key, null);
     defer iter.deinit();
 
     var scanned: usize = 0;
     while (scanned < LOAD_CHUNK) : (scanned += 1) {
         const entry = (try iter.next()) orelse return scanned;
         next_id.* = codec.decodeU64(entry.key[0..8]) + 1;
-        if (entry.value.len != @sizeOf(schema.LinkVector)) continue;
-        try db.vectors.putLocked(db.allocator, std.mem.bytesToValue(schema.LinkVector, entry.value[0..@sizeOf(schema.LinkVector)]));
+        if (entry.value.len != @sizeOf(schema.StoredVector)) continue;
+        try index.putLocked(db.allocator, std.mem.bytesToValue(schema.StoredVector, entry.value[0..@sizeOf(schema.StoredVector)]));
     }
     return scanned;
 }

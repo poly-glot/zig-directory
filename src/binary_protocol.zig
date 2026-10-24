@@ -102,6 +102,7 @@ pub const Op = enum(u8) {
     query_links = 38,
     put_link_entities = 39,
     match_names = 40,
+    put_category_vectors = 41,
     ping = 255,
 };
 
@@ -309,6 +310,7 @@ pub fn dispatch(db: *Directory, op_byte: u8, payload: []const u8, count: u16, re
         .query_links => handleQueryLinks(db, resp, op_byte, payload),
         .put_link_entities => handlePutLinkEntities(db, resp, op_byte, payload),
         .match_names => handleMatchNames(db, resp, op_byte, payload),
+        .put_category_vectors => handlePutCategoryVectors(db, resp, op_byte, payload),
     };
 }
 
@@ -765,6 +767,7 @@ const SearchMode = enum(u8) { all_terms = 0, ranked = 1, hybrid = 2 };
 const EMBEDDING_BYTES: usize = schema.EMBEDDING_DIMS * 4;
 const HYBRID_QUERY_BYTES: usize = 8 + EMBEDDING_BYTES;
 const VECTOR_WRITE_BYTES: usize = 8 + 8 + EMBEDDING_BYTES;
+const CATEGORY_VECTOR_WRITE_BYTES: usize = 8 + EMBEDDING_BYTES;
 
 const inverted = @import("zigstore").inverted_index;
 const vector_index = @import("vector_index.zig");
@@ -782,10 +785,16 @@ fn linkMatchField(link: schema.Link, query: []const u8) MatchField {
     return .semantic;
 }
 
-fn searchCategoriesInMode(db: *Directory, mode: SearchMode, query: []const u8, max: u32, buf: []schema.Category) ![]schema.Category {
+fn searchCategoriesInMode(db: *Directory, mode: SearchMode, query: []const u8, query_vector: []const u8, max: u32, buf: []schema.Category) ![]schema.Category {
     return switch (mode) {
         .all_terms => operations.searchCategories(db, query, max, buf),
-        .ranked, .hybrid => operations.searchCategoriesRanked(db, query, max, buf),
+        .ranked => operations.searchCategoriesRanked(db, query, max, buf),
+        .hybrid => {
+            const model = std.mem.readInt(u64, query_vector[0..8], .little);
+            var embedding: vector_index.Embedding = undefined;
+            vector_index.readEmbedding(query_vector[8..][0..EMBEDDING_BYTES], &embedding);
+            return operations.searchCategoriesHybrid(db, query, model, &embedding, max, buf);
+        },
     };
 }
 
@@ -846,7 +855,7 @@ fn handleSearch(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) us
     const cats = if (scope == .links_only)
         cat_buf[0..0]
     else
-        searchCategoriesInMode(db, mode, query, max, &cat_buf) catch &[0]schema.Category{};
+        searchCategoriesInMode(db, mode, query, query_vector, max, &cat_buf) catch &[0]schema.Category{};
     var off = writeCountedCategoryRows(resp, RESPONSE_HEADER_SIZE, cats, 2);
 
     var link_buf: [SEARCH_MAX_RESULTS]schema.Link = undefined;
@@ -1066,6 +1075,38 @@ fn handlePutLinkEntities(db: *Directory, resp: []u8, op_byte: u8, payload: []con
     std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE + 2 ..][0..2], count - ok_count, .little);
     writeOkHeader(resp, op_byte, reply_off, 0);
     return reply_off;
+}
+
+fn handlePutCategoryVectors(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
+    if (payload.len < 10) return writeErrorResp(resp, op_byte, .invalid);
+    const model = std.mem.readInt(u64, payload[0..8], .little);
+    const count = std.mem.readInt(u16, payload[8..10], .little);
+    if (count == 0 or count > operations.MAX_VECTORS_PER_WRITE) return writeErrorResp(resp, op_byte, .invalid);
+    if (payload.len != 10 + @as(usize, count) * CATEGORY_VECTOR_WRITE_BYTES) return writeErrorResp(resp, op_byte, .invalid);
+    if (resp.len < RESPONSE_HEADER_SIZE + 4 + @as(usize, count) * 9) return writeErrorResp(resp, op_byte, .err);
+
+    var writes: [operations.MAX_VECTORS_PER_WRITE]operations.CategoryVectorWrite = undefined;
+    for (writes[0..count], 0..) |*w, i| {
+        const item = payload[10 + i * CATEGORY_VECTOR_WRITE_BYTES ..][0..CATEGORY_VECTOR_WRITE_BYTES];
+        w.category_id = std.mem.readInt(u64, item[0..8], .little);
+        vector_index.readEmbedding(item[8..][0..EMBEDDING_BYTES], &w.embedding);
+    }
+
+    var results: [operations.MAX_VECTORS_PER_WRITE]operations.VectorWriteResult = undefined;
+    operations.putCategoryVectors(db, model, writes[0..count], results[0..count]) catch |err| return writeMappedError(resp, op_byte, err);
+
+    var ok_count: u16 = 0;
+    var off: usize = RESPONSE_HEADER_SIZE + 4;
+    for (writes[0..count], results[0..count]) |w, result| {
+        std.mem.writeInt(u64, resp[off..][0..8], w.category_id, .little);
+        resp[off + 8] = @intFromEnum(result);
+        off += 9;
+        if (result == .ok) ok_count += 1;
+    }
+    std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], ok_count, .little);
+    std.mem.writeInt(u16, resp[RESPONSE_HEADER_SIZE + 2 ..][0..2], count - ok_count, .little);
+    writeOkHeader(resp, op_byte, off, 0);
+    return off;
 }
 
 fn handlePutLinkVectors(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -2592,6 +2633,106 @@ test "put_link_vectors (op=37) and hybrid search (op=14 mode 2) frames" {
     try std.testing.expectEqual(link_id, std.mem.readInt(u64, resp[links_off + 2 ..][0..8], .little));
     try std.testing.expectEqual(@intFromEnum(MatchField.semantic), resp[links_off + 2 + @sizeOf(schema.Link)]);
     try std.testing.expectEqual(@as(u8, 1), resp[len - 1]);
+}
+
+fn hybridSearchFrame(buf: []u8, query: []const u8, model: u64, axis: usize) []const u8 {
+    const frame = buf[0 .. 2 + query.len + 4 + 2 + HYBRID_QUERY_BYTES];
+    @memset(frame, 0);
+    std.mem.writeInt(u16, frame[0..2], @intCast(query.len), .little);
+    @memcpy(frame[2..][0..query.len], query);
+    std.mem.writeInt(u32, frame[2 + query.len ..][0..4], 10, .little);
+    const opts = 2 + query.len + 4;
+    frame[opts] = @intFromEnum(SearchScope.both);
+    frame[opts + 1] = @intFromEnum(SearchMode.hybrid);
+    std.mem.writeInt(u64, frame[opts + 2 ..][0..8], model, .little);
+    std.mem.writeInt(u32, frame[opts + 10 + axis * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+    return frame;
+}
+
+fn categoryVectorFrame(buf: []u8, model: u64, category_id: u64, axis: usize) []const u8 {
+    const frame = buf[0 .. 10 + CATEGORY_VECTOR_WRITE_BYTES];
+    @memset(frame, 0);
+    std.mem.writeInt(u64, frame[0..8], model, .little);
+    std.mem.writeInt(u16, frame[8..10], 1, .little);
+    std.mem.writeInt(u64, frame[10..18], category_id, .little);
+    std.mem.writeInt(u32, frame[18 + axis * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+    return frame;
+}
+
+test "put_category_vectors (op=41) stores a vector for a known category and refuses an unknown one or a short frame" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try operations.createCategory(db, 0, "Top", "top", "");
+    const model: u64 = 0xB6E5;
+    var put_buf: [10 + CATEGORY_VECTOR_WRITE_BYTES]u8 = undefined;
+    var resp: [16384]u8 = undefined;
+
+    const put = categoryVectorFrame(&put_buf, model, top_id, 0);
+    _ = handlePutCategoryVectors(db, &resp, @intFromEnum(Op.put_category_vectors), put[0 .. put.len - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), resp[5]);
+
+    _ = handlePutCategoryVectors(db, &resp, @intFromEnum(Op.put_category_vectors), put);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], .little));
+    try std.testing.expectEqual(top_id, std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE + 4 ..][0..8], .little));
+    try std.testing.expectEqual(@as(u8, 0), resp[RESPONSE_HEADER_SIZE + 12]);
+
+    const unknown = categoryVectorFrame(&put_buf, model, top_id + 100, 0);
+    _ = handlePutCategoryVectors(db, &resp, @intFromEnum(Op.put_category_vectors), unknown);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], .little));
+    try std.testing.expectEqual(@intFromEnum(operations.VectorWriteResult.not_found), resp[RESPONSE_HEADER_SIZE + 12]);
+}
+
+test "hybrid search finds a link through its category's meaning when neither its text nor its own vector matches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try Directory.openTestInstance(allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const top_id = try operations.createCategory(db, 0, "Top", "top", "");
+    const jazz_id = try operations.createCategory(db, top_id, "Jazz", "jazz", "");
+    const players_id = try operations.createCategory(db, jazz_id, "Players", "players", "");
+    const pets_id = try operations.createCategory(db, top_id, "Pets", "pets", "");
+    const damas_id = try operations.createLink(db, players_id, "https://damas.example", "Damas", "");
+    const kennel_id = try operations.createLink(db, pets_id, "https://kennel.example", "Kennel", "");
+    const model: u64 = 0xB6E5;
+
+    var link_writes: [2]operations.VectorWrite = undefined;
+    for (&link_writes, [_]u64{ damas_id, kennel_id }, [_]usize{ 1, 2 }) |*w, id, axis| {
+        const link = (try operations.getLink(db, id)).?;
+        w.* = .{ .link_id = id, .text_fingerprint = schema.linkTextFingerprint(link), .embedding = @splat(0) };
+        w.embedding[axis] = 1;
+    }
+    link_writes[1].embedding[0] = 0.5;
+    var link_results: [2]operations.VectorWriteResult = undefined;
+    try operations.putLinkVectors(db, model, &link_writes, &link_results);
+
+    var put_buf: [10 + CATEGORY_VECTOR_WRITE_BYTES]u8 = undefined;
+    var resp: [16384]u8 = undefined;
+    _ = handlePutCategoryVectors(db, &resp, @intFromEnum(Op.put_category_vectors), categoryVectorFrame(&put_buf, model, jazz_id, 0));
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+
+    try operations.loadVectorIndex(db);
+    try operations.loadCategoryVectorIndex(db);
+    try operations.loadFactsIndex(db);
+
+    var search_buf: [2 + 16 + 4 + 2 + HYBRID_QUERY_BYTES]u8 = undefined;
+    _ = handleSearch(db, &resp, @intFromEnum(Op.search), hybridSearchFrame(&search_buf, "saxophonists", model, 0));
+    try std.testing.expectEqual(@intFromEnum(Status.ok), resp[5]);
+
+    const cat_count = std.mem.readInt(u16, resp[RESPONSE_HEADER_SIZE..][0..2], .little);
+    try std.testing.expectEqual(@as(u16, 1), cat_count);
+    try std.testing.expectEqual(jazz_id, std.mem.readInt(u64, resp[RESPONSE_HEADER_SIZE + 2 ..][0..8], .little));
+
+    const links_off = RESPONSE_HEADER_SIZE + 2 + @sizeOf(schema.Category);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, resp[links_off..][0..2], .little));
+    try std.testing.expectEqual(damas_id, std.mem.readInt(u64, resp[links_off + 2 ..][0..8], .little));
 }
 
 fn queryLinksRequest(buf: []u8, category_id: u64, domain: []const u8, country: []const u8, options: QueryLinksOptions, words: []const u8) ![]const u8 {

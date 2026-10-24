@@ -50,10 +50,20 @@ pub const schema_v6 = zigstore.schema(.{
     .counters = &v6_counters,
 });
 
-pub const schema = zigstore.schema(.{
+const v7_indexes = v6_indexes ++ .{.{ .name = "link_entities", .key = .u64 }};
+
+pub const schema_v7 = zigstore.schema(.{
     .magic = schema_v5.magic,
     .format_version = 7,
-    .indexes = v6_indexes ++ .{.{ .name = "link_entities", .key = .u64 }},
+    .indexes = v7_indexes,
+    .memtable_indexes = memtable_indexes,
+    .counters = &v6_counters,
+});
+
+pub const schema = zigstore.schema(.{
+    .magic = schema_v5.magic,
+    .format_version = 8,
+    .indexes = v7_indexes ++ .{.{ .name = "category_vectors", .key = .u64 }},
     .memtable_indexes = memtable_indexes,
     .counters = &v6_counters,
 });
@@ -104,6 +114,7 @@ pub const Directory = struct {
     url_bloom_seeder_stop: std.atomic.Value(bool),
 
     vectors: vector_index.VectorIndex,
+    cat_vectors: vector_index.VectorIndex,
     vector_loader: ?std.Thread,
 
     facts: facts_index.FactsIndex,
@@ -186,6 +197,10 @@ pub const Directory = struct {
     }
     pub fn link_vectors(self: *Self) *zigstore.BPlusTree {
         return self.store.tree("link_vectors");
+    }
+
+    pub fn category_vectors(self: *Self) *zigstore.BPlusTree {
+        return self.store.tree("category_vectors");
     }
 
     pub fn link_entities(self: *Self) *zigstore.BPlusTree {
@@ -283,6 +298,7 @@ pub const Directory = struct {
             .url_bloom_seeder = null,
             .url_bloom_seeder_stop = std.atomic.Value(bool).init(false),
             .vectors = .{ .model = .init(store.counter("embedding_model").*) },
+            .cat_vectors = .{ .model = .init(store.counter("embedding_model").*) },
             .vector_loader = null,
             .facts = .{},
             .facts_loader = null,
@@ -362,6 +378,13 @@ pub const Directory = struct {
         };
         if (self.vectors.ready.load(.acquire)) {
             log.info("vector index loaded {d} vectors in {d} ms", .{ self.vectors.count(self.io), started.untilNow(self.io, .awake).toMilliseconds() });
+        }
+        @import("operations/operations.zig").loadCategoryVectorIndex(self) catch |err| {
+            log.warn("category vector index load stopped: {} — search ignores category meaning", .{err});
+            return;
+        };
+        if (self.cat_vectors.ready.load(.acquire)) {
+            log.info("category vector index loaded {d} vectors in {d} ms", .{ self.cat_vectors.count(self.io), started.untilNow(self.io, .awake).toMilliseconds() });
         }
     }
 
@@ -458,6 +481,7 @@ pub const Directory = struct {
         self.url_bloom_seeder_stop.store(true, .release);
         if (self.url_bloom_seeder) |t| t.join();
         self.vectors.loader_stop.store(true, .release);
+        self.cat_vectors.loader_stop.store(true, .release);
         if (self.vector_loader) |t| t.join();
         self.facts.loader_stop.store(true, .release);
         if (self.facts_loader) |t| t.join();
@@ -476,6 +500,7 @@ pub const Directory = struct {
 
         self.url_bloom.deinit();
         self.vectors.deinit(self.allocator);
+        self.cat_vectors.deinit(self.allocator);
         self.facts.deinit(self.allocator);
         self.subtree_cache.deinit();
 

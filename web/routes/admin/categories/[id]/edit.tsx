@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../../../utils.ts";
 import { type Category, getClient } from "../../../../lib/dmoz-client.ts";
+import { storeCategoryVector } from "../../../../lib/embedder.ts";
 import { formField } from "../../../../lib/utils.ts";
 import AdminShell from "../../../../components/admin/AdminShell/AdminShell.tsx";
 import AdminStatusChip from "../../../../components/admin/AdminStatusChip/AdminStatusChip.tsx";
@@ -58,6 +59,7 @@ export const handler = define.handlers<Data>({
         if (slug) updates.slug = slug;
         updates.description = formField(form, "description");
         await getClient().updateCategory(id, updates);
+        await storeCategoryVector(getClient(), id);
         message = "Category updated";
       } else if (action === "delete") {
         await getClient().deleteCategory(id);

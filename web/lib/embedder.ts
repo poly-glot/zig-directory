@@ -94,6 +94,10 @@ export function linkDocumentText(
   return [path, title, description].filter(Boolean).join(". ").trim();
 }
 
+export function categoryDocumentText(categoryNames: readonly string[]): string {
+  return categoryNames.join(" > ");
+}
+
 export async function embedText(text: string): Promise<Float32Array> {
   return (await embedder())(text);
 }
@@ -112,6 +116,27 @@ export async function embedQuery(
   } catch (e) {
     console.error("embedQuery failed, searching by keywords only:", e);
     return undefined;
+  }
+}
+
+export async function storeCategoryVector(
+  client: DmozClient,
+  categoryId: number,
+): Promise<void> {
+  try {
+    const chains = await client.breadcrumbsByIds([categoryId]);
+    const vector = await embedText(
+      categoryDocumentText(categoryNames(chains.get(categoryId) ?? [])),
+    );
+    const [result] = await client.putCategoryVectors(EMBEDDING_MODEL, [{
+      categoryId,
+      vector,
+    }]);
+    if (result.code !== "ok") {
+      console.error(`storeCategoryVector ${categoryId}: ${result.code}`);
+    }
+  } catch (e) {
+    console.error(`storeCategoryVector ${categoryId}: search ignores it:`, e);
   }
 }
 

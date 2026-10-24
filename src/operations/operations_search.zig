@@ -15,6 +15,8 @@ const log = shared.log;
 pub const MAX_POSTINGS_PER_TOKEN: usize = 20_000;
 const MAX_QUERY_TOKENS: usize = 32;
 pub const HYBRID_CANDIDATES: usize = 200;
+pub const CATEGORY_CANDIDATES: usize = 3;
+const CATEGORY_NEAREST: usize = 50;
 
 const ScoredId = ranking.ScoredId;
 
@@ -300,7 +302,10 @@ pub fn searchLinksHybrid(
     var nearest_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
     const nearest = db.vectors.nearest(db.io, &q, &nearest_buf);
 
-    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest });
+    var subtree_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
+    const subtree = try subtreeCandidates(db, &q, &subtree_buf);
+
+    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest, subtree });
     defer db.allocator.free(fused);
     return .{
         .links = try fetchLinks(db, fused, limit, buf, site_rows),
@@ -308,10 +313,51 @@ pub fn searchLinksHybrid(
     };
 }
 
+fn subtreeCandidates(db: *Directory, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
+    if (!db.cat_vectors.ready.load(.acquire) or !db.facts.ready.load(.acquire)) return out[0..0];
+
+    var roots_buf: [CATEGORY_CANDIDATES]ScoredId = undefined;
+    const roots = db.cat_vectors.nearest(db.io, q, &roots_buf);
+    var root_ids: [CATEGORY_CANDIDATES]u64 = undefined;
+    for (roots, root_ids[0..roots.len]) |root, *id| id.* = root.id;
+
+    const ids = try db.facts.subtreeLinkIds(db.io, db.allocator, root_ids[0..roots.len]);
+    defer db.allocator.free(ids);
+    return db.vectors.scoreIds(db.io, ids, q, out);
+}
+
+pub fn searchCategoriesHybrid(
+    db: *Directory,
+    query: []const u8,
+    model: u64,
+    query_embedding: *const vector_index.Embedding,
+    limit: u32,
+    buf: []schema.Category,
+) ![]schema.Category {
+    const ranked = try rankedIds(db.allocator, db.categories_index_tree(), db.next_category_id.load(.monotonic), MAX_POSTINGS_PER_TOKEN, query);
+    defer db.allocator.free(ranked);
+
+    const quantized = if (categoryHalfUsable(db, model)) vector_index.quantize(query_embedding) else null;
+    const q = quantized orelse return fetchInRankOrder(schema.Category, db, ranked, limit, buf, category.getCategory);
+
+    var nearest_buf: [CATEGORY_NEAREST]ScoredId = undefined;
+    const nearest = db.cat_vectors.nearest(db.io, &q, &nearest_buf);
+
+    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ ranked[0..@min(ranked.len, CATEGORY_NEAREST)], nearest });
+    defer db.allocator.free(fused);
+    return fetchInRankOrder(schema.Category, db, fused, limit, buf, category.getCategory);
+}
+
 fn vectorHalfUsable(db: *Directory, model: u64) bool {
     return model != 0 and
         db.vectors.ready.load(.acquire) and
         db.vectors.model.load(.acquire) == model;
+}
+
+fn categoryHalfUsable(db: *Directory, model: u64) bool {
+    return model != 0 and
+        db.cat_vectors.ready.load(.acquire) and
+        db.cat_vectors.model.load(.acquire) == model;
 }
 
 fn searchViaIndexTree(

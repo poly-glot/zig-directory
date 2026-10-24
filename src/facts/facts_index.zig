@@ -196,7 +196,7 @@ pub const FactsIndex = struct {
             .category_renamed => |e| try self.writeCategory(io, allocator, e.new_cat),
             .category_moved => |e| try self.writeCategory(io, allocator, e.cat),
             .category_deleted => |e| try self.dropCategory(io, allocator, e.cat.id),
-            .link_vectors_put, .slug_path_repair_chunk, .slug_path_repair_complete => {},
+            .link_vectors_put, .category_vectors_put, .slug_path_repair_chunk, .slug_path_repair_complete => {},
         }
     }
 
@@ -287,6 +287,43 @@ pub const FactsIndex = struct {
         defer self.lock.unlock(io);
         if (self.views_stale) try self.rebuildCategoryViews(allocator);
         return self.evaluate(arena, q);
+    }
+
+    pub fn subtreeLinkIds(self: *FactsIndex, io: std.Io, allocator: std.mem.Allocator, roots: []const u64) ![]u64 {
+        self.lock.lockSharedUncancelable(io);
+        if (!self.views_stale) {
+            defer self.lock.unlockShared(io);
+            return self.collectSubtreeLinkIds(allocator, roots);
+        }
+        self.lock.unlockShared(io);
+
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        if (self.views_stale) try self.rebuildCategoryViews(allocator);
+        return self.collectSubtreeLinkIds(allocator, roots);
+    }
+
+    fn collectSubtreeLinkIds(self: *const FactsIndex, allocator: std.mem.Allocator, roots: []const u64) ![]u64 {
+        var scopes: [MAX_SUBTREE_ROOTS]CategoryView = undefined;
+        var scope_count: usize = 0;
+        for (roots[0..@min(roots.len, MAX_SUBTREE_ROOTS)]) |root| {
+            const view = self.category_views.get(root) orelse continue;
+            scopes[scope_count] = view;
+            scope_count += 1;
+        }
+
+        var ids: std.ArrayListUnmanaged(u64) = .empty;
+        errdefer ids.deinit(allocator);
+        var it = self.links.iterator();
+        while (it.next()) |entry| {
+            const view = self.category_views.get(entry.value_ptr.category_id) orelse continue;
+            for (scopes[0..scope_count]) |scope| {
+                if (!scope.contains(view)) continue;
+                try ids.append(allocator, entry.key_ptr.*);
+                break;
+            }
+        }
+        return ids.toOwnedSlice(allocator);
     }
 
     fn evaluate(self: *const FactsIndex, arena: std.mem.Allocator, q: Query) !Answer {
@@ -528,6 +565,8 @@ fn foldName(text: []const u8, out: *[MAX_FOLDED_NAME]u8) []const u8 {
     }
     return out[0..w.end];
 }
+
+pub const MAX_SUBTREE_ROOTS: usize = 8;
 
 pub const CategoryView = struct {
     country: countries.Code,

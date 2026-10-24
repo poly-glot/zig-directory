@@ -78,7 +78,7 @@ pub fn applyLinkVectorsPut(db: *Directory, e: changeset.LinkVectorsPutEffect) !v
     db.vectors.model.store(e.model, .release);
 
     for (e.vectors) |v| {
-        const key = codec.encodeU64(v.link_id);
+        const key = codec.encodeU64(v.id);
         try db.link_vectors().insert(&key, std.mem.asBytes(&v));
         try db.vectors.put(db.io, db.allocator, v);
     }

@@ -46,12 +46,15 @@ pub const searchLinks = search.searchLinks;
 pub const searchCategoriesRanked = search.searchCategoriesRanked;
 pub const searchLinksRanked = search.searchLinksRanked;
 pub const searchLinksHybrid = search.searchLinksHybrid;
+pub const searchCategoriesHybrid = search.searchCategoriesHybrid;
 pub const HybridLinks = search.HybridLinks;
 pub const RowSite = search.RowSite;
 
 pub const putLinkVectors = vector_mod.putLinkVectors;
 pub const getLinkVector = vector_mod.getLinkVector;
 pub const loadVectorIndex = vector_mod.loadVectorIndex;
+pub const loadCategoryVectorIndex = vector_mod.loadCategoryVectorIndex;
+pub const putCategoryVectors = vector_mod.putCategoryVectors;
 pub const loadFactsIndex = facts_mod.loadFactsIndex;
 pub const queryLinks = facts_mod.queryLinks;
 pub const matchNames = facts_mod.matchNames;
@@ -65,6 +68,7 @@ pub const EntityWrite = facts_mod.EntityWrite;
 pub const EntityWriteResult = facts_mod.EntityWriteResult;
 pub const MAX_ENTITY_WRITES = facts_mod.MAX_ENTITY_WRITES;
 pub const VectorWrite = vector_mod.VectorWrite;
+pub const CategoryVectorWrite = vector_mod.CategoryVectorWrite;
 pub const VectorWriteResult = vector_mod.VectorWriteResult;
 pub const MAX_VECTORS_PER_WRITE = vector_mod.MAX_VECTORS_PER_WRITE;
 

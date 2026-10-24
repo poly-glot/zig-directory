@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
+import { storeCategoryVector } from "../../../lib/embedder.ts";
 import { formField, slugify } from "../../../lib/utils.ts";
 import CreatePageShell from "../../../components/admin/CreatePageShell/CreatePageShell.tsx";
 import {
@@ -67,12 +68,13 @@ export const handler = define.handlers<Data>({
     }
 
     try {
-      await client.createCategory(
+      const id = await client.createCategory(
         parentId,
         values.name,
         values.slug || slugify(values.name),
         values.description,
       );
+      await storeCategoryVector(client, id);
     } catch (e) {
       return page({
         values,

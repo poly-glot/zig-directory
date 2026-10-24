@@ -42,6 +42,7 @@ export const enum Op {
   QueryLinks = 38,
   PutLinkEntities = 39,
   MatchNames = 40,
+  PutCategoryVectors = 41,
   Ping = 255,
 }
 
