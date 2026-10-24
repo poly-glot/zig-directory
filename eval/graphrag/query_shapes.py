@@ -105,7 +105,7 @@ for c in cats:
         else:
             leaves.append(k)
     persons = [k for k in leaves if is_person(k)]
-    if len(leaves) >= 3 and len(persons) / len(leaves) >= 0.5:
+    if not LETTER.match(slug[c]) and len(leaves) >= 3 and len(persons) / len(leaves) >= 0.5:
         role_nodes[slug[c]] += 1
         role_links[slug[c]] += sum(len(own[p]) for p in persons)
         for p in persons:
