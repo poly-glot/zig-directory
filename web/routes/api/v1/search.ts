@@ -2,6 +2,7 @@ import { define } from "../../../utils.ts";
 import { getClient } from "../../../lib/dmoz-client.ts";
 import { categoryPath } from "../../../lib/format.ts";
 import { embedQuery } from "../../../lib/embedder.ts";
+import { rankedQuery } from "../../search/_lib/targets.ts";
 import { categoryJson, errorResponse, linkJson, pageSize } from "./_lib/api.ts";
 
 type Scope = "both" | "links" | "categories";
@@ -27,14 +28,15 @@ export const handler = define.handlers({
     try {
       const client = getClient();
       const scope = parseScope(searchParams.get("scope"));
-      const result = await client.search(query, {
+      const ranked = rankedQuery(query);
+      const result = await client.search(ranked, {
         limit: pageSize(searchParams.get("limit")),
         scope,
         mode: "ranked",
         capPerSite: true,
         queryEmbedding: scope === "categories"
           ? undefined
-          : await embedQuery(query),
+          : await embedQuery(ranked),
       });
       const chains = await client.breadcrumbsByIds([
         ...result.categories.map((c) => c.id),

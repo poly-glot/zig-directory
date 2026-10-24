@@ -166,6 +166,19 @@ function wordsOf(text: string): string[] {
     .filter(Boolean);
 }
 
+function isContentWord(word: string): boolean {
+  return word.length > 1 && !STOPWORDS.has(word);
+}
+
+export function contentWords(text: string): string[] {
+  return [...new Set(wordsOf(text).filter(isContentWord))];
+}
+
+export function rankedQuery(text: string): string {
+  const words = contentWords(text);
+  return words.length > 0 ? words.join(" ") : text;
+}
+
 function cued(words: readonly string[], start: number, end: number): boolean {
   const before = words[start - 1] === "the"
     ? words[start - 2]
@@ -279,10 +292,7 @@ export function recognise(
     start += found.length;
   }
 
-  const content = rest.filter((word) =>
-    word.length > 1 && !STOPWORDS.has(word)
-  );
-  return { targets, words: [...new Set(content)] };
+  return { targets, words: [...new Set(rest.filter(isContentWord))] };
 }
 
 export function constraintsOf(

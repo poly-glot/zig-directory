@@ -28,6 +28,7 @@ import {
   constraintsOf,
   linkQueryFor,
   namePhrases,
+  rankedQuery,
   recognise,
   type Target,
   typedTargets,
@@ -196,11 +197,12 @@ async function buildSearchResult(
   year: number,
 ): Promise<Data> {
   const client = getClient();
-  const rawResults = await client.search(q, {
+  const ranked = rankedQuery(q);
+  const rawResults = await client.search(ranked, {
     limit: 50,
     mode: "ranked",
     capPerSite: true,
-    queryEmbedding: await embedQuery(q),
+    queryEmbedding: await embedQuery(ranked),
   });
   const crumbIds = new Set<number>();
   for (const c of rawResults.categories) crumbIds.add(c.id);

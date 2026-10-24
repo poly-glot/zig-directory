@@ -4,8 +4,10 @@ import type { Religion } from "../../../lib/dmoz-protocol.gen.ts";
 import type { QueryVocabulary } from "../../../lib/entities.ts";
 import {
   canonicalQuery,
+  contentWords,
   linkQueryFor,
   namePhrases,
+  rankedQuery,
   recognise,
   type Target,
   typedTargets,
@@ -168,4 +170,14 @@ Deno.test("targets round-trip through a canonical query and become one query_lin
     words: "anime",
     allWords: true,
   });
+});
+
+Deno.test("a sentence ranks by its content words only, and an all-stopword query ranks as typed", () => {
+  assertEquals(contentWords("show me site about ali"), ["ali"]);
+  assertEquals(
+    contentWords("what are the links about biography about politicians"),
+    ["biography", "politicians"],
+  );
+  assertEquals(rankedQuery("What are the links about Ali's site?"), "ali");
+  assertEquals(rankedQuery("what is"), "what is");
 });
