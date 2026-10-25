@@ -10,6 +10,8 @@ const histogram = zigstore.histogram;
 const binary_protocol = @import("binary_protocol.zig");
 const header_upgrade = @import("header_upgrade.zig");
 const vector_index = @import("vector_index.zig");
+const ivf_index = @import("ivf_index.zig");
+const vector_model = @import("vector_model.zig");
 const facts_index = @import("facts/facts_index.zig");
 const Config = @import("main.zig").Config;
 
@@ -60,10 +62,20 @@ pub const schema_v7 = zigstore.schema(.{
     .counters = &v6_counters,
 });
 
-pub const schema = zigstore.schema(.{
+const v8_indexes = v7_indexes ++ .{.{ .name = "category_vectors", .key = .u64 }};
+
+pub const schema_v8 = zigstore.schema(.{
     .magic = schema_v5.magic,
     .format_version = 8,
-    .indexes = v7_indexes ++ .{.{ .name = "category_vectors", .key = .u64 }},
+    .indexes = v8_indexes,
+    .memtable_indexes = memtable_indexes,
+    .counters = &v6_counters,
+});
+
+pub const schema = zigstore.schema(.{
+    .magic = schema_v5.magic,
+    .format_version = 9,
+    .indexes = v8_indexes,
     .memtable_indexes = memtable_indexes,
     .counters = &v6_counters,
 });
@@ -82,6 +94,7 @@ pub const Stats = struct {
 pub const URL_BLOOM_INITIAL_CAPACITY: u64 = 1_000_000;
 pub const DERIVED_COUNTS_VERSION: u64 = 1;
 const MEMTABLE_FLUSH_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
+const TEST_VECTOR_MODEL_SEED: u64 = 0x5EED;
 
 threadlocal var deferred_durable_seq: ?u64 = null;
 
@@ -113,7 +126,7 @@ pub const Directory = struct {
     url_bloom_seeder: ?std.Thread,
     url_bloom_seeder_stop: std.atomic.Value(bool),
 
-    vectors: vector_index.VectorIndex,
+    vectors: ivf_index.LinkVectorIndex,
     cat_vectors: vector_index.VectorIndex,
     vector_loader: ?std.Thread,
 
@@ -231,6 +244,8 @@ pub const Directory = struct {
         const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
         const path = try allocator.dupe(u8, path_buf[0..path_len]);
         errdefer allocator.free(path);
+        const pq = try vector_model.Model.synthetic(allocator, TEST_VECTOR_MODEL_SEED);
+        errdefer pq.deinit(allocator);
         const dir = try Self.init(std.testing.io, allocator, .{
             .data_dir = path,
             .server = .{
@@ -239,18 +254,20 @@ pub const Directory = struct {
                 .wal_batch_size = 32,
                 .snapshot_interval_s = 3600,
             },
-        });
+        }, pq);
         return dir;
     }
 
     pub fn deinitTestInstance(self: *Self) void {
         const allocator = self.allocator;
         const data_dir = self.config.data_dir;
+        const pq = self.vectors.pq;
         self.deinit();
+        pq.deinit(allocator);
         allocator.free(data_dir);
     }
 
-    pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config) !*Self {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, pq: *const vector_model.Model) !*Self {
         try header_upgrade.upgradeHeader(io, config.data_dir);
 
         const store = try Store.init(io, allocator, .{
@@ -297,7 +314,7 @@ pub const Directory = struct {
             .url_bloom_ready = std.atomic.Value(bool).init(false),
             .url_bloom_seeder = null,
             .url_bloom_seeder_stop = std.atomic.Value(bool).init(false),
-            .vectors = .{ .model = .init(store.counter("embedding_model").*) },
+            .vectors = .{ .pq = pq, .model = .init(store.counter("embedding_model").*) },
             .cat_vectors = .{ .model = .init(store.counter("embedding_model").*) },
             .vector_loader = null,
             .facts = .{},
@@ -473,7 +490,9 @@ pub const Directory = struct {
     pub fn deinitCrashTestInstance(self: *Self) void {
         const allocator = self.allocator;
         const data_dir = self.config.data_dir;
+        const pq = self.vectors.pq;
         self.shutdown(false);
+        pq.deinit(allocator);
         allocator.free(data_dir);
     }
 

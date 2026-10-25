@@ -90,11 +90,26 @@ pub const StoredVector = extern struct {
     _pad: [4]u8 = @splat(0),
 };
 
-pub const LinkVector = StoredVector;
+pub const PQ_SUBQUANTIZERS: usize = 96;
+
+pub const LinkVector = extern struct {
+    vector: StoredVector = .{},
+    model_hash: u64 = 0,
+    cell: u16 = 0,
+    _pad: [6]u8 = @splat(0),
+    codes: [PQ_SUBQUANTIZERS]u8 = @splat(0),
+};
 
 comptime {
     if (@sizeOf(StoredVector) != 400)
         @compileError("StoredVector size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(StoredVector)}) ++ ", expected 400");
+    if (@sizeOf(LinkVector) != 512)
+        @compileError("LinkVector size mismatch: got " ++ std.fmt.comptimePrint("{d}", .{@sizeOf(LinkVector)}) ++ ", expected 512");
+}
+
+pub fn storedVectorPrefix(bytes: []const u8) ?StoredVector {
+    if (bytes.len != @sizeOf(StoredVector) and bytes.len != @sizeOf(LinkVector)) return null;
+    return std.mem.bytesToValue(StoredVector, bytes[0..@sizeOf(StoredVector)]);
 }
 
 pub fn linkTextFingerprint(link: Link) u64 {

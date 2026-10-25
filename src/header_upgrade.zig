@@ -7,6 +7,7 @@ const log = std.log.scoped(.header_upgrade);
 const HeaderV5 = zigstore.Engine(directory.schema_v5).Header;
 const HeaderV6 = zigstore.Engine(directory.schema_v6).Header;
 const HeaderV7 = zigstore.Engine(directory.schema_v7).Header;
+const HeaderV8 = zigstore.Engine(directory.schema_v8).Header;
 const Header = directory.Store.Header;
 const PAGE_SIZE = @sizeOf(Header);
 const INVALID_PAGE: u64 = std.math.maxInt(u32);
@@ -16,11 +17,12 @@ const SIDE_FILE_LEN = PAGE_SIZE + 8;
 const steps = .{
     .{ HeaderV5, HeaderV6, directory.schema_v6.format_version },
     .{ HeaderV6, HeaderV7, directory.schema_v7.format_version },
-    .{ HeaderV7, Header, directory.schema.format_version },
+    .{ HeaderV7, HeaderV8, directory.schema_v8.format_version },
+    .{ HeaderV8, Header, directory.schema.format_version },
 };
 
 comptime {
-    if (@sizeOf(HeaderV5) != PAGE_SIZE or @sizeOf(HeaderV6) != PAGE_SIZE or @sizeOf(HeaderV7) != PAGE_SIZE) @compileError("every header version must fill one page");
+    if (@sizeOf(HeaderV5) != PAGE_SIZE or @sizeOf(HeaderV6) != PAGE_SIZE or @sizeOf(HeaderV7) != PAGE_SIZE or @sizeOf(HeaderV8) != PAGE_SIZE) @compileError("every header version must fill one page");
 }
 
 pub const UpgradeError = error{CheckpointJournalPending};
@@ -260,6 +262,32 @@ test "header upgrade: a v7 page 0 keeps its entities root and gains an empty cat
     try testing.expectEqual(@as(u64, 0), header.category_vectors_count);
 }
 
+test "header upgrade: a v8 page 0 keeps every root and counter because format 9 only widens link vector records" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+    var v8 = std.mem.zeroes(HeaderV8);
+    v8.magic = directory.schema_v8.magic;
+    v8.format_version = directory.schema_v8.format_version;
+    v8.link_vectors_root = 12;
+    v8.link_vectors_count = 91_994;
+    v8.category_vectors_root = 14;
+    v8.category_vectors_count = 59_219;
+    v8.embedding_model = 0xB6E5;
+    try writePage(testing.io, tmp.dir, &std.mem.toBytes(v8));
+
+    try upgradeHeader(testing.io, try tmpPath(&tmp, &path_buf));
+
+    const header = try readHeader(testing.io, tmp.dir);
+    try testing.expectEqual(directory.schema.format_version, header.format_version);
+    try testing.expectEqual(@as(u64, 12), header.link_vectors_root);
+    try testing.expectEqual(@as(u64, 91_994), header.link_vectors_count);
+    try testing.expectEqual(@as(u64, 14), header.category_vectors_root);
+    try testing.expectEqual(@as(u64, 59_219), header.category_vectors_count);
+    try testing.expectEqual(@as(u64, 0xB6E5), header.embedding_model);
+}
+
 test "header upgrade: running it again on a current store changes nothing" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -283,7 +311,8 @@ test "header upgrade: a complete side file left by a crash is redone over a torn
     const v5_page = std.mem.toBytes(v5);
     const v6_page = upgraded(HeaderV5, HeaderV6, directory.schema_v6.format_version, &v5_page);
     const v7_page = upgraded(HeaderV6, HeaderV7, directory.schema_v7.format_version, &v6_page);
-    const current_page = upgraded(HeaderV7, Header, directory.schema.format_version, &v7_page);
+    const v8_page = upgraded(HeaderV7, HeaderV8, directory.schema_v8.format_version, &v7_page);
+    const current_page = upgraded(HeaderV8, Header, directory.schema.format_version, &v8_page);
     try writeSideFile(testing.io, tmp.dir, path, &current_page);
     {
         const file = try tmp.dir.openFile(testing.io, "store.dat", .{ .mode = .read_write });

@@ -44,6 +44,10 @@ fn dot(a: *const Row, b: *const Row) i32 {
     return @reduce(.Add, a32 *% b32);
 }
 
+pub fn similarity(stored: *const schema.StoredVector, query: *const Quantized) f64 {
+    return @as(f64, @floatFromInt(dot(&stored.values, &query.values))) * stored.scale;
+}
+
 pub const VectorIndex = struct {
     lock: std.Io.RwLock = .init,
     ids: std.ArrayListUnmanaged(u64) = .empty,
@@ -113,8 +117,8 @@ pub const VectorIndex = struct {
 
         var top = ranking.TopK.init(out);
         for (self.ids.items, self.scales.items, self.rows.items) |id, scale, *row| {
-            const similarity = @as(f64, @floatFromInt(dot(row, &query.values))) * scale;
-            top.offer(.{ .id = id, .score = similarity });
+            const score = @as(f64, @floatFromInt(dot(row, &query.values))) * scale;
+            top.offer(.{ .id = id, .score = score });
         }
         return top.sorted();
     }
@@ -126,8 +130,8 @@ pub const VectorIndex = struct {
         var top = ranking.TopK.init(out);
         for (ids) |id| {
             const at = self.position.get(id) orelse continue;
-            const similarity = @as(f64, @floatFromInt(dot(&self.rows.items[at], &query.values))) * self.scales.items[at];
-            top.offer(.{ .id = id, .score = similarity });
+            const score = @as(f64, @floatFromInt(dot(&self.rows.items[at], &query.values))) * self.scales.items[at];
+            top.offer(.{ .id = id, .score = score });
         }
         return top.sorted();
     }

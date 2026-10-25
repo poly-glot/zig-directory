@@ -3,6 +3,7 @@ const codec = @import("zigstore").codec;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
 const vector_index = @import("../vector_index.zig");
+const vector_model = @import("../vector_model.zig");
 const link_mod = @import("operations_link.zig");
 
 pub const MAX_VECTORS_PER_WRITE: usize = 32;
@@ -37,7 +38,7 @@ pub fn putLinkVectors(db: *Directory, model: u64, writes: []const VectorWrite, r
     const current = db.vectors.model.load(.acquire);
     if (current != 0 and current != model) return error.EmbeddingModelMismatch;
 
-    var accepted: [MAX_VECTORS_PER_WRITE]schema.LinkVector = undefined;
+    var accepted: [MAX_VECTORS_PER_WRITE]schema.StoredVector = undefined;
     var accepted_len: usize = 0;
     for (writes, results) |*w, *result| {
         result.* = try checkWrite(db, w, &accepted[accepted_len]);
@@ -48,7 +49,7 @@ pub fn putLinkVectors(db: *Directory, model: u64, writes: []const VectorWrite, r
     try db.commit(.{ .link_vectors_put = .{ .model = model, .vectors = accepted[0..accepted_len] } });
 }
 
-fn checkWrite(db: *Directory, w: *const VectorWrite, out: *schema.LinkVector) !VectorWriteResult {
+fn checkWrite(db: *Directory, w: *const VectorWrite, out: *schema.StoredVector) !VectorWriteResult {
     const link = (try link_mod.getLink(db, w.link_id)) orelse return .not_found;
     if (schema.linkTextFingerprint(link) != w.text_fingerprint) return .stale_text;
     const q = vector_index.quantize(&w.embedding) orelse return .invalid_vector;
@@ -85,38 +86,67 @@ fn checkCategoryWrite(db: *Directory, w: *const CategoryVectorWrite, out: *schem
     return .ok;
 }
 
-pub fn getLinkVector(db: *Directory, link_id: u64) !?schema.LinkVector {
+pub fn getLinkVector(db: *Directory, link_id: u64) !?schema.StoredVector {
     const key = codec.encodeU64(link_id);
     var buf: [@sizeOf(schema.LinkVector)]u8 = undefined;
     const bytes = (try db.link_vectors().search(&key, &buf)) orelse return null;
-    if (bytes.len != @sizeOf(schema.LinkVector)) return null;
-    return std.mem.bytesToValue(schema.LinkVector, bytes[0..@sizeOf(schema.LinkVector)]);
+    return schema.storedVectorPrefix(bytes);
 }
 
 pub fn loadVectorIndex(db: *Directory) !void {
-    try loadIndex(db, db.link_vectors(), &db.vectors);
-}
-
-pub fn loadCategoryVectorIndex(db: *Directory) !void {
-    try loadIndex(db, db.category_vectors(), &db.cat_vectors);
-}
-
-fn loadIndex(db: *Directory, tree: *@import("zigstore").BPlusTree, index: *vector_index.VectorIndex) !void {
     var next_id: u64 = 0;
-    while (!index.loader_stop.load(.acquire)) {
-        if (try loadChunk(db, tree, index, &next_id) < LOAD_CHUNK) {
-            index.ready.store(true, .release);
+    while (!db.vectors.loader_stop.load(.acquire)) {
+        if (try loadLinkChunk(db, &next_id) < LOAD_CHUNK) {
+            db.vectors.ready.store(true, .release);
             return;
         }
     }
 }
 
-fn loadChunk(db: *Directory, tree: *@import("zigstore").BPlusTree, index: *vector_index.VectorIndex, next_id: *u64) !usize {
+pub fn loadCategoryVectorIndex(db: *Directory) !void {
+    var next_id: u64 = 0;
+    while (!db.cat_vectors.loader_stop.load(.acquire)) {
+        if (try loadCategoryChunk(db, &next_id) < LOAD_CHUNK) {
+            db.cat_vectors.ready.store(true, .release);
+            return;
+        }
+    }
+}
+
+fn loadLinkChunk(db: *Directory, next_id: *u64) !usize {
+    const index = &db.vectors;
     index.lock.lockUncancelable(db.io);
     defer index.lock.unlock(db.io);
 
     const start_key = codec.encodeU64(next_id.*);
-    var iter = try tree.rangeScan(&start_key, null);
+    var iter = try db.link_vectors().rangeScan(&start_key, null);
+    defer iter.deinit();
+
+    var scanned: usize = 0;
+    while (scanned < LOAD_CHUNK) : (scanned += 1) {
+        const entry = (try iter.next()) orelse return scanned;
+        next_id.* = codec.decodeU64(entry.key[0..8]) + 1;
+        const stored = schema.storedVectorPrefix(entry.value) orelse continue;
+        try index.putLocked(db.allocator, stored.id, codesFor(index.pq, entry.value, &stored));
+    }
+    return scanned;
+}
+
+fn codesFor(pq: *const vector_model.Model, bytes: []const u8, stored: *const schema.StoredVector) vector_model.Encoded {
+    if (bytes.len == @sizeOf(schema.LinkVector)) {
+        const record = std.mem.bytesToValue(schema.LinkVector, bytes[0..@sizeOf(schema.LinkVector)]);
+        if (record.model_hash == pq.hash) return .{ .cell = record.cell, .codes = record.codes };
+    }
+    return pq.encode(stored);
+}
+
+fn loadCategoryChunk(db: *Directory, next_id: *u64) !usize {
+    const index = &db.cat_vectors;
+    index.lock.lockUncancelable(db.io);
+    defer index.lock.unlock(db.io);
+
+    const start_key = codec.encodeU64(next_id.*);
+    var iter = try db.category_vectors().rangeScan(&start_key, null);
     defer iter.deinit();
 
     var scanned: usize = 0;
@@ -192,7 +222,7 @@ test "put_link_vectors rejects unknown links, text that changed since it was emb
     try testing.expectEqual(VectorWriteResult.not_found, results[0]);
     try testing.expectEqual(VectorWriteResult.stale_text, results[1]);
     try testing.expectEqual(VectorWriteResult.invalid_vector, results[2]);
-    try testing.expectEqual(@as(?schema.LinkVector, null), try getLinkVector(db, id));
+    try testing.expectEqual(@as(?schema.StoredVector, null), try getLinkVector(db, id));
     try testing.expectEqual(@as(u64, 0), db.store.counter("embedding_model").*);
 }
 
@@ -226,7 +256,7 @@ test "editing a link's title or description drops its vector; a status or url ch
     try testing.expectEqual(@as(usize, 1), db.vectors.count(db.io));
 
     try link_mod.updateLink(db, id, null, null, "Miniature trees");
-    try testing.expectEqual(@as(?schema.LinkVector, null), try getLinkVector(db, id));
+    try testing.expectEqual(@as(?schema.StoredVector, null), try getLinkVector(db, id));
     try testing.expectEqual(@as(usize, 0), db.vectors.count(db.io));
 }
 
@@ -243,7 +273,7 @@ test "deleting a link drops its vector so the verifier finds no vector without a
     try putLinkVectors(db, MODEL, &.{ try writeFor(db, kept, 0), try writeFor(db, gone, 1) }, &results);
 
     try link_mod.deleteLink(db, gone);
-    try testing.expectEqual(@as(?schema.LinkVector, null), try getLinkVector(db, gone));
+    try testing.expectEqual(@as(?schema.StoredVector, null), try getLinkVector(db, gone));
     try testing.expectEqual(@as(usize, 1), db.vectors.count(db.io));
 
     var state: verifier.VerifierState = .{};
@@ -279,11 +309,35 @@ test "a crash after acked vector writes replays the WAL into the same vector ind
     try testing.expectEqual(MODEL, b.vectors.model.load(.acquire));
     try testing.expectEqual(@as(usize, 2), b.vectors.count(b.io));
     try testing.expect((try getLinkVector(b, ids[0])) != null);
-    try testing.expectEqual(@as(?schema.LinkVector, null), try getLinkVector(b, ids[1]));
+    try testing.expectEqual(@as(?schema.StoredVector, null), try getLinkVector(b, ids[1]));
 
-    const query = vector_index.quantize(&axisEmbedding(2)).?;
     var buf: [1]@import("../ranking.zig").ScoredId = undefined;
-    try testing.expectEqual(ids[2], b.vectors.nearest(b.io, &query, &buf)[0].id);
+    try testing.expectEqual(ids[2], b.vectors.shortlist(b.io, &axisEmbedding(2), &buf)[0].id);
+}
+
+test "the loader codes a format-8 record and re-codes a record written under another model file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try Directory.openTestInstance(testing.allocator, &tmp);
+    defer db.deinitTestInstance();
+
+    const legacy = vector_index.quantize(&axisEmbedding(4)).?;
+    const legacy_record = schema.StoredVector{ .id = 41, .scale = legacy.scale, .values = legacy.values };
+    const legacy_key = codec.encodeU64(41);
+    try db.link_vectors().insert(&legacy_key, std.mem.asBytes(&legacy_record));
+
+    const foreign = vector_index.quantize(&axisEmbedding(5)).?;
+    const foreign_record = schema.LinkVector{ .vector = .{ .id = 42, .scale = foreign.scale, .values = foreign.values }, .model_hash = db.vectors.pq.hash +% 1, .cell = 0, .codes = @splat(0) };
+    const foreign_key = codec.encodeU64(42);
+    try db.link_vectors().insert(&foreign_key, std.mem.asBytes(&foreign_record));
+
+    try loadVectorIndex(db);
+    try testing.expectEqual(@as(usize, 2), db.vectors.count(db.io));
+
+    var buf: [1]@import("../ranking.zig").ScoredId = undefined;
+    try testing.expectEqual(@as(u64, 41), db.vectors.shortlist(db.io, &axisEmbedding(4), &buf)[0].id);
+    try testing.expectEqual(@as(u64, 42), db.vectors.shortlist(db.io, &axisEmbedding(5), &buf)[0].id);
+    try testing.expectEqual(db.vectors.pq.encode(&foreign_record.vector).cell, db.vectors.position.get(42).?.cell);
 }
 
 test "hybrid search adds a vector-only match, and falls back to keywords for another model" {
