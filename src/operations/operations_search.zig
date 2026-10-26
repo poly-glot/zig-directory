@@ -8,6 +8,8 @@ const link_mod = @import("operations_link.zig");
 const shared = @import("operations_shared.zig");
 const ranking = @import("../ranking.zig");
 const vector_index = @import("../vector_index.zig");
+const vector_model = @import("../vector_model.zig");
+const vector_ops = @import("operations_vector.zig");
 const sites = @import("../facts/sites.zig");
 
 const log = shared.log;
@@ -362,11 +364,16 @@ pub fn searchLinksHybrid(
         .vector_used = false,
     };
 
+    var unit = query_embedding.*;
+    vector_model.normalizeInPlace(&unit);
+
+    var shortlist_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
+    const shortlist = db.vectors.shortlist(db.io, &unit, &shortlist_buf);
     var nearest_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
-    const nearest = db.vectors.nearest(db.io, &q, &nearest_buf);
+    const nearest = try rerankExact(db, shortlist, &q, &nearest_buf);
 
     var subtree_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
-    const subtree = try subtreeCandidates(db, &q, &subtree_buf);
+    const subtree = try subtreeCandidates(db, &unit, &q, &subtree_buf);
 
     const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest, subtree });
     defer db.allocator.free(fused);
@@ -376,7 +383,16 @@ pub fn searchLinksHybrid(
     };
 }
 
-fn subtreeCandidates(db: *Directory, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
+fn rerankExact(db: *Directory, shortlist: []const ScoredId, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
+    var top = ranking.TopK.init(out);
+    for (shortlist) |candidate| {
+        const stored = (try vector_ops.getLinkVector(db, candidate.id)) orelse continue;
+        top.offer(.{ .id = candidate.id, .score = vector_index.similarity(&stored, q) });
+    }
+    return top.sorted();
+}
+
+fn subtreeCandidates(db: *Directory, unit: *const vector_model.Float, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
     if (!db.cat_vectors.ready.load(.acquire) or !db.facts.ready.load(.acquire)) return out[0..0];
 
     var roots_buf: [CATEGORY_CANDIDATES]ScoredId = undefined;
@@ -386,7 +402,7 @@ fn subtreeCandidates(db: *Directory, q: *const vector_index.Quantized, out: []Sc
 
     const ids = try db.facts.subtreeLinkIds(db.io, db.allocator, root_ids[0..roots.len]);
     defer db.allocator.free(ids);
-    return db.vectors.scoreIds(db.io, ids, q, out);
+    return db.vectors.scoreIds(db.io, ids, unit, out);
 }
 
 pub fn searchCategoriesHybrid(

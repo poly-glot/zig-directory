@@ -311,6 +311,7 @@ pub const FactsIndex = struct {
             scopes[scope_count] = view;
             scope_count += 1;
         }
+        if (scope_count == 0) return allocator.alloc(u64, 0);
 
         var ids: std.ArrayListUnmanaged(u64) = .empty;
         errdefer ids.deinit(allocator);
@@ -826,6 +827,25 @@ test "observe keeps a link's facts in step with inserts, URL edits, moves and de
 
     try index.observe(io, allocator, .{ .link_deleted = .{ .link = moved, .ancestor_updates = &.{}, .tokens = &.{} } });
     try testing.expectEqual(@as(usize, 0), index.links.count());
+}
+
+test "subtreeLinkIds collects the links under known roots and returns nothing for unknown roots without walking" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    try buildTree(&index, io, allocator, &.{ testCategory(1, 0, "Top"), testCategory(2, 1, "Arts"), testCategory(3, 2, "Music"), testCategory(4, 1, "Science") });
+    try index.observe(io, allocator, inserted(testLink(10, 3, "http://music.example/")));
+    try index.observe(io, allocator, inserted(testLink(11, 4, "http://science.example/")));
+
+    const under_arts = try index.subtreeLinkIds(io, allocator, &.{2});
+    defer allocator.free(under_arts);
+    try testing.expectEqualSlices(u64, &.{10}, under_arts);
+
+    const none = try index.subtreeLinkIds(io, allocator, &.{ 999, 998 });
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "a link the apply path touches while loading keeps that state, not the loader's older read" {

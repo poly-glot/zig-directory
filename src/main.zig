@@ -7,6 +7,7 @@ pub const directory = @import("directory.zig");
 pub const binary_protocol = @import("binary_protocol.zig");
 pub const subtree = @import("subtree.zig");
 pub const verifier = @import("verifier.zig");
+pub const vector_model = @import("vector_model.zig");
 
 const Directory = directory.Directory;
 
@@ -20,11 +21,15 @@ pub const Config = struct {
     repair_worker_chunk_size: u32 = 10000,
     subtree_scan_threshold: u32 = 1024,
     verifier_interval_s: u32 = 300,
+    vector_model: []const u8 = "/usr/local/share/dmozdb/vector_model.bin",
 
     pub fn fromEnv(env: *const std.process.Environ.Map) Config {
         var config = Config{ .server = zigstore.ServerConfig.fromEnv("DMOZDB_", env) };
         if (env.get("DMOZDB_DATA_DIR")) |v| {
             config.data_dir = v;
+        }
+        if (env.get("DMOZDB_VECTOR_MODEL")) |v| {
+            config.vector_model = v;
         }
         if (env.get("DMOZDB_RENAME_INLINE_THRESHOLD")) |v| {
             config.rename_inline_threshold = std.fmt.parseInt(u32, v, 10) catch config.rename_inline_threshold;
@@ -56,7 +61,14 @@ pub fn main(init: std.process.Init) !void {
         config.server.trusted_count,
     });
 
-    const db = try Directory.init(init.io, allocator, config);
+    const pq = vector_model.Model.load(init.io, allocator, config.vector_model) catch |err| {
+        log.err("vector model {s} failed to load: {} — set DMOZDB_VECTOR_MODEL to the file the image ships", .{ config.vector_model, err });
+        return err;
+    };
+    defer pq.deinit(allocator);
+    log.info("  vector model {s} hash={x}", .{ config.vector_model, pq.hash });
+
+    const db = try Directory.init(init.io, allocator, config, pq);
     defer db.deinit();
 
     try db.recover();
@@ -94,6 +106,8 @@ test {
     _ = @import("header_upgrade.zig");
     _ = @import("ranking.zig");
     _ = @import("vector_index.zig");
+    _ = vector_model;
+    _ = @import("ivf_index.zig");
     _ = @import("facts/countries.zig");
     _ = @import("facts/url_facts.zig");
     _ = @import("facts/sites.zig");
@@ -108,4 +122,5 @@ test "Config: every tuning knob has its documented default" {
     try std.testing.expectEqual(@as(u32, 10000), default_cfg.repair_worker_chunk_size);
     try std.testing.expectEqual(@as(u32, 1024), default_cfg.subtree_scan_threshold);
     try std.testing.expectEqual(@as(u32, 300), default_cfg.verifier_interval_s);
+    try std.testing.expectEqualStrings("/usr/local/share/dmozdb/vector_model.bin", default_cfg.vector_model);
 }

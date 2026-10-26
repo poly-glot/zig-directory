@@ -39,6 +39,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=zig-builder /build/zig-out/bin/dmozdb /usr/local/bin/dmozdb
+COPY models/vector_model.bin /usr/local/share/dmozdb/vector_model.bin
 COPY entrypoint.backend.sh /usr/local/bin/entrypoint.backend.sh
 RUN chmod +x /usr/local/bin/entrypoint.backend.sh
 
@@ -46,6 +47,7 @@ ENV DMOZDB_BIND=0.0.0.0
 ENV DMOZDB_PORT=8080
 ENV DMOZDB_DATA_DIR=/var/lib/dmozdb
 ENV DMOZDB_CACHE_SIZE_MB=256
+ENV DMOZDB_VECTOR_MODEL=/usr/local/share/dmozdb/vector_model.bin
 
 EXPOSE 8080
 VOLUME ["/var/lib/dmozdb"]

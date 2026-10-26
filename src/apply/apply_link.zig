@@ -78,9 +78,11 @@ pub fn applyLinkVectorsPut(db: *Directory, e: changeset.LinkVectorsPutEffect) !v
     db.vectors.model.store(e.model, .release);
 
     for (e.vectors) |v| {
+        const encoded = db.vectors.pq.encode(&v);
+        const record = schema.LinkVector{ .vector = v, .model_hash = db.vectors.pq.hash, .cell = encoded.cell, .codes = encoded.codes };
         const key = codec.encodeU64(v.id);
-        try db.link_vectors().insert(&key, std.mem.asBytes(&v));
-        try db.vectors.put(db.io, db.allocator, v);
+        try db.link_vectors().insert(&key, std.mem.asBytes(&record));
+        try db.vectors.put(db.io, db.allocator, v.id, encoded);
     }
 }
 

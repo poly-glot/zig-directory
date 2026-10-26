@@ -81,7 +81,7 @@ pub const LinkEntitiesPutEffect = struct {
 };
 pub const LinkVectorsPutEffect = struct {
     model: u64,
-    vectors: []const schema.LinkVector,
+    vectors: []const schema.StoredVector,
 };
 
 pub const CategoryVectorsPutEffect = struct {
@@ -365,7 +365,7 @@ test "encode/decode roundtrip — link_entities_put" {
 
 test "encode/decode roundtrip — link_vectors_put" {
     const allocator = std.testing.allocator;
-    var vector = schema.LinkVector{ .id = 12, .scale = 0.25 };
+    var vector = schema.StoredVector{ .id = 12, .scale = 0.25 };
     vector.values[0] = -127;
     vector.values[383] = 64;
     const cs = ChangeSet{ .link_vectors_put = .{ .model = 0xB6E5, .vectors = &.{vector} } };
