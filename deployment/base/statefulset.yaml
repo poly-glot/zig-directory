@@ -69,7 +69,7 @@ spec:
             limits:
               # Raised from the combined image's 1000m now that the CPU-heavy
               # Deno SSR runs in its own pod and no longer shares this budget.
-              memory: "2Gi"
+              memory: "3Gi"
               cpu: "1500m"
   volumeClaimTemplates:
     - metadata:
@@ -78,4 +78,4 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 10Gi
+            storage: 40Gi
