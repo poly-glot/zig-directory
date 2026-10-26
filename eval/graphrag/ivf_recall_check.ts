@@ -1,5 +1,8 @@
-import { DmozClient } from "../../web/lib/dmoz-client.ts";
-import { EMBEDDING_MODEL } from "../../web/lib/embedder.ts";
+import { DmozClient, fnv1a64 } from "../../web/lib/dmoz-client.ts";
+
+const EMBEDDING_MODEL = fnv1a64(
+  new TextEncoder().encode("Xenova/bge-small-en-v1.5:model_quantized.onnx:cls"),
+);
 
 const LIMIT = 20;
 const TOP = 10;
@@ -7,6 +10,8 @@ const MAX_URL_BYTES = 64;
 
 const host = Deno.env.get("DMOZDB_HOST") ?? "127.0.0.1";
 const port = Number(Deno.env.get("DMOZDB_PORT") ?? 18080);
+const mode = Deno.env.get("MODE") ?? "hybrid";
+const NO_KEYWORD_QUERY = "zzzzqqqq";
 const truthPath = Deno.env.get("TRUTH") ?? "";
 const linksPath = Deno.env.get("LINKS_JSONL") ?? "";
 if (!truthPath || !linksPath) {
@@ -72,15 +77,18 @@ let vectorUsed = 0;
 let reachable = 0;
 let hits = 0;
 for (const [i, q] of vectors.entries()) {
-  const query = textByQid.get(q.qid as string) ?? "";
+  const text = textByQid.get(q.qid as string) ?? "";
+  const query = mode === "vector_only" ? NO_KEYWORD_QUERY : text;
+  const embedding = mode === "keyword" ? undefined : {
+    model: EMBEDDING_MODEL,
+    vector: Float32Array.from(q.vector as number[]),
+  };
   const started = performance.now();
   const result = await client.search(query, {
     limit: LIMIT,
     scope: "links",
-    queryEmbedding: {
-      model: EMBEDDING_MODEL,
-      vector: Float32Array.from(q.vector as number[]),
-    },
+    mode: "ranked",
+    queryEmbedding: embedding,
   });
   searchMs.push(performance.now() - started);
   if (result.vectorUsed) vectorUsed++;
@@ -95,6 +103,7 @@ for (const [i, q] of vectors.entries()) {
 }
 
 console.log(JSON.stringify({
+  mode,
   queries: vectors.length,
   vectorUsed,
   truthRows: vectors.length * TOP,
