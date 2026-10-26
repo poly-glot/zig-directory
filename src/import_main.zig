@@ -54,9 +54,9 @@ fn importCategories(
     path_to_id: *std.StringHashMap(u64),
     tsv_path: []const u8,
 ) !u64 {
-    const top_id = try operations.createCategory(db, 0, ROOT_NAME, ROOT_SLUG, "");
+    const top_id = (try operations.resolveSlugPath(db, ROOT_SLUG)) orelse try operations.createCategory(db, 0, ROOT_NAME, ROOT_SLUG, "");
     try path_to_id.put(try allocator.dupe(u8, "Top"), top_id);
-    log.info("Created root category Top (id={d})", .{top_id});
+    log.info("Root category Top (id={d})", .{top_id});
 
     const data = try readFileAll(db.io, allocator, tsv_path);
     defer allocator.free(data);
