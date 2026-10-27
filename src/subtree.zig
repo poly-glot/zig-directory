@@ -119,36 +119,32 @@ pub fn listSubtreeLinkIds(
     offset: u32,
     limit: u32,
     allocator: std.mem.Allocator,
-) !SubtreeLinkPage {
+) ![]u64 {
     var page_ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer page_ids.deinit(allocator);
 
-    var total: u64 = 0;
     var skipped: u64 = 0;
     const offset_u64: u64 = offset;
 
     for (descendants) |cat_id| {
+        if (page_ids.items.len >= limit) break;
         const start_key = schema.CategoryLinkKey.encode(.{ cat_id, 0 });
         var iter = try link_by_category.rangeScan(&start_key, null);
         defer iter.deinit();
         while (try iter.next()) |entry| {
             if (entry.key.len < 16) return error.Corrupted;
             if (codec.decodeU64(entry.key[0..8]) != cat_id) break;
-            total += 1;
             if (skipped < offset_u64) {
                 skipped += 1;
                 continue;
             }
-            if (page_ids.items.len >= limit) continue;
             const link_id = codec.decodeU64(entry.key[8..16]);
             try page_ids.append(allocator, link_id);
+            if (page_ids.items.len >= limit) break;
         }
     }
 
-    return SubtreeLinkPage{
-        .link_ids = try page_ids.toOwnedSlice(allocator),
-        .total = total,
-    };
+    return page_ids.toOwnedSlice(allocator);
 }
 
 pub fn collectDescendantsCached(
@@ -294,10 +290,9 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
         15,
         std.testing.allocator,
     );
-    defer std.testing.allocator.free(r1.link_ids);
-    try std.testing.expectEqual(@as(u64, 30), r1.total);
-    try std.testing.expectEqual(@as(usize, 15), r1.link_ids.len);
-    try std.testing.expectEqual(@as(u64, 101), r1.link_ids[0]);
+    defer std.testing.allocator.free(r1);
+    try std.testing.expectEqual(@as(usize, 15), r1.len);
+    try std.testing.expectEqual(@as(u64, 101), r1[0]);
 
     const r2 = try listSubtreeLinkIds(
         link_by_category,
@@ -306,8 +301,18 @@ test "listSubtreeLinkIds: total counts everything; page slice is bounded" {
         15,
         std.testing.allocator,
     );
-    defer std.testing.allocator.free(r2.link_ids);
-    try std.testing.expectEqual(@as(u64, 30), r2.total);
-    try std.testing.expectEqual(@as(usize, 15), r2.link_ids.len);
-    try std.testing.expectEqual(@as(u64, 206), r2.link_ids[0]);
+    defer std.testing.allocator.free(r2);
+    try std.testing.expectEqual(@as(usize, 15), r2.len);
+    try std.testing.expectEqual(@as(u64, 206), r2[0]);
+
+    const r3 = try listSubtreeLinkIds(
+        link_by_category,
+        ids[0..],
+        0,
+        3,
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(r3);
+    try std.testing.expectEqual(@as(usize, 3), r3.len);
+    try std.testing.expectEqual(@as(u64, 103), r3[2]);
 }

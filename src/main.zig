@@ -19,7 +19,6 @@ pub const Config = struct {
     rename_inline_threshold: u32 = 5000,
     repair_worker_interval_ms: u32 = 1000,
     repair_worker_chunk_size: u32 = 10000,
-    subtree_scan_threshold: u32 = 1024,
     verifier_interval_s: u32 = 300,
     vector_model: []const u8 = "/usr/local/share/dmozdb/vector_model.bin",
 
@@ -39,9 +38,6 @@ pub const Config = struct {
         }
         if (env.get("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |v| {
             config.repair_worker_chunk_size = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_chunk_size;
-        }
-        if (env.get("DMOZDB_SUBTREE_SCAN_THRESHOLD")) |v| {
-            config.subtree_scan_threshold = std.fmt.parseInt(u32, v, 10) catch config.subtree_scan_threshold;
         }
         if (env.get("DMOZDB_VERIFIER_INTERVAL_S")) |v| {
             config.verifier_interval_s = std.fmt.parseInt(u32, v, 10) catch config.verifier_interval_s;
@@ -120,7 +116,6 @@ test "Config: every tuning knob has its documented default" {
     try std.testing.expectEqual(@as(u32, 5000), default_cfg.rename_inline_threshold);
     try std.testing.expectEqual(@as(u32, 1000), default_cfg.repair_worker_interval_ms);
     try std.testing.expectEqual(@as(u32, 10000), default_cfg.repair_worker_chunk_size);
-    try std.testing.expectEqual(@as(u32, 1024), default_cfg.subtree_scan_threshold);
     try std.testing.expectEqual(@as(u32, 300), default_cfg.verifier_interval_s);
     try std.testing.expectEqualStrings("/usr/local/share/dmozdb/vector_model.bin", default_cfg.vector_model);
 }
