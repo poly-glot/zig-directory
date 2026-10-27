@@ -64,12 +64,14 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              memory: "512Mi"
+              memory: "3Gi"
               cpu: "250m"
             limits:
               # Raised from the combined image's 1000m now that the CPU-heavy
               # Deno SSR runs in its own pod and no longer shares this budget.
-              memory: "3Gi"
+              # Memory: the full 3.04M-link store runs at 3.6 GB RSS (int8 link
+              # vectors, PQ codes, category vectors, facts and entities).
+              memory: "5Gi"
               cpu: "1500m"
   volumeClaimTemplates:
     - metadata:
