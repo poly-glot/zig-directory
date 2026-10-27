@@ -255,7 +255,7 @@ pub fn main(init: std.process.Init) !void {
     const db = try Directory.init(io, allocator, config, pq);
     defer db.deinit();
     try db.recover();
-    try operations.seedUrlBloom(db, .full_speed);
+    try operations.seedUrlBloom(db);
 
     var vectors: ?VectorRows = if (vectors_path) |p| try VectorRows.open(io, p) else null;
     defer if (vectors) |*v| v.close(io);
