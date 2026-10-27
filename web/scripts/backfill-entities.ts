@@ -18,6 +18,7 @@ const encoder = new TextEncoder();
 const counts = new Map<string, number>();
 const started = performance.now();
 let afterId = Number(Deno.env.get("BACKFILL_AFTER_ID") ?? 0);
+const stopId = Number(Deno.env.get("BACKFILL_STOP_ID") ?? 0);
 let pages = 0;
 
 async function inBatches<T, R>(
@@ -58,7 +59,7 @@ do {
   if (++pages % PROGRESS_EVERY_PAGES === 0) {
     console.log(JSON.stringify({ afterId, ...Object.fromEntries(counts) }));
   }
-} while (afterId !== 0);
+} while (afterId !== 0 && (stopId === 0 || afterId < stopId));
 
 dump?.close();
 console.log(JSON.stringify({
