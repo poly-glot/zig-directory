@@ -711,11 +711,14 @@ fn writeSubtreeLinkRows(
     return .{ .off = off, .written = written, .total = total, .next_after_id = next_after_id };
 }
 
-fn fetchSubtreeLinkIds(db: *Directory, descendants: []const u64, offset: u32, limit: u32) !subtree.SubtreeLinkPage {
-    if (descendants.len > db.config.subtree_scan_threshold) {
-        return subtree.listSubtreeLinkIdsScan(db.link_by_category(), descendants, offset, limit, db.allocator);
+fn fetchSubtreeLinkIds(db: *Directory, cat_id: u64, descendants: []const u64, spec: SubtreePageSpec) !subtree.SubtreeLinkPage {
+    if (spec.needsFullScan()) {
+        return subtree.listSubtreeLinkIdsScan(db.link_by_category(), descendants, 0, MAX_SUBTREE_FETCH, db.allocator);
     }
-    return subtree.listSubtreeLinkIds(db.link_by_category(), descendants, offset, limit, db.allocator);
+    const page_limit = spec.limit *| SUBTREE_OVERPROVISION_FACTOR;
+    const link_ids = try subtree.listSubtreeLinkIds(db.link_by_category(), descendants, spec.offset, page_limit, db.allocator);
+    const category = try operations.getCategory(db, cat_id);
+    return .{ .link_ids = link_ids, .total = if (category) |c| c.link_count_subtree else 0 };
 }
 
 fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []const u8) usize {
@@ -746,9 +749,7 @@ fn handleListSubtreeLinks(db: *Directory, resp: []u8, op_byte: u8, payload: []co
 
     if (resp.len < SUBTREE_MIN_FRAME) return writeErrorResp(resp, op_byte, .err);
 
-    const fetch_offset: u32 = if (spec.needsFullScan()) 0 else spec.offset;
-    const fetch_limit: u32 = if (spec.needsFullScan()) MAX_SUBTREE_FETCH else spec.limit *| SUBTREE_OVERPROVISION_FACTOR;
-    const slice = fetchSubtreeLinkIds(db, descendants, fetch_offset, fetch_limit) catch |err| {
+    const slice = fetchSubtreeLinkIds(db, req.cat_id, descendants, spec) catch |err| {
         return writeMappedError(resp, op_byte, err);
     };
     defer db.allocator.free(slice.link_ids);
@@ -1664,7 +1665,7 @@ test "list_subtree_links: unsupported order_code produces sub_status=unsupported
     try std.testing.expectEqual(@as(u8, 0), resp[7]);
 }
 
-test "list_subtree_links: the sequential scan above subtree_scan_threshold and the per-descendant walk below it emit identical frames" {
+test "list_subtree_links: a plain page stops walking once filled and reports link_count_subtree as total" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1690,24 +1691,24 @@ test "list_subtree_links: the sequential scan above subtree_scan_threshold and t
     var payload: [17]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], top_id, .little);
     payload[8] = 0;
-    std.mem.writeInt(u32, payload[9..13], 0, .little);
-    std.mem.writeInt(u32, payload[13..17], 20, .little);
+    std.mem.writeInt(u32, payload[9..13], 1, .little);
+    std.mem.writeInt(u32, payload[13..17], 2, .little);
 
-    db.config.subtree_scan_threshold = 5;
-    var resp_a: [4096]u8 = undefined;
-    const len_a = handleListSubtreeLinks(db, &resp_a, @intFromEnum(Op.list_subtree_links), &payload);
-    const total_a = std.mem.readInt(u64, resp_a[len_a - 16 .. len_a - 8][0..8], .little);
-    const next_a = std.mem.readInt(u64, resp_a[len_a - 8 .. len_a][0..8], .little);
+    var resp: [4096]u8 = undefined;
+    const len = handleListSubtreeLinks(db, &resp, @intFromEnum(Op.list_subtree_links), &payload);
+    const written = std.mem.readInt(u32, resp[RESPONSE_HEADER_SIZE..][0..4], .little);
+    const total = std.mem.readInt(u64, resp[len - 16 .. len - 8][0..8], .little);
+    const next = std.mem.readInt(u64, resp[len - 8 .. len][0..8], .little);
 
-    db.config.subtree_scan_threshold = 100;
-    var resp_b: [4096]u8 = undefined;
-    const len_b = handleListSubtreeLinks(db, &resp_b, @intFromEnum(Op.list_subtree_links), &payload);
-    const total_b = std.mem.readInt(u64, resp_b[len_b - 16 .. len_b - 8][0..8], .little);
+    try std.testing.expectEqual(@as(u32, 2), written);
+    try std.testing.expectEqual(@as(u64, 6), total);
+    try std.testing.expect(next != 0);
 
-    try std.testing.expectEqual(@as(u64, 6), total_a);
-    try std.testing.expectEqual(total_a, total_b);
-    try std.testing.expectEqual(len_a, len_b);
-    try std.testing.expectEqual(@as(u64, 0), next_a);
+    const descendants = try subtree.collectDescendantsCached(db.cat_by_parent(), top_id, &db.subtree_cache, allocator);
+    defer allocator.free(descendants);
+    const walked = try subtree.listSubtreeLinkIds(db.link_by_category(), descendants, 1, 2, allocator);
+    defer allocator.free(walked);
+    try std.testing.expectEqual(@as(usize, 2), walked.len);
 }
 
 test "list_subtree_links: oversize offset produces sub_status=offset_too_large" {

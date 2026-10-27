@@ -282,7 +282,6 @@ are read by `zigstore.ServerConfig.fromEnv("DMOZDB_")`; the rest by `src/main.zi
 | `DMOZDB_RENAME_INLINE_THRESHOLD`          | u32    | `5000`            | Subtree size at which rename/move flips from in-line strict to queued async repair |
 | `DMOZDB_REPAIR_WORKER_INTERVAL_MS`        | u32    | `1000`            | Repair-worker tick interval (ms)                                            |
 | `DMOZDB_REPAIR_WORKER_CHUNK_SIZE`         | u32    | `10000`           | Descendants processed per worker chunk                                      |
-| `DMOZDB_SUBTREE_SCAN_THRESHOLD`           | u32    | `1024`            | Descendant count above which `list_subtree_links` uses the sequential `link_by_category` scan instead of per-descendant range scans |
 | `DMOZDB_VERIFIER_INTERVAL_S`              | u32    | `300`             | Seconds between background verifier runs                                    |
 
 ---

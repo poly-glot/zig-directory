@@ -41,6 +41,11 @@ spec:
               value: "256"
             - name: DMOZDB_THREAD_COUNT
               value: "4"
+            # The verifier rescans the whole 17 GB store (15 min per pass);
+            # links are rarely added, so one pass a month is plenty. The
+            # run_verifier op still triggers a pass on demand.
+            - name: DMOZDB_VERIFIER_INTERVAL_S
+              value: "2592000"
           volumeMounts:
             - name: data
               mountPath: /var/lib/dmozdb
