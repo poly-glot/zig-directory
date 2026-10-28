@@ -7,12 +7,13 @@ A DMOZ-style web directory: a Zig backend database (`dmozdb`, binary protocol, i
 - **Simplicity first.** The smallest change that correctly solves the problem wins. Justify added machinery against the current scale, not a hypothetical one.
 - **No laziness, no band-aids.** Fix root causes, not symptoms. If you patch a symptom to unblock, say so and name the real fix.
 - **Declarative, testable, maintainable.** Senior-level code: clear names, focused units, no clever one-liners, behavior covered by tests.
+- **TigerStyle for Zig.** Every `.zig` file follows [tigerstyle.dev](https://tigerstyle.dev): assertions on arguments and invariants, explicit limits, static allocation, 70-line functions, 100 columns, `snake_case`. Where another rule conflicts, TigerStyle wins. `src/tidy.zig` enforces the mechanical half inside `zig build test`; [`zig.md`](.claude/rules/zig.md) carries the rest.
 
 ## Verify before "done" (non-negotiable)
 
 A change is done only when the relevant gate passes and, for anything user-visible, you have confirmed the rendered result against the running app.
 
-- Zig change: `zig build test` (exit 0).
+- Zig change: `zig build test` (exit 0). It includes `src/tidy.zig`, the TigerStyle checker; `zig test src/tidy.zig` runs that part alone on the host in a second.
 - Web change: `cd web && deno task check` (fmt, lint, type-check).
 - User-visible web change: also `curl` the affected route and run Playwright with `cd e2e && npx playwright test --project=chromium --reporter=line`. Pass `--project=chromium` because the `cold-boot` project SIGTERMs `dmozdb` and tears the DB out from under the other tests. Green specs miss CSS and width regressions, so look at the page.
 - Cite the evidence in your summary. The Stop hook runs the scoped gate and blocks turn-end on failure. The visual check is yours to do.
@@ -42,7 +43,7 @@ When debugging stalls past two or three cycles, stop narrating ruled-out hypothe
 ## Rules index
 
 - [`common.md`](.claude/rules/common.md): cross-cutting (trailing newline, root-cause over band-aid, no commented-out code).
-- [`zig.md`](.claude/rules/zig.md): Zig backend (cleanup, allocators, errors, comptime, comment carve-out).
+- [`zig.md`](.claude/rules/zig.md): Zig backend, TigerStyle (assertions, explicit limits, static allocation, naming, function and line limits, comments that say why, zero dependencies).
 - [`web.md`](.claude/rules/web.md): Fresh/Preact (islands, no inline styles, `.bleed-rule`, tokens).
 - [`protocol.md`](.claude/rules/protocol.md): binary protocol and generated client.
 - [`mcp.md`](.claude/rules/mcp.md): FastMCP tool schemas, annotations, and where authorization lives.

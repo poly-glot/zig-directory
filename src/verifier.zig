@@ -1,4 +1,10 @@
+//! The verifier audits the derived indexes on a fixed interval: it counts what each secondary
+//! index should hold against what it does hold and publishes the drift as health numbers. It
+//! only reports; repair stays a separate, explicit operation, so a verifier bug cannot corrupt
+//! data.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const codec = @import("zigstore").codec;
 const schema = @import("schema.zig");
 const btree = @import("zigstore");
@@ -17,31 +23,37 @@ pub const InvariantId = enum(u8) {
     link_vectors_have_links = 7,
 };
 
-pub const INVARIANT_COUNT = std.enums.values(InvariantId).len;
+pub const invariant_count = std.enums.values(InvariantId).len;
+
+const composite_key_len: usize = 16;
 
 pub const InvariantHealth = struct {
     name: []const u8,
     expected: u64,
     observed: u64,
 
-    pub fn driftBp(self: InvariantHealth) u32 {
+    pub fn drift_bp(self: InvariantHealth) u32 {
+        assert(self.name.len > 0);
         if (self.expected == 0) {
             if (self.observed == 0) return 0;
             return std.math.maxInt(u32);
         }
+        assert(self.expected > 0);
         const diff: u64 = if (self.observed > self.expected)
             self.observed - self.expected
         else
             self.expected - self.observed;
-        const bp: u64 = (diff * 10000) / self.expected;
+        const bp: u64 = @divFloor(diff * 10000, self.expected);
+        if (self.observed <= self.expected) assert(bp <= 10_000);
         return @intCast(@min(bp, std.math.maxInt(u32)));
     }
 };
 
 pub const VerifierState = struct {
+    // Zero until the first run completes; the status frame reports it as never run.
     last_run_at: i64 = 0,
     any_drift: bool = false,
-    indices: [INVARIANT_COUNT]InvariantHealth = .{
+    indices: [invariant_count]InvariantHealth = .{
         .{ .name = "cat_by_parent", .expected = 0, .observed = 0 },
         .{ .name = "link_by_category", .expected = 0, .observed = 0 },
         .{ .name = "link_by_url_hash", .expected = 0, .observed = 0 },
@@ -55,7 +67,7 @@ pub const VerifierState = struct {
 
     pub fn snapshot(self: *VerifierState, db: *Directory) struct {
         last_run_at: i64,
-        indices: [INVARIANT_COUNT]InvariantHealth,
+        indices: [invariant_count]InvariantHealth,
         slug_path_repair_queue_depth: u64,
         slug_path_repair_worker_last_tick_ms: i64,
         slug_path_repair_worker_tasks_processed: u64,
@@ -63,120 +75,49 @@ pub const VerifierState = struct {
     } {
         self.mutex.lockUncancelable(db.io);
         defer self.mutex.unlock(db.io);
+        assert(self.last_run_at >= 0);
+        if (self.any_drift) assert(self.last_run_at > 0);
+        const last_tick_ms = db.repair_worker_last_tick_ms.load(.acquire);
+        assert(last_tick_ms >= 0);
         return .{
             .last_run_at = self.last_run_at,
             .indices = self.indices,
             .slug_path_repair_queue_depth = db.slug_path_repair_queue().entryCount(),
-            .slug_path_repair_worker_last_tick_ms = db.repair_worker_last_tick_ms.load(.acquire),
-            .slug_path_repair_worker_tasks_processed = db.repair_worker_tasks_processed.load(.monotonic),
-            .slug_path_repair_worker_chunks_processed = db.repair_worker_chunks_processed.load(.monotonic),
+            .slug_path_repair_worker_last_tick_ms = last_tick_ms,
+            .slug_path_repair_worker_tasks_processed = db.repair_worker_tasks_processed.load(
+                .monotonic,
+            ),
+            .slug_path_repair_worker_chunks_processed = db.repair_worker_chunks_processed.load(
+                .monotonic,
+            ),
         };
     }
 };
 
-pub fn runOnce(db: *Directory, state: *VerifierState) !void {
-    const t0 = db.nowMillis();
-
-    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
-    try db.drainOneMemtable(db.mt_cat_by_parent(), db.cat_by_parent());
-    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
-    try db.drainOneMemtable(db.mt_link_by_url_hash(), db.link_by_url_hash());
-
-    const cat_count = try countTree(db.categories_by_id(), codec.encodeU64(0)[0..]);
-    const link_count = try countTree(db.links_by_id(), codec.encodeU64(0)[0..]);
-    const cat_by_parent_count = try countTree(db.cat_by_parent(), &@as([16]u8, @splat(0)));
-    const link_by_category_count = try countTree(db.link_by_category(), &@as([16]u8, @splat(0)));
-    const link_by_url_hash_count = try countTree(db.link_by_url_hash(), codec.encodeU64(0)[0..]);
-
-    var indices: [INVARIANT_COUNT]InvariantHealth = undefined;
-
-    indices[@intFromEnum(InvariantId.cat_by_parent_coverage)] = .{
-        .name = "cat_by_parent",
-        .expected = cat_count,
-        .observed = cat_by_parent_count,
-    };
-    indices[@intFromEnum(InvariantId.link_by_category_coverage)] = .{
-        .name = "link_by_category",
-        .expected = link_count,
-        .observed = link_by_category_count,
-    };
-    indices[@intFromEnum(InvariantId.link_by_url_hash_coverage)] = .{
-        .name = "link_by_url_hash",
-        .expected = link_count,
-        .observed = link_by_url_hash_count,
-    };
-
-    const subtree_drift = try countSubtreeDrift(db);
-    indices[@intFromEnum(InvariantId.subtree_counts)] = .{
-        .name = "subtree_counts",
-        .expected = cat_count,
-        .observed = cat_count -| subtree_drift,
-    };
-
-    const orphan_count = try countOrphans(db);
-    indices[@intFromEnum(InvariantId.no_orphans)] = .{
-        .name = "no_orphans",
-        .expected = cat_count,
-        .observed = cat_count -| orphan_count,
-    };
-
-    const top_count = try countTops(db);
-    indices[@intFromEnum(InvariantId.single_top)] = .{
-        .name = "single_top",
-        .expected = if (cat_count == 0) 0 else 1,
-        .observed = top_count,
-    };
-
-    const link_orphan_count = try countLinksWithMissingCategory(db);
-    indices[@intFromEnum(InvariantId.link_category_exists)] = .{
-        .name = "link_category_exists",
-        .expected = link_count,
-        .observed = link_count -| link_orphan_count,
-    };
-
-    const vector_count = try countTree(db.link_vectors(), codec.encodeU64(0)[0..]);
-    const vector_orphan_count = try countVectorsWithMissingLink(db);
-    indices[@intFromEnum(InvariantId.link_vectors_have_links)] = .{
-        .name = "link_vectors_have_links",
-        .expected = vector_count,
-        .observed = vector_count -| vector_orphan_count,
-    };
-    log.info("verifier: {d} of {d} links carry a vector", .{ vector_count, link_count });
+pub fn run_once(db: *Directory, state: *VerifierState) !void {
+    const started_ms = db.now_millis();
+    const totals = try run_once_totals(db);
+    const indices = try run_once_indices(db, totals);
+    log.info(
+        "verifier: {d} of {d} links carry a vector",
+        .{ totals.vector_count, totals.link_count },
+    );
 
     state.mutex.lockUncancelable(db.io);
-    state.last_run_at = db.nowSeconds();
+    state.last_run_at = db.now_seconds();
     state.indices = indices;
+    assert(state.last_run_at > 0);
     state.mutex.unlock(db.io);
 
-    var any_drift = false;
-
-    {
-        const slug_path_count = try countTree(db.categories_by_slug_path(), "");
-        if (slug_path_count != cat_count) {
-            any_drift = true;
-            log.warn(
-                "invariant categories_by_slug_path coverage (expected={d} observed={d}) — manual intervention required",
-                .{ cat_count, slug_path_count },
-            );
-        }
-        if (cat_count > 0 and !(try treeNonEmpty(db.categories_index_tree(), ""))) {
-            any_drift = true;
-            log.warn("invariant categories_index empty while {d} categories exist — rebuild required", .{cat_count});
-        }
-        if (link_count > 0 and !(try treeNonEmpty(db.links_index_tree(), ""))) {
-            any_drift = true;
-            log.warn("invariant links_index empty while {d} links exist — rebuild required", .{link_count});
-        }
-    }
-
-    for (indices) |inv| {
-        const drift = inv.driftBp();
+    var any_drift = try run_once_derived_drift(db, totals);
+    for (indices) |invariant| {
+        const drift = invariant.drift_bp();
         if (drift == 0) continue;
         any_drift = true;
         log.warn(
-            "invariant {s} drift {d}bp (expected={d} observed={d}) — manual intervention required",
-            .{ inv.name, drift, inv.expected, inv.observed },
+            "invariant {s} drift {d}bp (expected={d} observed={d}) — " ++
+                "manual intervention required",
+            .{ invariant.name, drift, invariant.expected, invariant.observed },
         );
     }
 
@@ -184,217 +125,401 @@ pub fn runOnce(db: *Directory, state: *VerifierState) !void {
     state.any_drift = any_drift;
     state.mutex.unlock(db.io);
 
-    const elapsed = db.nowMillis() - t0;
+    const elapsed_ms = db.now_millis() - started_ms;
     if (any_drift) {
-        log.info("verifier: completed in {d}ms with drift (warn-only)", .{elapsed});
+        log.info("verifier: completed in {d}ms with drift (warn-only)", .{elapsed_ms});
     } else {
-        log.info("verifier: completed in {d}ms — all clean", .{elapsed});
+        log.info("verifier: completed in {d}ms — all clean", .{elapsed_ms});
     }
 }
 
-fn countTree(tree: *btree.BPlusTree, min_key: []const u8) !u64 {
-    var iter = try tree.rangeScan(min_key, null);
-    defer iter.deinit();
+const TreeTotals = struct {
+    category_count: u64,
+    link_count: u64,
+    cat_by_parent_count: u64,
+    link_by_category_count: u64,
+    link_by_url_hash_count: u64,
+    vector_count: u64,
+};
+
+// The memtables are drained first so a row written since the last flush is counted once, in
+// its tree, instead of being missed by every scan below.
+fn run_once_totals(db: *Directory) !TreeTotals {
+    try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
+    try db.drain_one_memtable(db.memtable_links_by_id(), db.links_by_id());
+    try db.drain_one_memtable(db.memtable_cat_by_parent(), db.cat_by_parent());
+    try db.drain_one_memtable(db.memtable_link_by_category(), db.link_by_category());
+    try db.drain_one_memtable(db.memtable_link_by_url_hash(), db.link_by_url_hash());
+
+    comptime assert(composite_key_len == 2 * @sizeOf(u64));
+    const u64_key_min = codec.encodeU64(0);
+    const composite_key_min: [composite_key_len]u8 = @splat(0);
+    return .{
+        .category_count = try count_tree(db.categories_by_id(), &u64_key_min),
+        .link_count = try count_tree(db.links_by_id(), &u64_key_min),
+        .cat_by_parent_count = try count_tree(db.cat_by_parent(), &composite_key_min),
+        .link_by_category_count = try count_tree(db.link_by_category(), &composite_key_min),
+        .link_by_url_hash_count = try count_tree(db.link_by_url_hash(), &u64_key_min),
+        .vector_count = try count_tree(db.link_vectors(), &u64_key_min),
+    };
+}
+
+fn run_once_indices(db: *Directory, totals: TreeTotals) ![invariant_count]InvariantHealth {
+    comptime {
+        for (std.enums.values(InvariantId), 0..) |id, index| assert(@intFromEnum(id) == index);
+    }
+    var indices = (VerifierState{}).indices;
+    run_once_set(&indices, .cat_by_parent_coverage, .{
+        .expected = totals.category_count,
+        .observed = totals.cat_by_parent_count,
+    });
+    run_once_set(&indices, .link_by_category_coverage, .{
+        .expected = totals.link_count,
+        .observed = totals.link_by_category_count,
+    });
+    run_once_set(&indices, .link_by_url_hash_coverage, .{
+        .expected = totals.link_count,
+        .observed = totals.link_by_url_hash_count,
+    });
+
+    const subtree_drift = try count_subtree_drift(db);
+    run_once_set(&indices, .subtree_counts, .{
+        .expected = totals.category_count,
+        .observed = totals.category_count -| subtree_drift,
+    });
+    const orphan_count = try count_orphans(db);
+    run_once_set(&indices, .no_orphans, .{
+        .expected = totals.category_count,
+        .observed = totals.category_count -| orphan_count,
+    });
+    const top_count = try count_tops(db);
+    run_once_set(&indices, .single_top, .{
+        .expected = if (totals.category_count == 0) 0 else 1,
+        .observed = top_count,
+    });
+    const link_orphan_count = try count_links_with_missing_category(db);
+    run_once_set(&indices, .link_category_exists, .{
+        .expected = totals.link_count,
+        .observed = totals.link_count -| link_orphan_count,
+    });
+    const vector_orphan_count = try count_vectors_with_missing_link(db);
+    run_once_set(&indices, .link_vectors_have_links, .{
+        .expected = totals.vector_count,
+        .observed = totals.vector_count -| vector_orphan_count,
+    });
+
+    assert(indices[@intFromEnum(InvariantId.single_top)].expected <= 1);
+    assert(indices[@intFromEnum(InvariantId.subtree_counts)].observed <= totals.category_count);
+    assert(indices[@intFromEnum(InvariantId.no_orphans)].observed <= totals.category_count);
+    assert(indices[@intFromEnum(InvariantId.link_category_exists)].observed <= totals.link_count);
+    assert(
+        indices[@intFromEnum(InvariantId.link_vectors_have_links)].observed <= totals.vector_count,
+    );
+    for (indices) |health| assert(health.name.len > 0);
+    return indices;
+}
+
+const Counts = struct { expected: u64, observed: u64 };
+
+fn run_once_set(indices: *[invariant_count]InvariantHealth, id: InvariantId, counts: Counts) void {
+    const slot = &indices[@intFromEnum(id)];
+    assert(slot.expected == 0);
+    assert(slot.observed == 0);
+    slot.expected = counts.expected;
+    slot.observed = counts.observed;
+}
+
+fn run_once_derived_drift(db: *Directory, totals: TreeTotals) !bool {
+    var any_drift = false;
+    const slug_path_count = try count_tree(db.categories_by_slug_path(), "");
+    if (slug_path_count != totals.category_count) {
+        any_drift = true;
+        log.warn(
+            "invariant categories_by_slug_path coverage (expected={d} observed={d}) — " ++
+                "manual intervention required",
+            .{ totals.category_count, slug_path_count },
+        );
+    }
+    if (totals.category_count > 0) {
+        if (!(try tree_non_empty(db.categories_index_tree(), ""))) {
+            any_drift = true;
+            log.warn(
+                "invariant categories_index empty while {d} categories exist — rebuild required",
+                .{totals.category_count},
+            );
+        }
+    }
+    if (totals.link_count > 0) {
+        if (!(try tree_non_empty(db.links_index_tree(), ""))) {
+            any_drift = true;
+            log.warn(
+                "invariant links_index empty while {d} links exist — rebuild required",
+                .{totals.link_count},
+            );
+        }
+    }
+    return any_drift;
+}
+
+fn count_tree(tree: *btree.BPlusTree, min_key: []const u8) !u64 {
+    assert(min_key.len <= composite_key_len);
+    var iterator = try tree.rangeScan(min_key, null);
+    defer iterator.deinit();
     var count: u64 = 0;
-    while (try iter.next()) |_| count += 1;
+    while (try iterator.next()) |_| count += 1;
     return count;
 }
 
-fn treeNonEmpty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
-    var iter = try tree.rangeScan(min_key, null);
-    defer iter.deinit();
-    return (try iter.next()) != null;
+fn tree_non_empty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
+    assert(min_key.len == 0);
+    var iterator = try tree.rangeScan(min_key, null);
+    defer iterator.deinit();
+    return (try iterator.next()) != null;
 }
 
-fn countTops(db: *Directory) !u64 {
+fn count_tops(db: *Directory) !u64 {
     const min_key = codec.encodeU64(0);
-    var iter = try db.categories_by_id().rangeScan(&min_key, null);
-    defer iter.deinit();
-    var n: u64 = 0;
-    while (try iter.next()) |entry| {
+    var iterator = try db.categories_by_id().rangeScan(&min_key, null);
+    defer iterator.deinit();
+    var walked: u64 = 0;
+    var top_count: u64 = 0;
+    while (try iterator.next()) |entry| : (walked += 1) {
         if (entry.value.len < @sizeOf(schema.Category)) continue;
-        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
-        if (cat.parent_id == 0) n += 1;
+        const category = std.mem.bytesToValue(
+            schema.Category,
+            entry.value[0..@sizeOf(schema.Category)],
+        );
+        if (category.parent_id == 0) top_count += 1;
     }
-    return n;
+    assert(top_count <= walked);
+    return top_count;
 }
 
-fn countOrphans(db: *Directory) !u64 {
+fn count_orphans(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
 
     var parents: std.ArrayListUnmanaged(u64) = .empty;
     defer parents.deinit(db.allocator);
+
+    var walked: u64 = 0;
     {
         const min_key = codec.encodeU64(0);
-        var iter = try db.categories_by_id().rangeScan(&min_key, null);
-        defer iter.deinit();
-        while (try iter.next()) |entry| {
+        var iterator = try db.categories_by_id().rangeScan(&min_key, null);
+        defer iterator.deinit();
+        while (try iterator.next()) |entry| : (walked += 1) {
             if (entry.value.len < @sizeOf(schema.Category)) continue;
-            const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
-            if (cat.parent_id != 0) try parents.append(db.allocator, cat.parent_id);
+            const category = std.mem.bytesToValue(
+                schema.Category,
+                entry.value[0..@sizeOf(schema.Category)],
+            );
+            if (category.parent_id != 0) try parents.append(db.allocator, category.parent_id);
         }
     }
+    assert(parents.items.len <= walked);
 
     var orphans: u64 = 0;
     for (parents.items) |parent_id| {
-        const parent = ops.getCategory(db, parent_id) catch null;
+        assert(parent_id != 0);
+        const parent = ops.get_category(db, parent_id) catch null;
         if (parent == null) orphans += 1;
     }
+    assert(orphans <= parents.items.len);
     return orphans;
 }
 
-fn countLinksWithMissingCategory(db: *Directory) !u64 {
+fn count_links_with_missing_category(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
 
     var category_exists = std.AutoHashMap(u64, bool).init(db.allocator);
     defer category_exists.deinit();
 
+    var walked: u64 = 0;
     var orphans: u64 = 0;
     const min_key = codec.encodeU64(0);
-    var iter = try db.links_by_id().rangeScan(&min_key, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
+    var iterator = try db.links_by_id().rangeScan(&min_key, null);
+    defer iterator.deinit();
+    while (try iterator.next()) |entry| : (walked += 1) {
         if (entry.value.len < @sizeOf(schema.Link)) continue;
         const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
-        const gop = try category_exists.getOrPut(link.category_id);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = (ops.getCategory(db, link.category_id) catch null) != null;
+        const slot = try category_exists.getOrPut(link.category_id);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = (ops.get_category(db, link.category_id) catch null) != null;
         }
-        if (!gop.value_ptr.*) orphans += 1;
+        if (!slot.value_ptr.*) orphans += 1;
     }
+    assert(category_exists.count() <= walked);
+    assert(orphans <= walked);
     return orphans;
 }
 
-fn countVectorsWithMissingLink(db: *Directory) !u64 {
+fn count_vectors_with_missing_link(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
 
+    var walked: u64 = 0;
     var orphans: u64 = 0;
     const min_key = codec.encodeU64(0);
-    var iter = try db.link_vectors().rangeScan(&min_key, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
+    var iterator = try db.link_vectors().rangeScan(&min_key, null);
+    defer iterator.deinit();
+    while (try iterator.next()) |entry| : (walked += 1) {
+        assert(entry.key.len == @sizeOf(u64));
         const link_id = codec.decodeU64(entry.key[0..8]);
-        if ((ops.getLink(db, link_id) catch null) == null) orphans += 1;
+        if ((ops.get_link(db, link_id) catch null) == null) orphans += 1;
     }
+    assert(orphans <= walked);
     return orphans;
 }
 
-fn countSubtreeDrift(db: *Directory) !u64 {
+fn count_subtree_drift(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
-    var counts = try ops.computeCategoryCounts(db);
+    var counts = try ops.compute_category_counts(db);
     defer counts.deinit();
 
+    var walked: u64 = 0;
     var drift: u64 = 0;
     const min_key = codec.encodeU64(0);
-    var iter = try db.categories_by_id().rangeScan(&min_key, null);
-    defer iter.deinit();
-    while (try iter.next()) |entry| {
+    var iterator = try db.categories_by_id().rangeScan(&min_key, null);
+    defer iterator.deinit();
+    while (try iterator.next()) |entry| : (walked += 1) {
         if (entry.value.len < @sizeOf(schema.Category)) continue;
-        const cat = std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
-        const want = counts.expectedFor(cat.id);
-        if (cat.link_count_subtree != want.link_count_subtree or
-            cat.child_count_subtree != want.child_count_subtree)
-        {
+        const category = std.mem.bytesToValue(
+            schema.Category,
+            entry.value[0..@sizeOf(schema.Category)],
+        );
+        const want = counts.expected_for(category.id);
+        assert(want.link_count_subtree >= want.link_count);
+        assert(want.child_count_subtree >= want.child_count);
+        if (category.link_count_subtree != want.link_count_subtree) {
+            drift += 1;
+        } else if (category.child_count_subtree != want.child_count_subtree) {
             drift += 1;
         }
     }
+    assert(drift <= walked);
     return drift;
 }
 
-test "InvariantHealth.driftBp basic" {
-    const h = InvariantHealth{ .name = "x", .expected = 1000, .observed = 950 };
-    try std.testing.expectEqual(@as(u32, 500), h.driftBp());
+// Goal: drift is a basis-point distance in either direction. Method: four hand-computed pairs.
+test "InvariantHealth.drift_bp basic" {
+    const under = InvariantHealth{ .name = "x", .expected = 1000, .observed = 950 };
+    try std.testing.expectEqual(@as(u32, 500), under.drift_bp());
 
     const exact = InvariantHealth{ .name = "x", .expected = 1000, .observed = 1000 };
-    try std.testing.expectEqual(@as(u32, 0), exact.driftBp());
+    try std.testing.expectEqual(@as(u32, 0), exact.drift_bp());
 
     const empty = InvariantHealth{ .name = "x", .expected = 0, .observed = 0 };
-    try std.testing.expectEqual(@as(u32, 0), empty.driftBp());
+    try std.testing.expectEqual(@as(u32, 0), empty.drift_bp());
 
     const over = InvariantHealth{ .name = "x", .expected = 1000, .observed = 1100 };
-    try std.testing.expectEqual(@as(u32, 1000), over.driftBp());
+    try std.testing.expectEqual(@as(u32, 1000), over.drift_bp());
 }
 
+// Goal: a consistent store reports no drift. Method: one category, run, read every invariant.
 test "verifier: clean DB has no drift" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    _ = try ops.createCategory(db, 0, "Top", "top", "");
+    _ = try ops.create_category(db, 0, .{ .name = "Top", .slug = "top", .description = "" });
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
-    for (state.indices) |inv| {
-        const drift = inv.driftBp();
+    for (state.indices) |invariant| {
+        const drift = invariant.drift_bp();
         try std.testing.expect(drift < 100);
     }
 }
 
+// Goal: a wrong subtree count is reported, not fixed. Method: tamper one row, run, re-read it.
 test "verifier: detects subtree count drift without repairing (WARN-only)" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top_id = try ops.createCategory(db, 0, "Top", "top", "");
+    const top_id = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
 
     var sibling_ids: [50]u64 = undefined;
-    var name_buf: [16]u8 = undefined;
-    var slug_buf: [16]u8 = undefined;
+    var name_buffer: [16]u8 = undefined;
+    var slug_buffer: [16]u8 = undefined;
     for (0..sibling_ids.len) |i| {
-        const name = try std.fmt.bufPrint(&name_buf, "C{d}", .{i});
-        const slug = try std.fmt.bufPrint(&slug_buf, "c{d}", .{i});
-        sibling_ids[i] = try ops.createCategory(db, top_id, name, slug, "");
+        const name = try std.fmt.bufPrint(&name_buffer, "C{d}", .{i});
+        const slug = try std.fmt.bufPrint(&slug_buffer, "c{d}", .{i});
+        sibling_ids[i] = try ops.create_category(
+            db,
+            top_id,
+            .{ .name = name, .slug = slug, .description = "" },
+        );
     }
-    _ = try ops.createLink(db, sibling_ids[0], "https://x.example", "x", "");
+    _ = try ops.create_link(
+        db,
+        sibling_ids[0],
+        .{ .url = "https://x.example", .title = "x", .description = "" },
+    );
 
-    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
 
     {
-        var cat = (try ops.getCategory(db, sibling_ids[0])).?;
-        cat.link_count_subtree = 0;
+        var category = (try ops.get_category(db, sibling_ids[0])).?;
+        category.link_count_subtree = 0;
         const id_key = codec.encodeU64(sibling_ids[0]);
-        try db.categories_by_id().insert(&id_key, std.mem.asBytes(&cat));
+        try db.categories_by_id().insert(&id_key, std.mem.asBytes(&category));
     }
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
     const subtree = state.indices[@intFromEnum(InvariantId.subtree_counts)];
-    try std.testing.expect(subtree.driftBp() > 0);
+    try std.testing.expect(subtree.drift_bp() > 0);
 
-    const after = (try ops.getCategory(db, sibling_ids[0])).?;
+    const after = (try ops.get_category(db, sibling_ids[0])).?;
     try std.testing.expectEqual(@as(u64, 0), after.link_count_subtree);
 }
 
+// Goal: a missing link_by_category row shows as coverage drift. Method: delete one row and run.
 test "verifier: tampered link_count surfaces drift on link_by_category invariant" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top = try ops.createCategory(db, 0, "Top", "top", "");
-    _ = try ops.createLink(db, top, "https://a.example", "a", "");
-    _ = try ops.createLink(db, top, "https://b.example", "b", "");
+    const top = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try ops.create_link(
+        db,
+        top,
+        .{ .url = "https://a.example", .title = "a", .description = "" },
+    );
+    _ = try ops.create_link(
+        db,
+        top,
+        .{ .url = "https://b.example", .title = "b", .description = "" },
+    );
 
-    try db.drainOneMemtable(db.mt_link_by_category(), db.link_by_category());
+    try db.drain_one_memtable(db.memtable_link_by_category(), db.link_by_category());
 
     {
         var key_copy: [16]u8 = undefined;
         var found = false;
         {
             const min_key: [16]u8 = @splat(0);
-            var iter = try db.link_by_category().rangeScan(&min_key, null);
-            defer iter.deinit();
-            if (try iter.next()) |entry| {
+            var iterator = try db.link_by_category().rangeScan(&min_key, null);
+            defer iterator.deinit();
+            if (try iterator.next()) |entry| {
                 @memcpy(&key_copy, entry.key[0..16]);
                 found = true;
             }
@@ -403,224 +528,264 @@ test "verifier: tampered link_count surfaces drift on link_by_category invariant
     }
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
-    const inv = state.indices[@intFromEnum(InvariantId.link_by_category_coverage)];
-    try std.testing.expect(inv.driftBp() > 0);
+    const invariant = state.indices[@intFromEnum(InvariantId.link_by_category_coverage)];
+    try std.testing.expect(invariant.drift_bp() > 0);
 }
 
+// Goal: a wrong child subtree count is reported. Method: tamper the root's count and run.
 test "verifier: tampered child_count_subtree surfaces drift" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top = try ops.createCategory(db, 0, "Top", "top", "");
-    _ = try ops.createCategory(db, top, "A", "a", "");
-    _ = try ops.createCategory(db, top, "B", "b", "");
+    const top = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try ops.create_category(db, top, .{ .name = "A", .slug = "a", .description = "" });
+    _ = try ops.create_category(db, top, .{ .name = "B", .slug = "b", .description = "" });
 
-    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
 
     {
-        var cat = (try ops.getCategory(db, top)).?;
-        cat.child_count_subtree = 99;
+        var category = (try ops.get_category(db, top)).?;
+        category.child_count_subtree = 99;
         const id_key = codec.encodeU64(top);
-        try db.categories_by_id().insert(&id_key, std.mem.asBytes(&cat));
+        try db.categories_by_id().insert(&id_key, std.mem.asBytes(&category));
     }
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
     const subtree = state.indices[@intFromEnum(InvariantId.subtree_counts)];
-    try std.testing.expect(subtree.driftBp() > 0);
+    try std.testing.expect(subtree.drift_bp() > 0);
 }
 
+// Goal: the snapshot carries one named slot per invariant. Method: run, snapshot, check names.
 test "verifier: every InvariantId has a matching snapshot index" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
-    const snap = state.snapshot(db);
-    try std.testing.expectEqual(INVARIANT_COUNT, snap.indices.len);
-    for (snap.indices) |idx| {
-        try std.testing.expect(idx.name.len > 0);
+    const snapshot = state.snapshot(db);
+    try std.testing.expectEqual(invariant_count, snapshot.indices.len);
+    for (snapshot.indices) |health| {
+        try std.testing.expect(health.name.len > 0);
     }
 }
 
-test "verifier: runOnce does not mutate categories_by_id count" {
+// Goal: a run is read-only on the primary trees. Method: compare entry counts before and after.
+test "verifier: run_once does not mutate categories_by_id count" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top = try ops.createCategory(db, 0, "Top", "top", "");
-    _ = try ops.createCategory(db, top, "A", "a", "");
-    _ = try ops.createLink(db, top, "https://x.example", "x", "");
+    const top = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try ops.create_category(db, top, .{ .name = "A", .slug = "a", .description = "" });
+    _ = try ops.create_link(
+        db,
+        top,
+        .{ .url = "https://x.example", .title = "x", .description = "" },
+    );
 
-    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
-    try db.drainOneMemtable(db.mt_links_by_id(), db.links_by_id());
+    try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
+    try db.drain_one_memtable(db.memtable_links_by_id(), db.links_by_id());
 
-    const before_cats = db.categories_by_id().entry_count;
+    const before_categories = db.categories_by_id().entry_count;
     const before_links = db.links_by_id().entry_count;
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
-    try std.testing.expectEqual(before_cats, db.categories_by_id().entry_count);
+    try std.testing.expectEqual(before_categories, db.categories_by_id().entry_count);
     try std.testing.expectEqual(before_links, db.links_by_id().entry_count);
 }
 
+// Goal: the verifier tolerates concurrent writes. Method: a writer thread races five runs.
 test "verifier: concurrent writer + verifier does not crash" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top = try ops.createCategory(db, 0, "Top", "top", "");
+    const top = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
 
     const Writer = struct {
-        fn run(d: *Directory, parent: u64) void {
-            var name_buf: [32]u8 = undefined;
-            var slug_buf: [32]u8 = undefined;
-            var url_buf: [64]u8 = undefined;
+        fn run(directory: *Directory, parent: u64) void {
+            assert(parent > 0);
+            var url_buffer: [64]u8 = undefined;
             for (0..200) |i| {
-                const url = std.fmt.bufPrint(&url_buf, "https://w{d}.example", .{i}) catch continue;
-                const name = std.fmt.bufPrint(&name_buf, "L{d}", .{i}) catch continue;
-                const slug = std.fmt.bufPrint(&slug_buf, "l{d}", .{i}) catch continue;
-                _ = name;
-                _ = slug;
-                _ = ops.createLink(d, parent, url, "x", "") catch {};
+                const url = std.fmt.bufPrint(&url_buffer, "https://w{d}.example", .{i}) catch
+                    continue;
+                _ = ops.create_link(
+                    directory,
+                    parent,
+                    .{ .url = url, .title = "x", .description = "" },
+                ) catch {};
             }
         }
     };
 
-    const t = try std.Thread.spawn(.{}, Writer.run, .{ db, top });
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ db, top });
 
     var state = VerifierState{};
-    var i: usize = 0;
-    while (i < 5) : (i += 1) {
-        runOnce(db, &state) catch {};
+    for (0..5) |_| {
+        run_once(db, &state) catch {};
     }
-    t.join();
+    thread.join();
 
-    try runOnce(db, &state);
+    try run_once(db, &state);
 }
 
+// Goal: two snapshots of one state agree field by field. Method: run once, snapshot twice.
 test "verifier: op 19 frame matches op 18 frame" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
     db.verifier_state = state;
 
-    const snap1 = db.verifier_state.snapshot(db);
-    const snap2 = db.verifier_state.snapshot(db);
-    try std.testing.expectEqual(snap1.last_run_at, snap2.last_run_at);
-    try std.testing.expectEqual(snap1.indices.len, snap2.indices.len);
-    for (snap1.indices, snap2.indices) |a, b| {
+    const first = db.verifier_state.snapshot(db);
+    const second = db.verifier_state.snapshot(db);
+    try std.testing.expectEqual(first.last_run_at, second.last_run_at);
+    try std.testing.expectEqual(first.indices.len, second.indices.len);
+    for (first.indices, second.indices) |a, b| {
         try std.testing.expectEqualSlices(u8, a.name, b.name);
         try std.testing.expectEqual(a.expected, b.expected);
         try std.testing.expectEqual(a.observed, b.observed);
     }
     try std.testing.expectEqual(
-        snap1.slug_path_repair_queue_depth,
-        snap2.slug_path_repair_queue_depth,
+        first.slug_path_repair_queue_depth,
+        second.slug_path_repair_queue_depth,
     );
 }
 
+// Goal: the queue depth in a snapshot is live. Method: snapshot, enqueue one task, snapshot.
 test "verifier: slug_path_repair_queue_depth round-trips through snapshot" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     var state = VerifierState{};
-    var snap = state.snapshot(db);
-    try std.testing.expectEqual(@as(u64, 0), snap.slug_path_repair_queue_depth);
+    var snapshot = state.snapshot(db);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.slug_path_repair_queue_depth);
 
     const seq: u64 = 1;
     const key = codec.encodeU64(seq);
     const value = codec.encodeU64(42);
     try db.slug_path_repair_queue().insert(&key, &value);
 
-    snap = state.snapshot(db);
-    try std.testing.expectEqual(@as(u64, 1), snap.slug_path_repair_queue_depth);
+    snapshot = state.snapshot(db);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.slug_path_repair_queue_depth);
 }
 
+// Goal: shutdown does not wait a whole verifier interval. Method: start workers, time deinit.
 test "verifier: shutdown signal causes verifier loop to exit promptly" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
 
-    db.startBackgroundThreads();
+    db.start_background_threads();
     try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
 
-    const t0 = std.Io.Clock.awake.now(std.testing.io);
-    db.deinitTestInstance();
-    const elapsed = t0.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds();
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    db.deinit_test_instance();
+    const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(std.testing.io)).toMilliseconds();
 
-    try std.testing.expect(elapsed < 5_000);
+    try std.testing.expect(elapsed_ms < 5_000);
 }
 
+// Goal: a missing slug path row flips any_drift. Method: clean run, delete a row, run again.
 test "H14: verifier flags slug-path coverage divergence" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top = try ops.createCategory(db, 0, "Top", "top", "");
-    _ = try ops.createCategory(db, top, "Child", "child", "");
+    const top = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try ops.create_category(db, top, .{ .name = "Child", .slug = "child", .description = "" });
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
     try std.testing.expect(!state.any_drift);
 
     _ = try db.categories_by_slug_path().delete("top/child");
 
-    try runOnce(db, &state);
+    try run_once(db, &state);
     try std.testing.expect(state.any_drift);
 }
 
+// Goal: a link whose category row vanished counts as uncovered. Method: delete the category row.
 test "verifier reports a link whose category no longer exists" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
     const ops = @import("operations/operations.zig");
-    const top = try ops.createCategory(db, 0, "Top", "top", "");
-    const doomed = try ops.createCategory(db, top, "Doomed", "doomed", "");
-    _ = try ops.createLink(db, doomed, "https://orphan.example", "Orphan", "");
+    const top = try ops.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const doomed = try ops.create_category(
+        db,
+        top,
+        .{ .name = "Doomed", .slug = "doomed", .description = "" },
+    );
+    _ = try ops.create_link(
+        db,
+        doomed,
+        .{ .url = "https://orphan.example", .title = "Orphan", .description = "" },
+    );
 
-    try db.drainOneMemtable(db.mt_categories_by_id(), db.categories_by_id());
+    try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
     const doomed_key = codec.encodeU64(doomed);
     _ = try db.categories_by_id().delete(&doomed_key);
 
     var state = VerifierState{};
-    try runOnce(db, &state);
+    try run_once(db, &state);
 
-    const inv = state.indices[@intFromEnum(InvariantId.link_category_exists)];
-    try std.testing.expectEqual(@as(u64, 1), inv.expected);
-    try std.testing.expectEqual(@as(u64, 0), inv.observed);
-    try std.testing.expect(inv.driftBp() > 0);
+    const invariant = state.indices[@intFromEnum(InvariantId.link_category_exists)];
+    try std.testing.expectEqual(@as(u64, 1), invariant.expected);
+    try std.testing.expectEqual(@as(u64, 0), invariant.observed);
+    try std.testing.expect(invariant.drift_bp() > 0);
 }

@@ -1,4 +1,9 @@
+//! The server entry point: read the configuration from the environment, load the vector model,
+//! open and recover the directory, start its background workers, and hand the store to the
+//! zigstore reactor. Nothing is served before recovery has completed.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const zigstore = @import("zigstore");
 
 pub const schema = @import("schema.zig");
@@ -13,6 +18,52 @@ const Directory = directory.Directory;
 
 const log = std.log.scoped(.dmozdb);
 
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const config = Config.from_env(init.environ_map);
+
+    log.info("Dmoz Zig Development - starting up", .{});
+    log.info(
+        "  bind={d}.{d}.{d}.{d}:{d} data_dir={s} cache={d}MB threads={d} trusted_ips={d}",
+        .{
+            config.server.bind_address[0],
+            config.server.bind_address[1],
+            config.server.bind_address[2],
+            config.server.bind_address[3],
+            config.server.port,
+            config.data_dir,
+            config.server.cache_size_mb,
+            config.server.thread_count,
+            config.server.trusted_count,
+        },
+    );
+
+    const model = vector_model.Model.load(init.io, allocator, config.vector_model) catch |err| {
+        log.err(
+            "vector model {s} failed to load: {} — " ++
+                "set DMOZDB_VECTOR_MODEL to the file the image ships",
+            .{ config.vector_model, err },
+        );
+        return err;
+    };
+    defer model.deinit(allocator);
+    log.info("  vector model {s} hash={x}", .{ config.vector_model, model.hash });
+
+    const db = try Directory.init(init.io, allocator, config, model);
+    defer db.deinit();
+
+    try db.recover();
+    assert(db.derived_counts_checkpointed());
+    db.start_background_threads();
+
+    log.info("Database ready. Starting server on port {d}...", .{config.server.port});
+
+    try zigstore.run(directory.Store, db, Directory.handler(), config.server, .{});
+}
+
+const scratch_slab_mb_min: u32 = 1;
+const scratch_slab_mb_max: u32 = 1024;
+
 pub const Config = struct {
     server: zigstore.ServerConfig = .{},
     data_dir: []const u8 = "/var/lib/dmozdb",
@@ -21,59 +72,41 @@ pub const Config = struct {
     repair_worker_chunk_size: u32 = 10000,
     verifier_interval_s: u32 = 300,
     vector_model: []const u8 = "/usr/local/share/dmozdb/vector_model.bin",
+    scratch_slab_mb: u32 = 32,
 
-    pub fn fromEnv(env: *const std.process.Environ.Map) Config {
+    // A knob that fails to parse keeps its default: the environment is operating input, so it
+    // is tolerated and logged by the caller, never asserted.
+    pub fn from_env(env: *const std.process.Environ.Map) Config {
         var config = Config{ .server = zigstore.ServerConfig.fromEnv("DMOZDB_", env) };
-        if (env.get("DMOZDB_DATA_DIR")) |v| {
-            config.data_dir = v;
+        if (env.get("DMOZDB_DATA_DIR")) |value| {
+            config.data_dir = value;
         }
-        if (env.get("DMOZDB_VECTOR_MODEL")) |v| {
-            config.vector_model = v;
+        if (env.get("DMOZDB_VECTOR_MODEL")) |value| {
+            config.vector_model = value;
         }
-        if (env.get("DMOZDB_RENAME_INLINE_THRESHOLD")) |v| {
-            config.rename_inline_threshold = std.fmt.parseInt(u32, v, 10) catch config.rename_inline_threshold;
+        if (env.get("DMOZDB_RENAME_INLINE_THRESHOLD")) |value| {
+            const parsed = std.fmt.parseInt(u32, value, 10);
+            config.rename_inline_threshold = parsed catch config.rename_inline_threshold;
         }
-        if (env.get("DMOZDB_REPAIR_WORKER_INTERVAL_MS")) |v| {
-            config.repair_worker_interval_ms = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_interval_ms;
+        if (env.get("DMOZDB_REPAIR_WORKER_INTERVAL_MS")) |value| {
+            const parsed = std.fmt.parseInt(u32, value, 10);
+            config.repair_worker_interval_ms = parsed catch config.repair_worker_interval_ms;
         }
-        if (env.get("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |v| {
-            config.repair_worker_chunk_size = std.fmt.parseInt(u32, v, 10) catch config.repair_worker_chunk_size;
+        if (env.get("DMOZDB_REPAIR_WORKER_CHUNK_SIZE")) |value| {
+            const parsed = std.fmt.parseInt(u32, value, 10);
+            config.repair_worker_chunk_size = parsed catch config.repair_worker_chunk_size;
         }
-        if (env.get("DMOZDB_VERIFIER_INTERVAL_S")) |v| {
-            config.verifier_interval_s = std.fmt.parseInt(u32, v, 10) catch config.verifier_interval_s;
+        if (env.get("DMOZDB_VERIFIER_INTERVAL_S")) |value| {
+            const parsed = std.fmt.parseInt(u32, value, 10);
+            config.verifier_interval_s = parsed catch config.verifier_interval_s;
+        }
+        if (env.get("DMOZDB_SCRATCH_SLAB_MB")) |value| {
+            const parsed = std.fmt.parseInt(u32, value, 10) catch config.scratch_slab_mb;
+            config.scratch_slab_mb = @min(@max(parsed, scratch_slab_mb_min), scratch_slab_mb_max);
         }
         return config;
     }
 };
-
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    const config = Config.fromEnv(init.environ_map);
-
-    log.info("Dmoz Zig Development - starting up", .{});
-    log.info("  bind={d}.{d}.{d}.{d}:{d} data_dir={s} cache={d}MB threads={d} trusted_ips={d}", .{
-        config.server.bind_address[0], config.server.bind_address[1], config.server.bind_address[2], config.server.bind_address[3],
-        config.server.port,            config.data_dir,               config.server.cache_size_mb,   config.server.thread_count,
-        config.server.trusted_count,
-    });
-
-    const pq = vector_model.Model.load(init.io, allocator, config.vector_model) catch |err| {
-        log.err("vector model {s} failed to load: {} — set DMOZDB_VECTOR_MODEL to the file the image ships", .{ config.vector_model, err });
-        return err;
-    };
-    defer pq.deinit(allocator);
-    log.info("  vector model {s} hash={x}", .{ config.vector_model, pq.hash });
-
-    const db = try Directory.init(init.io, allocator, config, pq);
-    defer db.deinit();
-
-    try db.recover();
-    db.startBackgroundThreads();
-
-    log.info("Database ready. Starting server on port {d}...", .{config.server.port});
-
-    try zigstore.run(directory.Store, db, Directory.handler(), config.server, .{});
-}
 
 test {
     _ = schema;
@@ -84,6 +117,8 @@ test {
     _ = verifier;
     _ = @import("wal/wal_apply.zig");
     _ = @import("e2e_test.zig");
+    _ = @import("tidy.zig");
+    _ = @import("scratch.zig");
     _ = @import("changeset.zig");
     _ = @import("apply/apply.zig");
     _ = @import("apply/apply_link.zig");
@@ -111,11 +146,16 @@ test {
     _ = @import("facts/entities.zig");
 }
 
+// Goal: the documented defaults are the real defaults. Method: compare a default Config field
+// by field with the values the deployment docs promise.
 test "Config: every tuning knob has its documented default" {
-    const default_cfg = Config{};
-    try std.testing.expectEqual(@as(u32, 5000), default_cfg.rename_inline_threshold);
-    try std.testing.expectEqual(@as(u32, 1000), default_cfg.repair_worker_interval_ms);
-    try std.testing.expectEqual(@as(u32, 10000), default_cfg.repair_worker_chunk_size);
-    try std.testing.expectEqual(@as(u32, 300), default_cfg.verifier_interval_s);
-    try std.testing.expectEqualStrings("/usr/local/share/dmozdb/vector_model.bin", default_cfg.vector_model);
+    const default_config = Config{};
+    try std.testing.expectEqual(@as(u32, 5000), default_config.rename_inline_threshold);
+    try std.testing.expectEqual(@as(u32, 1000), default_config.repair_worker_interval_ms);
+    try std.testing.expectEqual(@as(u32, 10000), default_config.repair_worker_chunk_size);
+    try std.testing.expectEqual(@as(u32, 300), default_config.verifier_interval_s);
+    try std.testing.expectEqualStrings(
+        "/usr/local/share/dmozdb/vector_model.bin",
+        default_config.vector_model,
+    );
 }

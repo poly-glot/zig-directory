@@ -27,3 +27,4 @@ deployment/
 *.md
 .DS_Store
 zig-pkg/
+.zig-cache-host/

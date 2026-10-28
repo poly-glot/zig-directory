@@ -1,94 +1,135 @@
+//! Applies a committed ChangeSet to the store: trees, memtables and the in-memory indexes.
+//! Every entry point runs after the WAL append, so a failure here is a programmer error or
+//! corruption, never a client error, and the caller aborts so recovery replays the record.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const codec = @import("zigstore").codec;
+const inverted_index = @import("zigstore").inverted_index;
 const BPlusTree = @import("zigstore").BPlusTree;
 const changeset = @import("../changeset.zig");
 const Directory = @import("../directory.zig").Directory;
+const operations = @import("../operations/operations.zig");
+const depth_max = @import("../operations/operations_shared.zig").depth_max;
 
 const apply_link = @import("apply_link.zig");
 const apply_category = @import("apply_category.zig");
 const apply_repair = @import("apply_repair.zig");
 
-pub fn apply(db: *Directory, cs: changeset.ChangeSet) !void {
-    try applyToTrees(db, cs);
-    try db.facts.observe(db.io, db.allocator, cs);
+pub fn apply(db: *Directory, change_set: *const changeset.ChangeSet) !void {
+    try apply_to_trees(db, change_set);
+    try db.facts.observe(db.io, db.allocator, change_set);
 }
 
-fn applyToTrees(db: *Directory, cs: changeset.ChangeSet) !void {
-    return switch (cs) {
-        .link_inserted => |e| apply_link.applyLinkInserted(db, e),
-        .link_deleted => |e| apply_link.applyLinkDeleted(db, e),
-        .link_text_updated => |e| apply_link.applyLinkTextUpdated(db, e),
-        .link_recategorized => |e| apply_link.applyLinkRecategorized(db, e),
-        .link_vectors_put => |e| apply_link.applyLinkVectorsPut(db, e),
-        .link_entities_put => |e| apply_link.applyLinkEntitiesPut(db, e),
-        .category_vectors_put => |e| apply_category.applyCategoryVectorsPut(db, e),
-        .category_inserted => |e| apply_category.applyCategoryInserted(db, e),
-        .category_deleted => |e| apply_category.applyCategoryDeleted(db, e),
-        .category_text_updated => |e| apply_category.applyCategoryTextUpdated(db, e),
-        .category_renamed => |e| apply_category.applyCategoryRenamed(db, e),
-        .category_moved => |e| apply_category.applyCategoryMoved(db, e),
-        .slug_path_repair_chunk => |e| apply_repair.applySlugPathRepairChunk(db, e),
-        .slug_path_repair_complete => |e| apply_repair.applySlugPathRepairComplete(db, e),
+fn apply_to_trees(db: *Directory, change_set: *const changeset.ChangeSet) !void {
+    return switch (change_set.*) {
+        .link_inserted => |*effect| apply_link.apply_link_inserted(db, effect),
+        .link_deleted => |*effect| apply_link.apply_link_deleted(db, effect),
+        .link_text_updated => |*effect| apply_link.apply_link_text_updated(db, effect),
+        .link_recategorized => |*effect| apply_link.apply_link_recategorized(db, effect),
+        .link_vectors_put => |*effect| apply_link.apply_link_vectors_put(db, effect),
+        .link_entities_put => |effect| apply_link.apply_link_entities_put(db, effect),
+        .category_vectors_put => |*effect| apply_category.apply_category_vectors_put(db, effect),
+        .category_inserted => |*effect| apply_category.apply_category_inserted(db, effect),
+        .category_deleted => |*effect| apply_category.apply_category_deleted(db, effect),
+        .category_text_updated => |*effect| apply_category.apply_category_text_updated(db, effect),
+        .category_renamed => |*effect| apply_category.apply_category_renamed(db, effect),
+        .category_moved => |*effect| apply_category.apply_category_moved(db, effect),
+        .slug_path_repair_chunk => |*effect| apply_repair.apply_slug_path_repair_chunk(db, effect),
+        .slug_path_repair_complete => |effect| apply_repair.apply_slug_path_repair_complete(
+            db,
+            effect,
+        ),
     };
 }
 
 pub const DirectField = enum { link_count, child_count };
 
-fn applyDeltaU64(base: u64, delta: i64) u64 {
-    if (delta >= 0) return base +| @as(u64, @intCast(delta));
-    return base -| @abs(delta);
+fn apply_delta_u64(base: u64, delta: i64) u64 {
+    if (delta >= 0) {
+        const result = base +| @as(u64, @intCast(delta));
+        assert(result >= base);
+        return result;
+    }
+    const result = base -| @abs(delta);
+    assert(result <= base);
+    return result;
 }
 
-fn applyDeltaU32(base: u32, delta: i64) u32 {
-    const lim: i64 = std.math.maxInt(u32);
-    const clamped = std.math.clamp(delta, -lim, lim);
-    if (clamped >= 0) return base +| @as(u32, @intCast(clamped));
-    return base -| @as(u32, @intCast(@abs(clamped)));
+fn apply_delta_u32(base: u32, delta: i64) u32 {
+    const limit: i64 = std.math.maxInt(u32);
+    const clamped = std.math.clamp(delta, -limit, limit);
+    assert(clamped >= -limit);
+    assert(clamped <= limit);
+    if (clamped >= 0) {
+        const result = base +| @as(u32, @intCast(clamped));
+        assert(result >= base);
+        return result;
+    }
+    const result = base -| @as(u32, @intCast(@abs(clamped)));
+    assert(result <= base);
+    return result;
 }
 
-pub fn cascadeAncestorCounts(
+pub fn cascade_ancestor_counts(
     db: *Directory,
     updates: []const changeset.AncestorUpdate,
     direct_target_id: u64,
     comptime direct_field: DirectField,
     comptime increment: bool,
 ) !void {
-    const ops = @import("../operations/operations.zig");
-    const now = db.nowSeconds();
-    const fld = comptime @tagName(direct_field);
-    for (updates) |upd| {
-        var cat = (try ops.getCategory(db, upd.cat_id)) orelse continue;
-        cat.link_count_subtree = applyDeltaU64(cat.link_count_subtree, upd.link_count_subtree_delta);
-        cat.child_count_subtree = applyDeltaU32(cat.child_count_subtree, upd.child_count_subtree_delta);
-        cat.updated_at = now;
-        if (cat.id == direct_target_id) {
+    assert(updates.len <= depth_max);
+    if (direct_target_id == 0) assert(updates.len == 0);
+
+    const now = db.now_seconds();
+    const field_name = comptime @tagName(direct_field);
+    for (updates) |update| {
+        assert(update.cat_id != 0);
+        var category = (try operations.get_category(db, update.cat_id)) orelse continue;
+        category.link_count_subtree = apply_delta_u64(
+            category.link_count_subtree,
+            update.link_count_subtree_delta,
+        );
+        category.child_count_subtree = apply_delta_u32(
+            category.child_count_subtree,
+            update.child_count_subtree_delta,
+        );
+        category.updated_at = now;
+        if (category.id == direct_target_id) {
             if (increment) {
-                @field(cat, fld) +|= 1;
-            } else if (@field(cat, fld) > 0) {
-                @field(cat, fld) -= 1;
+                @field(category, field_name) +|= 1;
+            } else if (@field(category, field_name) > 0) {
+                @field(category, field_name) -= 1;
             }
         }
-        const ancestor_key = codec.encodeU64(upd.cat_id);
-        try db.mt_categories_by_id().put(&ancestor_key, std.mem.asBytes(&cat));
+        const ancestor_key = codec.encodeU64(update.cat_id);
+        try db.memtable_categories_by_id().put(&ancestor_key, std.mem.asBytes(&category));
+        assert(db.memtable_categories_by_id().get(&ancestor_key) != .deleted);
     }
 }
 
-pub fn writeTokens(
+// A token key is the token text followed by the big-endian id, so one buffer sized by the
+// tokenizer's maximum covers every key without a heap allocation on the write path.
+const token_key_len_max: usize = inverted_index.MAX_TOKEN_LEN + 8;
+
+pub fn write_tokens(
     tree: *BPlusTree,
     tokens: []const changeset.Token,
     id: u64,
     comptime mode: enum { insert, delete },
 ) !void {
-    for (tokens) |t| {
-        var key_buf: [4096]u8 = undefined;
-        const key_len = t.text.len + 8;
-        if (key_len > key_buf.len) continue;
-        @memcpy(key_buf[0..t.text.len], t.text);
+    assert(id != 0);
+    for (tokens) |token| {
+        assert(token.text.len > 0);
+        assert(token.text.len <= inverted_index.MAX_TOKEN_LEN);
+        var key_buffer: [token_key_len_max]u8 = undefined;
+        const key_len = token.text.len + 8;
+        @memcpy(key_buffer[0..token.text.len], token.text);
         const id_be = codec.encodeU64(id);
-        @memcpy(key_buf[t.text.len..][0..8], &id_be);
+        @memcpy(key_buffer[token.text.len..][0..8], &id_be);
         switch (mode) {
-            .insert => try tree.insert(key_buf[0..key_len], &.{}),
-            .delete => _ = try tree.delete(key_buf[0..key_len]),
+            .insert => try tree.insert(key_buffer[0..key_len], &.{}),
+            .delete => _ = try tree.delete(key_buffer[0..key_len]),
         }
     }
 }

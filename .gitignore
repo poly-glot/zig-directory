@@ -40,3 +40,4 @@ web/data/
 mcp/.venv/
 __pycache__/
 zig-pkg/
+.zig-cache-host/

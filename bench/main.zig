@@ -1,3 +1,7 @@
+//! Entry point of the bench harness: it builds the shared environment, picks the workload named
+//! by the first argument and hands it the remaining arguments. Every workload emits one JSONL
+//! record through `common.Run`, so the output shape is the same whichever one runs.
+
 const std = @import("std");
 const seed = @import("workloads/seed.zig");
 const create_link = @import("workloads/create_link.zig");
@@ -20,29 +24,29 @@ pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.skip();
 
-    const sub = args.next() orelse {
-        printHelp();
+    const subcommand = args.next() orelse {
+        print_help();
         return;
     };
-    if (std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h")) {
-        printHelp();
+    if (std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h")) {
+        print_help();
         return;
     }
-    if (std.mem.eql(u8, sub, "seed")) return seed.run(env, &args);
-    if (std.mem.eql(u8, sub, "create_link")) return create_link.run(env, &args);
-    if (std.mem.eql(u8, sub, "bulk_import")) return bulk_import.run(env, &args);
-    if (std.mem.eql(u8, sub, "get_link")) return get_link.run(env, &args);
-    if (std.mem.eql(u8, sub, "browse")) return browse.run(env, &args);
-    if (std.mem.eql(u8, sub, "search")) return search.run(env, &args);
-    if (std.mem.eql(u8, sub, "mixed")) return mixed.run(env, &args);
-    if (std.mem.eql(u8, sub, "cold")) return cold.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "seed")) return seed.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "create_link")) return create_link.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "bulk_import")) return bulk_import.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "get_link")) return get_link.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "browse")) return browse.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "search")) return search.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "mixed")) return mixed.run(env, &args);
+    if (std.mem.eql(u8, subcommand, "cold")) return cold.run(env, &args);
 
-    std.debug.print("Unknown subcommand: {s}\n\n", .{sub});
-    printHelp();
+    std.debug.print("Unknown subcommand: {s}\n\n", .{subcommand});
+    print_help();
     return error.UnknownSubcommand;
 }
 
-fn printHelp() void {
+fn print_help() void {
     const help =
         \\bench - dmozdb benchmark harness
         \\
@@ -59,7 +63,7 @@ fn printHelp() void {
         \\Common options:
         \\  --profile {1cpu2gb|2cpu4gb|unconstrained}    Tag the JSON record (does NOT enforce)
         \\  --output PATH        Append JSON Lines records to PATH (default: stdout)
-        \\  --workers W          Concurrent client connections (default: 4)
+        \\  --workers W          Concurrent client connections (default: 4, at most 256)
         \\  --ops-per-worker N   Ops per worker (default: 10000)
         \\  --warmup-ops N       Discard first N ops from percentile recording (default: 1000)
         \\  --connect-host HOST  (default: 127.0.0.1)
