@@ -1,44 +1,68 @@
+//! The TypeScript client generator writes `web/lib/dmoz-protocol.gen.ts` from the op and status
+//! enums and the extern row structs, so the Deno client reads exactly the bytes the server
+//! writes. Every byte it emits is the contract; a change here is a protocol change.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const zigstore = @import("zigstore");
 const tsgen = zigstore.tsgen;
 const protocol = @import("binary_protocol.zig");
 const schema = @import("schema.zig");
 const entities = @import("facts/entities.zig");
 
-const FixedStringMeta = struct { capacity: usize };
+const FixedStringMeta = struct { capacity: u32 };
 
 const FieldTable = struct {
     pub fn tsType(comptime T: type, comptime field_name: []const u8) []const u8 {
-        if (comptime isFixedString(T)) |_| return "string";
-        if (comptime std.mem.eql(u8, field_name, "created_at") or std.mem.eql(u8, field_name, "updated_at")) return "Date";
+        comptime assert(field_name.len > 0);
+        if (comptime is_fixed_string(T)) |_| return "string";
+        if (comptime is_timestamp(field_name)) {
+            comptime assert(T == i64);
+            return "Date";
+        }
         if (T == u8 and comptime std.mem.eql(u8, field_name, "status")) return "LinkStatus";
         return "number";
     }
 
     pub fn reader(comptime T: type, comptime field_name: []const u8) []const u8 {
-        if (comptime isFixedString(T)) |fs| {
-            return std.fmt.comptimePrint("r.fixedString({d})", .{fs.capacity});
+        comptime assert(field_name.len > 0);
+        if (comptime is_fixed_string(T)) |fixed_string| {
+            comptime assert(std.mem.eql(u8, tsType(T, field_name), "string"));
+            return std.fmt.comptimePrint("r.fixedString({d})", .{fixed_string.capacity});
         }
         if (T == u8) {
-            if (comptime std.mem.eql(u8, field_name, "status")) return "linkStatusFromByte(r.u8())";
+            if (comptime std.mem.eql(u8, field_name, "status")) {
+                comptime assert(std.mem.eql(u8, tsType(T, field_name), "LinkStatus"));
+                return "linkStatusFromByte(r.u8())";
+            }
             return "r.u8()";
         }
         if (T == u16) return "r.u16()";
         if (T == u32) return "r.u32()";
         if (T == u64) return "r.u64()";
         if (T == i64) {
-            if (comptime std.mem.eql(u8, field_name, "created_at") or std.mem.eql(u8, field_name, "updated_at")) {
+            if (comptime is_timestamp(field_name)) {
+                comptime assert(std.mem.eql(u8, tsType(T, field_name), "Date"));
                 return "r.timestamp()";
             }
             return "r.i64()";
         }
-        @compileError("FieldTable.reader: unsupported field type " ++ @typeName(T) ++ " for field " ++ field_name);
+        @compileError("FieldTable.reader: unsupported field type " ++ @typeName(T) ++
+            " for field " ++ field_name);
     }
 };
 
-fn isFixedString(comptime T: type) ?FixedStringMeta {
+fn is_timestamp(comptime field_name: []const u8) bool {
+    comptime assert(field_name.len > 0);
+    if (std.mem.eql(u8, field_name, "created_at")) return true;
+    return std.mem.eql(u8, field_name, "updated_at");
+}
+
+fn is_fixed_string(comptime T: type) ?FixedStringMeta {
     if (@typeInfo(T) != .@"struct") return null;
     if (!@hasDecl(T, "is_fixed_string")) return null;
+    comptime assert(T.capacity > 0);
+    comptime assert(T.capacity % 2 == 0);
     return .{ .capacity = T.capacity };
 }
 
@@ -51,29 +75,31 @@ pub fn main(init: std.process.Init) !void {
     const file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
     defer file.close(io);
 
-    var buf: [16384]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    const w = &fw.interface;
+    var buffer: [16384]u8 = undefined;
+    var file_writer = file.writer(io, &buffer);
+    const writer = &file_writer.interface;
 
-    try writeHeader(w);
-    try tsgen.writeOpEnum(w, "Op", protocol.Op);
-    try tsgen.writeStatusEnum(w, "Status", protocol.Status);
-    try tsgen.writeStatusEnum(w, "SubStatus", protocol.SubStatus);
-    try tsgen.writeStatusMap(w, "STATUS_MSG", protocol.Status);
-    try tsgen.writeStatusMap(w, "SUB_STATUS_MSG", protocol.SubStatus);
-    try writeStructSize(w, "CATEGORY_SIZE", schema.Category);
-    try writeStructSize(w, "LINK_SIZE", schema.Link);
-    try writeLinkStatusEnum(w);
-    try writeReligions(w);
-    try tsgen.writeStructInterface(w, FieldTable, "Category", schema.Category);
-    try tsgen.writeStructInterface(w, FieldTable, "Link", schema.Link);
-    try tsgen.writeStructReader(w, FieldTable, "Category", schema.Category);
-    try tsgen.writeStructReader(w, FieldTable, "Link", schema.Link);
-    try w.flush();
+    try write_header(writer);
+    try tsgen.writeOpEnum(writer, "Op", protocol.Op);
+    try tsgen.writeStatusEnum(writer, "Status", protocol.Status);
+    try tsgen.writeStatusEnum(writer, "SubStatus", protocol.SubStatus);
+    try tsgen.writeStatusMap(writer, "STATUS_MSG", protocol.Status);
+    try tsgen.writeStatusMap(writer, "SUB_STATUS_MSG", protocol.SubStatus);
+    try write_struct_size(writer, "CATEGORY_SIZE", schema.Category);
+    try write_struct_size(writer, "LINK_SIZE", schema.Link);
+    try write_link_status_enum(writer);
+    try write_religions(writer);
+    try tsgen.writeStructInterface(writer, FieldTable, "Category", schema.Category);
+    try tsgen.writeStructInterface(writer, FieldTable, "Link", schema.Link);
+    try tsgen.writeStructReader(writer, FieldTable, "Category", schema.Category);
+    try tsgen.writeStructReader(writer, FieldTable, "Link", schema.Link);
+    try writer.flush();
+    assert(file_writer.interface.end == 0);
+    assert(file_writer.pos > 0);
 }
 
-fn writeHeader(w: *std.Io.Writer) !void {
-    try w.writeAll(
+fn write_header(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
         \\// AUTO-GENERATED by `zig build gen-client-ts`. DO NOT EDIT.
         \\// Source of truth: src/binary_protocol.zig + src/schema.zig.
         \\// Regenerate after any change to the Op enum, Status/SubStatus,
@@ -85,40 +111,65 @@ fn writeHeader(w: *std.Io.Writer) !void {
     );
 }
 
-fn writeStructSize(w: *std.Io.Writer, comptime name: []const u8, comptime T: type) !void {
-    try w.print("export const {s} = {d};\n", .{ name, @sizeOf(T) });
+// The client reads rows by byte offset, which only matches an extern layout.
+fn write_struct_size(writer: *std.Io.Writer, comptime name: []const u8, comptime T: type) !void {
+    comptime assert(name.len > 0);
+    comptime assert(@sizeOf(T) > 0);
+    comptime assert(@typeInfo(T).@"struct".layout == .@"extern");
+    try writer.print("export const {s} = {d};\n", .{ name, @sizeOf(T) });
 }
 
-fn writeReligions(w: *std.Io.Writer) !void {
-    try w.writeAll("export const RELIGIONS = [\n");
-    inline for (comptime std.enums.values(entities.Religion)) |religion| {
-        try w.print("  \"{s}\",\n", .{@tagName(religion)});
+fn write_religions(writer: *std.Io.Writer) !void {
+    const religions = comptime std.enums.values(entities.Religion);
+    comptime assert(religions.len > 0);
+    try writer.writeAll("export const RELIGIONS = [\n");
+    var written: u32 = 0;
+    inline for (religions) |religion| {
+        try writer.print("  \"{s}\",\n", .{@tagName(religion)});
+        written += 1;
     }
-    try w.writeAll("] as const;\nexport type Religion = typeof RELIGIONS[number];\n");
+    assert(written == religions.len);
+    try writer.writeAll("] as const;\nexport type Religion = typeof RELIGIONS[number];\n");
 }
 
-fn writeLinkStatusEnum(w: *std.Io.Writer) !void {
-    try w.writeAll(
+// The union literal below spells out the three named statuses by hand, so the enum must keep
+// exactly those three members for the generated guards to cover it.
+fn write_link_status_enum(writer: *std.Io.Writer) !void {
+    const statuses = comptime std.enums.values(schema.LinkStatus);
+    comptime assert(statuses.len == 3);
+    try writer.writeAll(
         \\
         \\export type LinkStatus = "pending" | "approved" | "rejected" | "unknown";
         \\
         \\export function linkStatusFromByte(b: number): LinkStatus {
         \\
     );
-    inline for (comptime std.enums.values(schema.LinkStatus)) |status| {
-        try w.print("    if (b === {d}) return \"{s}\";\n", .{ @intFromEnum(status), @tagName(status) });
+    var from_byte_written: u32 = 0;
+    inline for (statuses) |status| {
+        try writer.print(
+            "    if (b === {d}) return \"{s}\";\n",
+            .{ @intFromEnum(status), @tagName(status) },
+        );
+        from_byte_written += 1;
     }
-    try w.writeAll(
+    assert(from_byte_written == statuses.len);
+    try writer.writeAll(
         \\    return "unknown";
         \\}
         \\
         \\export function statusToCode(s: LinkStatus): number {
         \\
     );
-    inline for (comptime std.enums.values(schema.LinkStatus)) |status| {
-        try w.print("    if (s === \"{s}\") return {d};\n", .{ @tagName(status), @intFromEnum(status) });
+    var to_code_written: u32 = 0;
+    inline for (statuses) |status| {
+        try writer.print(
+            "    if (s === \"{s}\") return {d};\n",
+            .{ @tagName(status), @intFromEnum(status) },
+        );
+        to_code_written += 1;
     }
-    try w.writeAll(
+    assert(to_code_written == statuses.len);
+    try writer.writeAll(
         \\    throw new Error(`statusToCode: cannot encode "${s}"`);
         \\}
         \\

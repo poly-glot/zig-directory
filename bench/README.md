@@ -59,7 +59,7 @@ Parsed by every subcommand before its own flags:
 ```
 --profile {1cpu2gb|2cpu4gb|unconstrained}    Tag the JSON record (does NOT enforce; the wrapper does)
 --output PATH                                Append JSON Lines records to PATH (default: stdout)
---workers W                                  Concurrent client connections (default: 4)
+--workers W                                  Concurrent client connections, 1 to 256 (default: 4)
 --ops-per-worker N                           Ops each worker performs (default: 10000)
 --warmup-ops N                               Discard first N ops from percentile recording (default: 1000)
 --connect-host HOST                          Server host (default: 127.0.0.1)

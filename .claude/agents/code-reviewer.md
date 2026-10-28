@@ -20,6 +20,8 @@ You are a senior engineer reviewing a change in the dmozdb / zig-directory repo.
 
 Read every file under `.claude/rules/` and walk each rule against the diff. A `NEVER` violation is at least Major. A `DO`/`PREFER` violation is Minor or Nit unless it causes a correctness or maintainability problem.
 
+For Zig, `zig.md` is TigerStyle and it outranks every other rule. Run the mechanical checker yourself (`~/Library/zig/0.16.0/zig test src/tidy.zig` on this Mac, or `zig test src/tidy.zig` with the Zig from `build.zig.zon`); any violation it prints is at least Major. Then walk the judgement half of `zig.md` against every changed function: does it assert its arguments, results and invariants (two per function on average, operating input excepted); does every new loop carry a bound; does anything allocate on a request or background-tick path; are domain values `u32`/`u64`; are names unabbreviated and big-endian; are two same-typed scalars behind an options struct; are large arguments `*const`; do comments say why rather than what.
+
 ## Phase 2: Rewrite parity check (when the diff rewrites a page, op, or module)
 
 A recurring failure here is dropping a working capability during a rewrite. When a file is substantially rewritten:

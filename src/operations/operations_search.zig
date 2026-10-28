@@ -1,10 +1,18 @@
+//! Keyword and hybrid search over the inverted index trees: the exact AND search the browse
+//! pages use, the IDF-ranked OR search, and the hybrid variants that fuse keyword ranks with the
+//! vector shortlist through reciprocal rank fusion. Posting lists come out of the trees in
+//! ascending id order and every stage keeps them that way, which is what the intersection and
+//! the deduplication rely on.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const codec = @import("zigstore").codec;
+const BPlusTree = @import("zigstore").BPlusTree;
+const inverted = @import("zigstore").inverted_index;
 const schema = @import("../schema.zig");
 const Directory = @import("../directory.zig").Directory;
-const inverted = @import("zigstore").inverted_index;
 const category = @import("operations_category.zig");
-const link_mod = @import("operations_link.zig");
+const link_operations = @import("operations_link.zig");
 const shared = @import("operations_shared.zig");
 const ranking = @import("../ranking.zig");
 const vector_index = @import("../vector_index.zig");
@@ -14,203 +22,294 @@ const sites = @import("../facts/sites.zig");
 
 const log = shared.log;
 
-pub const MAX_POSTINGS_PER_TOKEN: usize = 20_000;
-const MAX_QUERY_TOKENS: usize = 32;
-pub const HYBRID_CANDIDATES: usize = 200;
-pub const CATEGORY_CANDIDATES: usize = 3;
-const CATEGORY_NEAREST: usize = 50;
+pub const postings_per_token_max: usize = 20_000;
+const query_tokens_max: usize = 32;
+pub const hybrid_candidates: usize = 200;
+pub const category_candidates: usize = 3;
+const category_nearest: usize = 50;
 
 const ScoredId = ranking.ScoredId;
 
-pub fn searchCategories(
+pub fn search_categories(
     db: *Directory,
     query: []const u8,
     limit: u32,
-    buf: []schema.Category,
+    buffer: []schema.Category,
 ) ![]schema.Category {
-    return searchViaIndexTree(
+    const hits = try search_via_index_tree(
         schema.Category,
         db,
         db.categories_index_tree(),
         query,
         limit,
-        buf,
-        category.getCategory,
+        buffer,
+        category.get_category,
     );
+    assert(hits.len <= limit);
+    return hits;
 }
 
-pub fn searchLinks(
+pub fn search_links(
     db: *Directory,
     query: []const u8,
     limit: u32,
-    buf: []schema.Link,
+    buffer: []schema.Link,
 ) ![]schema.Link {
-    return searchViaIndexTree(
+    const hits = try search_via_index_tree(
         schema.Link,
         db,
         db.links_index_tree(),
         query,
         limit,
-        buf,
-        link_mod.getLink,
+        buffer,
+        link_operations.get_link,
     );
+    assert(hits.len <= limit);
+    return hits;
 }
 
-pub fn searchCategoriesRanked(
+pub fn search_categories_ranked(
     db: *Directory,
     query: []const u8,
     limit: u32,
-    buf: []schema.Category,
+    buffer: []schema.Category,
 ) ![]schema.Category {
-    const ranked = try rankedIds(db.allocator, db.categories_index_tree(), db.next_category_id.load(.monotonic), MAX_POSTINGS_PER_TOKEN, query);
-    defer db.allocator.free(ranked);
-    return fetchInRankOrder(schema.Category, db, ranked, limit, buf, category.getCategory);
+    const ranked = try ranked_ids(
+        db.scratch(),
+        db.categories_index_tree(),
+        db.next_category_id.load(.monotonic),
+        postings_per_token_max,
+        query,
+    );
+    defer db.scratch().free(ranked);
+
+    const hits = fetch_in_rank_order(
+        schema.Category,
+        db,
+        ranked,
+        limit,
+        buffer,
+        category.get_category,
+    );
+    assert(hits.len <= limit);
+    assert(hits.len <= ranked.len);
+    return hits;
 }
 
-pub fn searchLinksRanked(
+pub fn search_links_ranked(
     db: *Directory,
     query: []const u8,
     limit: u32,
-    buf: []schema.Link,
+    buffer: []schema.Link,
     site_rows: ?[]RowSite,
 ) ![]schema.Link {
-    const ranked = try rankedIds(db.allocator, db.links_index_tree(), linkCorpusSize(db), MAX_POSTINGS_PER_TOKEN, query);
-    defer db.allocator.free(ranked);
-    return fetchLinks(db, ranked, limit, buf, site_rows);
+    const ranked = try ranked_ids(
+        db.scratch(),
+        db.links_index_tree(),
+        link_corpus_size(db),
+        postings_per_token_max,
+        query,
+    );
+    defer db.scratch().free(ranked);
+
+    const hits = try fetch_links(db, ranked, limit, buffer, site_rows);
+    assert(hits.len <= limit);
+    assert(hits.len <= ranked.len);
+    return hits;
 }
 
-fn linkCorpusSize(db: *Directory) u64 {
+fn link_corpus_size(db: *Directory) u64 {
     return db.links_pending_count.load(.monotonic) +
         db.links_approved_count.load(.monotonic) +
         db.links_rejected_count.load(.monotonic);
 }
 
-fn searchTreeByToken(
-    tree: *@import("zigstore").BPlusTree,
-    token: []const u8,
-    allocator: std.mem.Allocator,
-) ![]u64 {
-    return postingsForToken(tree, token, allocator, std.math.maxInt(usize));
-}
-
-pub fn postingsForToken(
-    tree: *@import("zigstore").BPlusTree,
+pub fn postings_for_token(
+    tree: *BPlusTree,
     token: []const u8,
     allocator: std.mem.Allocator,
     postings_cap: usize,
 ) ![]u64 {
-    const KEY_BUF_LEN: usize = inverted.MAX_TOKEN_LEN + 8;
-    if (token.len + 8 > KEY_BUF_LEN) return &[_]u64{};
+    assert(token.len >= inverted.MIN_TOKEN_LEN);
+    const key_buffer_len: usize = inverted.MAX_TOKEN_LEN + 8;
+    if (token.len + 8 > key_buffer_len) return &[_]u64{};
 
-    var key_lo_buf: [KEY_BUF_LEN]u8 = undefined;
-    var key_hi_buf: [KEY_BUF_LEN]u8 = undefined;
-    @memcpy(key_lo_buf[0..token.len], token);
-    @memset(key_lo_buf[token.len..][0..8], 0);
-    @memcpy(key_hi_buf[0..token.len], token);
-    @memset(key_hi_buf[token.len..][0..8], 0xFF);
+    var key_low_buffer: [key_buffer_len]u8 = undefined;
+    var key_high_buffer: [key_buffer_len]u8 = undefined;
+    @memcpy(key_low_buffer[0..token.len], token);
+    @memset(key_low_buffer[token.len..][0..8], 0);
+    @memcpy(key_high_buffer[0..token.len], token);
+    @memset(key_high_buffer[token.len..][0..8], 0xFF);
 
-    var iter = try tree.rangeScan(
-        key_lo_buf[0 .. token.len + 8],
-        key_hi_buf[0 .. token.len + 8],
+    var iterator = try tree.rangeScan(
+        key_low_buffer[0 .. token.len + 8],
+        key_high_buffer[0 .. token.len + 8],
     );
-    defer iter.deinit();
+    defer iterator.deinit();
 
     var ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer ids.deinit(allocator);
 
-    while (try iter.next()) |kv| {
-        if (kv.key.len != token.len + 8) continue;
-        if (!std.mem.eql(u8, kv.key[0..token.len], token)) break;
+    while (try iterator.next()) |entry| {
+        if (entry.key.len != token.len + 8) continue;
+        if (!std.mem.eql(u8, entry.key[0..token.len], token)) break;
         if (ids.items.len == postings_cap) return error.PostingsCapExceeded;
-        const id = codec.decodeU64(kv.key[token.len..][0..8]);
+        const id = codec.decodeU64(entry.key[token.len..][0..8]);
+        if (ids.items.len > 0) assert(id > ids.items[ids.items.len - 1]);
         try ids.append(allocator, id);
     }
 
+    assert(ids.items.len <= postings_cap);
     return try ids.toOwnedSlice(allocator);
 }
 
 const QueryTokens = struct {
-    bufs: [MAX_QUERY_TOKENS][inverted.MAX_TOKEN_LEN]u8 = undefined,
-    lens: [MAX_QUERY_TOKENS]usize = undefined,
-    count: usize = 0,
+    buffers: [query_tokens_max][inverted.MAX_TOKEN_LEN]u8 = undefined,
+    lengths: [query_tokens_max]u32 = undefined,
+    count: u32 = 0,
 
     fn init(query: []const u8) QueryTokens {
         var self: QueryTokens = .{};
-        var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-        var iter = inverted.TokenIterator.init(query);
-        while (self.count < MAX_QUERY_TOKENS) {
-            const tok = iter.next(&tok_buf) orelse break;
-            if (self.contains(tok)) continue;
-            @memcpy(self.bufs[self.count][0..tok.len], tok);
-            self.lens[self.count] = tok.len;
+        var token_buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+        var iterator = inverted.TokenIterator.init(query);
+        while (self.count < query_tokens_max) {
+            const token = iterator.next(&token_buffer) orelse break;
+            assert(token.len >= inverted.MIN_TOKEN_LEN);
+            assert(token.len <= inverted.MAX_TOKEN_LEN);
+            if (self.contains(token)) continue;
+            @memcpy(self.buffers[self.count][0..token.len], token);
+            self.lengths[self.count] = @intCast(token.len);
             self.count += 1;
         }
+        assert(self.count <= query_tokens_max);
         return self;
     }
 
     fn get(self: *const QueryTokens, i: usize) []const u8 {
-        return self.bufs[i][0..self.lens[i]];
+        assert(i < self.count);
+        assert(self.lengths[i] <= inverted.MAX_TOKEN_LEN);
+        return self.buffers[i][0..self.lengths[i]];
     }
 
-    fn contains(self: *const QueryTokens, tok: []const u8) bool {
+    fn contains(self: *const QueryTokens, token: []const u8) bool {
+        assert(self.count <= query_tokens_max);
         for (0..self.count) |i| {
-            if (std.mem.eql(u8, self.get(i), tok)) return true;
+            if (std.mem.eql(u8, self.get(i), token)) return true;
         }
         return false;
     }
 };
 
-const NOT_PLURALS = std.StaticStringMap(void).initComptime(.{ .{"news"}, .{"series"}, .{"species"}, .{"lens"}, .{"chess"}, .{"athletics"}, .{"physics"}, .{"mathematics"}, .{"economics"}, .{"politics"}, .{"ethics"}, .{"linguistics"}, .{"genetics"}, .{"graphics"}, .{"electronics"}, .{"aerobics"}, .{"gymnastics"}, .{"texas"}, .{"kansas"}, .{"paris"}, .{"wales"}, .{"jesus"}, .{"blues"}, .{"jeans"}, .{"glasses"} });
+const plural_exceptions = std.StaticStringMap(void).initComptime(.{
+    .{"news"},
+    .{"series"},
+    .{"species"},
+    .{"lens"},
+    .{"chess"},
+    .{"athletics"},
+    .{"physics"},
+    .{"mathematics"},
+    .{"economics"},
+    .{"politics"},
+    .{"ethics"},
+    .{"linguistics"},
+    .{"genetics"},
+    .{"graphics"},
+    .{"electronics"},
+    .{"aerobics"},
+    .{"gymnastics"},
+    .{"texas"},
+    .{"kansas"},
+    .{"paris"},
+    .{"wales"},
+    .{"jesus"},
+    .{"blues"},
+    .{"jeans"},
+    .{"glasses"},
+});
 
-fn isVowel(c: u8) bool {
+fn is_vowel(c: u8) bool {
+    assert(c >= 'a');
+    assert(c <= 'z');
     return c == 'a' or c == 'e' or c == 'i' or c == 'o' or c == 'u';
 }
 
-fn endsWith(token: []const u8, suffix: []const u8) bool {
+fn ends_with(token: []const u8, suffix: []const u8) bool {
+    assert(suffix.len > 0);
     return std.mem.endsWith(u8, token, suffix);
 }
 
-fn takesEs(stem: []const u8) bool {
-    return endsWith(stem, "s") or endsWith(stem, "x") or endsWith(stem, "z") or endsWith(stem, "ch") or endsWith(stem, "sh");
+fn takes_es(stem: []const u8) bool {
+    assert(stem.len > 0);
+    const sibilant = ends_with(stem, "s") or ends_with(stem, "x") or ends_with(stem, "z");
+    return sibilant or ends_with(stem, "ch") or ends_with(stem, "sh");
 }
 
-fn inflection(token: []const u8, buf: *[inverted.MAX_TOKEN_LEN]u8) ?[]const u8 {
-    if (token.len < 3 or NOT_PLURALS.has(token)) return null;
-    if (endsWith(token, "ss") or endsWith(token, "us") or endsWith(token, "is")) return null;
+// A token's variant is its other grammatical number, so a query in either spelling scores both
+// as one term; words that only look plural, and tokens with digits, have no variant.
+fn inflection(token: []const u8, buffer: *[inverted.MAX_TOKEN_LEN]u8) ?[]const u8 {
+    assert(token.len <= inverted.MAX_TOKEN_LEN);
+    if (token.len < 3 or plural_exceptions.has(token)) return null;
+    if (ends_with(token, "ss") or ends_with(token, "us") or ends_with(token, "is")) return null;
     for (token) |c| if (c < 'a' or c > 'z') return null;
 
-    if (endsWith(token, "ies") and token.len >= 5) return inflected(buf, token[0 .. token.len - 3], "y");
-    if (endsWith(token, "es") and token.len >= 5 and takesEs(token[0 .. token.len - 2])) return inflected(buf, token[0 .. token.len - 2], "");
-    if (endsWith(token, "s")) return inflected(buf, token[0 .. token.len - 1], "");
-    if (endsWith(token, "y") and !isVowel(token[token.len - 2])) return inflected(buf, token[0 .. token.len - 1], "ies");
-    if (takesEs(token)) return inflected(buf, token, "es");
-    return inflected(buf, token, "s");
+    const variant = inflection_variant(token, buffer);
+    if (variant) |changed| assert(!std.mem.eql(u8, changed, token));
+    return variant;
 }
 
-fn inflected(buf: *[inverted.MAX_TOKEN_LEN]u8, stem: []const u8, suffix: []const u8) ?[]const u8 {
-    if (stem.len + suffix.len > buf.len) return null;
-    @memcpy(buf[0..stem.len], stem);
-    @memcpy(buf[stem.len..][0..suffix.len], suffix);
-    return buf[0 .. stem.len + suffix.len];
+fn inflection_variant(token: []const u8, buffer: *[inverted.MAX_TOKEN_LEN]u8) ?[]const u8 {
+    assert(token.len >= 3);
+    assert(token.len <= inverted.MAX_TOKEN_LEN);
+    const plural_ies = token.len >= 5 and ends_with(token, "ies");
+    if (plural_ies) return inflected(buffer, token[0 .. token.len - 3], "y");
+    const plural_es = token.len >= 5 and ends_with(token, "es") and
+        takes_es(token[0 .. token.len - 2]);
+    if (plural_es) return inflected(buffer, token[0 .. token.len - 2], "");
+    if (ends_with(token, "s")) return inflected(buffer, token[0 .. token.len - 1], "");
+    if (ends_with(token, "y") and !is_vowel(token[token.len - 2])) {
+        return inflected(buffer, token[0 .. token.len - 1], "ies");
+    }
+    if (takes_es(token)) return inflected(buffer, token, "es");
+    return inflected(buffer, token, "s");
 }
 
-fn postingsForTerm(
-    tree: *@import("zigstore").BPlusTree,
+fn inflected(
+    buffer: *[inverted.MAX_TOKEN_LEN]u8,
+    stem: []const u8,
+    suffix: []const u8,
+) ?[]const u8 {
+    assert(stem.len >= inverted.MIN_TOKEN_LEN);
+    assert(suffix.len <= 3);
+    if (stem.len + suffix.len > buffer.len) return null;
+    @memcpy(buffer[0..stem.len], stem);
+    @memcpy(buffer[stem.len..][0..suffix.len], suffix);
+    return buffer[0 .. stem.len + suffix.len];
+}
+
+fn postings_for_term(
+    tree: *BPlusTree,
     token: []const u8,
     allocator: std.mem.Allocator,
     postings_cap: usize,
 ) ![]u64 {
+    assert(token.len >= inverted.MIN_TOKEN_LEN);
     var ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer ids.deinit(allocator);
 
-    var variant_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    const forms = [_]?[]const u8{ token, inflection(token, &variant_buf) };
+    var variant_buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    const forms = [_]?[]const u8{ token, inflection(token, &variant_buffer) };
     for (forms) |form| {
         const some = form orelse continue;
-        const found = postingsForToken(tree, some, allocator, postings_cap) catch |err| switch (err) {
+        const found = postings_for_token(
+            tree,
+            some,
+            allocator,
+            postings_cap,
+        ) catch |err| switch (err) {
             error.PostingsCapExceeded => continue,
             else => {
-                log.err("rankedIds: rangeScan failed for token='{s}': {}", .{ some, err });
+                log.err("ranked_ids: rangeScan failed for token='{s}': {}", .{ some, err });
                 return err;
             },
         };
@@ -222,22 +321,29 @@ fn postingsForTerm(
     var unique: usize = 0;
     for (ids.items) |id| {
         if (unique > 0 and ids.items[unique - 1] == id) continue;
+        if (unique > 0) assert(id > ids.items[unique - 1]);
         ids.items[unique] = id;
         unique += 1;
     }
+    assert(unique <= ids.items.len);
     ids.items.len = unique;
     return ids.toOwnedSlice(allocator);
 }
 
-fn inverseDocumentFrequency(corpus_size: u64, document_frequency: usize) f64 {
-    const df: f64 = @floatFromInt(document_frequency);
-    const n: f64 = @floatFromInt(@max(corpus_size, document_frequency));
-    return @log(1.0 + (n - df + 0.5) / (df + 0.5));
+// BM25's idf with the corpus floored at the document frequency, so a term is never worth less
+// than nothing and a stale corpus counter cannot flip a score negative.
+fn inverse_document_frequency(corpus_size: u64, document_frequency: usize) f64 {
+    const frequency: f64 = @floatFromInt(document_frequency);
+    const corpus: f64 = @floatFromInt(@max(corpus_size, document_frequency));
+    const idf = @log(1.0 + (corpus - frequency + 0.5) / (frequency + 0.5));
+    assert(idf > 0);
+    assert(std.math.isFinite(idf));
+    return idf;
 }
 
-fn rankedIds(
+fn ranked_ids(
     allocator: std.mem.Allocator,
-    tree: *@import("zigstore").BPlusTree,
+    tree: *BPlusTree,
     corpus_size: u64,
     postings_cap: usize,
     query: []const u8,
@@ -246,11 +352,12 @@ fn rankedIds(
     defer scores.deinit(allocator);
 
     const tokens = QueryTokens.init(query);
+    assert(tokens.count <= query_tokens_max);
     for (0..tokens.count) |i| {
-        const ids = try postingsForTerm(tree, tokens.get(i), allocator, postings_cap);
+        const ids = try postings_for_term(tree, tokens.get(i), allocator, postings_cap);
         defer allocator.free(ids);
 
-        const idf = inverseDocumentFrequency(corpus_size, ids.len);
+        const idf = inverse_document_frequency(corpus_size, ids.len);
         for (ids) |id| {
             const entry = try scores.getOrPutValue(allocator, id, 0);
             entry.value_ptr.* += idf;
@@ -258,86 +365,123 @@ fn rankedIds(
     }
 
     const ranked = try allocator.alloc(ScoredId, scores.count());
-    var it = scores.iterator();
-    var n: usize = 0;
-    while (it.next()) |entry| : (n += 1) {
-        ranked[n] = .{ .id = entry.key_ptr.*, .score = entry.value_ptr.* };
+    var iterator = scores.iterator();
+    var filled: usize = 0;
+    while (iterator.next()) |entry| : (filled += 1) {
+        ranked[filled] = .{ .id = entry.key_ptr.*, .score = entry.value_ptr.* };
     }
-    std.sort.pdq(ScoredId, ranked, {}, ScoredId.ranksBefore);
+    assert(filled == ranked.len);
+    std.sort.pdq(ScoredId, ranked, {}, ScoredId.ranks_before);
     return ranked;
 }
 
-fn fetchInRankOrder(
+fn fetch_in_rank_order(
     comptime T: type,
     db: *Directory,
     ranked: []const ScoredId,
     limit: u32,
-    buf: []T,
+    buffer: []T,
     comptime getter: fn (*Directory, u64) anyerror!?T,
 ) []T {
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
+    const max = @min(limit, @as(u32, @intCast(buffer.len)));
     var count: u32 = 0;
     for (ranked) |hit| {
         if (count >= max) break;
         if (getter(db, hit.id) catch null) |item| {
-            buf[count] = item;
+            buffer[count] = item;
             count += 1;
         }
     }
-    return buf[0..count];
+    assert(count <= max);
+    assert(count <= ranked.len);
+    return buffer[0..count];
 }
 
 pub const RowSite = struct {
-    key_buf: [sites.MAX_SITE_LEN]u8 = undefined,
+    key_buf: [sites.site_len_max]u8 = undefined,
     key_len: u8 = 0,
     more: u16 = 0,
 
     pub fn key(self: *const RowSite) []const u8 {
+        assert(self.key_len <= self.key_buf.len);
         return self.key_buf[0..self.key_len];
     }
 };
 
-const MAX_LINKS_PER_SITE: u8 = 2;
+const links_per_site_max: u8 = 2;
 
 const SiteTally = struct {
     shown: u8,
-    last_row: usize,
+    last_row: u32,
 };
 
-fn fetchLinks(db: *Directory, ranked: []const ScoredId, limit: u32, buf: []schema.Link, site_rows: ?[]RowSite) ![]schema.Link {
-    const rows = site_rows orelse return fetchInRankOrder(schema.Link, db, ranked, limit, buf, link_mod.getLink);
-    return fetchCappedPerSite(db, ranked, limit, buf, rows);
+fn fetch_links(
+    db: *Directory,
+    ranked: []const ScoredId,
+    limit: u32,
+    buffer: []schema.Link,
+    site_rows: ?[]RowSite,
+) ![]schema.Link {
+    const rows = site_rows orelse {
+        const hits = fetch_in_rank_order(
+            schema.Link,
+            db,
+            ranked,
+            limit,
+            buffer,
+            link_operations.get_link,
+        );
+        assert(hits.len <= limit);
+        return hits;
+    };
+    const hits = try fetch_capped_per_site(db, ranked, limit, buffer, rows);
+    assert(hits.len <= limit);
+    return hits;
 }
 
-fn fetchCappedPerSite(db: *Directory, ranked: []const ScoredId, limit: u32, buf: []schema.Link, rows: []RowSite) ![]schema.Link {
-    const max = @min(limit, buf.len, rows.len);
+fn fetch_capped_per_site(
+    db: *Directory,
+    ranked: []const ScoredId,
+    limit: u32,
+    buffer: []schema.Link,
+    rows: []RowSite,
+) ![]schema.Link {
+    const max = @min(limit, buffer.len, rows.len);
     var tallies: std.StringHashMapUnmanaged(SiteTally) = .empty;
-    defer tallies.deinit(db.allocator);
-    try tallies.ensureTotalCapacity(db.allocator, @intCast(max));
+    defer tallies.deinit(db.scratch());
+    try tallies.ensureTotalCapacity(db.scratch(), @intCast(max));
 
     var count: usize = 0;
     for (ranked) |hit| {
         if (count == max) break;
-        const link = (link_mod.getLink(db, hit.id) catch null) orelse continue;
+        const link = (link_operations.get_link(db, hit.id) catch null) orelse continue;
 
         const row = &rows[count];
         row.* = .{};
-        row.key_len = @intCast(sites.siteFor(link.url.slice(), &row.key_buf).key.len);
+        const site = sites.site_for(link.url.slice(), &row.key_buf);
+        assert(site.key.len <= sites.site_len_max);
+        row.key_len = @intCast(site.key.len);
 
         if (tallies.getPtr(row.key())) |tally| {
-            if (tally.shown >= MAX_LINKS_PER_SITE) {
+            if (tally.shown >= links_per_site_max) {
+                assert(tally.last_row < count);
                 rows[tally.last_row].more +|= 1;
                 continue;
             }
-            tally.* = .{ .shown = tally.shown + 1, .last_row = count };
+            tally.* = .{ .shown = tally.shown + 1, .last_row = @intCast(count) };
+            assert(tally.shown <= links_per_site_max);
         } else {
-            tallies.putAssumeCapacityNoClobber(row.key(), .{ .shown = 1, .last_row = count });
+            tallies.putAssumeCapacityNoClobber(
+                row.key(),
+                .{ .shown = 1, .last_row = @intCast(count) },
+            );
         }
 
-        buf[count] = link;
+        buffer[count] = link;
         count += 1;
     }
-    return buf[0..count];
+    assert(count <= max);
+    return buffer[0..count];
 }
 
 pub const HybridLinks = struct {
@@ -345,124 +489,200 @@ pub const HybridLinks = struct {
     vector_used: bool,
 };
 
-pub fn searchLinksHybrid(
+pub fn search_links_hybrid(
     db: *Directory,
     query: []const u8,
     model: u64,
     query_embedding: *const vector_index.Embedding,
     limit: u32,
-    buf: []schema.Link,
+    buffer: []schema.Link,
     site_rows: ?[]RowSite,
 ) !HybridLinks {
-    const keyword = try rankedIds(db.allocator, db.links_index_tree(), linkCorpusSize(db), MAX_POSTINGS_PER_TOKEN, query);
-    defer db.allocator.free(keyword);
-    const keyword_top = keyword[0..@min(keyword.len, HYBRID_CANDIDATES)];
+    const keyword = try ranked_ids(
+        db.scratch(),
+        db.links_index_tree(),
+        link_corpus_size(db),
+        postings_per_token_max,
+        query,
+    );
+    defer db.scratch().free(keyword);
+    const keyword_top = keyword[0..@min(keyword.len, hybrid_candidates)];
 
-    const quantized = if (vectorHalfUsable(db, model)) vector_index.quantize(query_embedding) else null;
-    const q = quantized orelse return .{
-        .links = try fetchLinks(db, keyword, limit, buf, site_rows),
+    const quantized = if (vector_half_usable(db, model))
+        vector_index.quantize(query_embedding)
+    else
+        null;
+    const query_quantized = quantized orelse return .{
+        .links = try fetch_links(db, keyword, limit, buffer, site_rows),
         .vector_used = false,
     };
 
     var unit = query_embedding.*;
-    vector_model.normalizeInPlace(&unit);
+    vector_model.normalize_in_place(&unit);
 
-    var shortlist_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
-    const shortlist = db.vectors.shortlist(db.io, &unit, &shortlist_buf);
-    var nearest_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
-    const nearest = try rerankExact(db, shortlist, &q, &nearest_buf);
+    var shortlist_buffer: [hybrid_candidates]ScoredId = undefined;
+    const shortlist = db.link_vector_index.shortlist(db.io, &unit, &shortlist_buffer);
+    assert(shortlist.len <= hybrid_candidates);
+    var nearest_buffer: [hybrid_candidates]ScoredId = undefined;
+    const nearest = try rerank_exact(db, shortlist, &query_quantized, &nearest_buffer);
+    assert(nearest.len <= shortlist.len);
 
-    var subtree_buf: [HYBRID_CANDIDATES]ScoredId = undefined;
-    const subtree = try subtreeCandidates(db, &unit, &q, &subtree_buf);
+    var subtree_buffer: [hybrid_candidates]ScoredId = undefined;
+    const subtree = try subtree_candidates(db, &unit, &query_quantized, &subtree_buffer);
+    assert(subtree.len <= hybrid_candidates);
 
-    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ keyword_top, nearest, subtree });
-    defer db.allocator.free(fused);
+    const fused = try ranking.reciprocal_rank_fusion(
+        db.scratch(),
+        &.{ keyword_top, nearest, subtree },
+    );
+    defer db.scratch().free(fused);
+    assert(fused.len <= keyword_top.len + nearest.len + subtree.len);
+
     return .{
-        .links = try fetchLinks(db, fused, limit, buf, site_rows),
+        .links = try fetch_links(db, fused, limit, buffer, site_rows),
         .vector_used = true,
     };
 }
 
-fn rerankExact(db: *Directory, shortlist: []const ScoredId, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
+fn rerank_exact(
+    db: *Directory,
+    shortlist: []const ScoredId,
+    query: *const vector_index.Quantized,
+    out: []ScoredId,
+) ![]ScoredId {
+    assert(query.scale > 0);
     var top = ranking.TopK.init(out);
     for (shortlist) |candidate| {
-        const stored = (try vector_ops.getLinkVector(db, candidate.id)) orelse continue;
-        top.offer(.{ .id = candidate.id, .score = vector_index.similarity(&stored, q) });
+        const stored = (try vector_ops.get_link_vector(db, candidate.id)) orelse continue;
+        top.offer(.{ .id = candidate.id, .score = vector_index.similarity(&stored, query) });
     }
-    return top.sorted();
+    const ranked = top.sorted();
+    assert(ranked.len <= out.len);
+    assert(ranked.len <= shortlist.len);
+    return ranked;
 }
 
-fn subtreeCandidates(db: *Directory, unit: *const vector_model.Float, q: *const vector_index.Quantized, out: []ScoredId) ![]ScoredId {
-    if (!db.cat_vectors.ready.load(.acquire) or !db.facts.ready.load(.acquire)) return out[0..0];
+fn subtree_candidates(
+    db: *Directory,
+    unit: *const vector_model.Float,
+    query: *const vector_index.Quantized,
+    out: []ScoredId,
+) ![]ScoredId {
+    if (!db.category_vector_index.ready.load(.acquire)) return out[0..0];
+    if (!db.facts.ready.load(.acquire)) return out[0..0];
 
-    var roots_buf: [CATEGORY_CANDIDATES]ScoredId = undefined;
-    const roots = db.cat_vectors.nearest(db.io, q, &roots_buf);
-    var root_ids: [CATEGORY_CANDIDATES]u64 = undefined;
+    var roots_buffer: [category_candidates]ScoredId = undefined;
+    const roots = db.category_vector_index.nearest(db.io, query, &roots_buffer);
+    assert(roots.len <= category_candidates);
+    var root_ids: [category_candidates]u64 = undefined;
     for (roots, root_ids[0..roots.len]) |root, *id| id.* = root.id;
 
-    const ids = try db.facts.subtreeLinkIds(db.io, db.allocator, root_ids[0..roots.len]);
-    defer db.allocator.free(ids);
-    return db.vectors.scoreIds(db.io, ids, unit, out);
+    const ids = try db.facts.subtree_link_ids(db.io, db.scratch(), root_ids[0..roots.len]);
+    defer db.scratch().free(ids);
+
+    const scored = db.link_vector_index.score_ids(db.io, ids, unit, out);
+    assert(scored.len <= out.len);
+    assert(scored.len <= ids.len);
+    return scored;
 }
 
-pub fn searchCategoriesHybrid(
+pub fn search_categories_hybrid(
     db: *Directory,
     query: []const u8,
     model: u64,
     query_embedding: *const vector_index.Embedding,
     limit: u32,
-    buf: []schema.Category,
+    buffer: []schema.Category,
 ) ![]schema.Category {
-    const ranked = try rankedIds(db.allocator, db.categories_index_tree(), db.next_category_id.load(.monotonic), MAX_POSTINGS_PER_TOKEN, query);
-    defer db.allocator.free(ranked);
+    const ranked = try ranked_ids(
+        db.scratch(),
+        db.categories_index_tree(),
+        db.next_category_id.load(.monotonic),
+        postings_per_token_max,
+        query,
+    );
+    defer db.scratch().free(ranked);
 
-    const quantized = if (categoryHalfUsable(db, model)) vector_index.quantize(query_embedding) else null;
-    const q = quantized orelse return fetchInRankOrder(schema.Category, db, ranked, limit, buf, category.getCategory);
+    const quantized = if (category_half_usable(db, model))
+        vector_index.quantize(query_embedding)
+    else
+        null;
+    const query_quantized = quantized orelse {
+        const hits = fetch_in_rank_order(
+            schema.Category,
+            db,
+            ranked,
+            limit,
+            buffer,
+            category.get_category,
+        );
+        assert(hits.len <= limit);
+        return hits;
+    };
 
-    var nearest_buf: [CATEGORY_NEAREST]ScoredId = undefined;
-    const nearest = db.cat_vectors.nearest(db.io, &q, &nearest_buf);
+    var nearest_buffer: [category_nearest]ScoredId = undefined;
+    const nearest = db.category_vector_index.nearest(db.io, &query_quantized, &nearest_buffer);
+    assert(nearest.len <= category_nearest);
 
-    const fused = try ranking.reciprocalRankFusion(db.allocator, &.{ ranked[0..@min(ranked.len, CATEGORY_NEAREST)], nearest });
-    defer db.allocator.free(fused);
-    return fetchInRankOrder(schema.Category, db, fused, limit, buf, category.getCategory);
+    const ranked_top = ranked[0..@min(ranked.len, category_nearest)];
+    const fused = try ranking.reciprocal_rank_fusion(db.scratch(), &.{ ranked_top, nearest });
+    defer db.scratch().free(fused);
+    assert(fused.len <= ranked_top.len + nearest.len);
+
+    const hits = fetch_in_rank_order(
+        schema.Category,
+        db,
+        fused,
+        limit,
+        buffer,
+        category.get_category,
+    );
+    assert(hits.len <= limit);
+    return hits;
 }
 
-fn vectorHalfUsable(db: *Directory, model: u64) bool {
+fn vector_half_usable(db: *Directory, model: u64) bool {
     return model != 0 and
-        db.vectors.ready.load(.acquire) and
-        db.vectors.model.load(.acquire) == model;
+        db.link_vector_index.ready.load(.acquire) and
+        db.link_vector_index.model.load(.acquire) == model;
 }
 
-fn categoryHalfUsable(db: *Directory, model: u64) bool {
+fn category_half_usable(db: *Directory, model: u64) bool {
     return model != 0 and
-        db.cat_vectors.ready.load(.acquire) and
-        db.cat_vectors.model.load(.acquire) == model;
+        db.category_vector_index.ready.load(.acquire) and
+        db.category_vector_index.model.load(.acquire) == model;
 }
 
-fn searchViaIndexTree(
+fn search_via_index_tree(
     comptime T: type,
     db: *Directory,
-    tree: *@import("zigstore").BPlusTree,
+    tree: *BPlusTree,
     query: []const u8,
     limit: u32,
-    buf: []T,
+    buffer: []T,
     comptime getter: fn (*Directory, u64) anyerror!?T,
 ) ![]T {
-    const max = @min(limit, @as(u32, @intCast(buf.len)));
-    if (max == 0) return buf[0..0];
+    const max = @min(limit, @as(u32, @intCast(buffer.len)));
+    if (max == 0) return buffer[0..0];
 
-    var tok_buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    var iter = inverted.TokenIterator.init(query);
+    var token_buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    var iterator = inverted.TokenIterator.init(query);
 
     var candidates_full: ?[]u64 = null;
     var candidates_len: usize = 0;
-    defer if (candidates_full) |c| db.allocator.free(c);
+    defer if (candidates_full) |candidates| db.scratch().free(candidates);
 
     var had_any_token = false;
-    while (iter.next(&tok_buf)) |tok| {
+    while (iterator.next(&token_buffer)) |token| {
         had_any_token = true;
-        const ids = searchTreeByToken(tree, tok, db.allocator) catch |err| {
-            log.err("searchViaIndexTree: rangeScan failed for token='{s}': {}", .{ tok, err });
+        assert(token.len <= inverted.MAX_TOKEN_LEN);
+        const ids = postings_for_token(
+            tree,
+            token,
+            db.scratch(),
+            std.math.maxInt(usize),
+        ) catch |err| {
+            log.err("search_via_index_tree: rangeScan failed for token='{s}': {}", .{ token, err });
             return err;
         };
 
@@ -471,282 +691,507 @@ fn searchViaIndexTree(
             candidates_len = ids.len;
             continue;
         }
-        defer db.allocator.free(ids);
+        defer db.scratch().free(ids);
 
-        const cur = candidates_full.?[0..candidates_len];
-        var write: usize = 0;
-        var i: usize = 0;
-        var j: usize = 0;
-        while (i < cur.len and j < ids.len) {
-            if (cur[i] == ids[j]) {
-                cur[write] = cur[i];
-                write += 1;
-                i += 1;
-                j += 1;
-            } else if (cur[i] < ids[j]) {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
-        candidates_len = write;
-
+        const current = candidates_full.?[0..candidates_len];
+        candidates_len = search_via_index_tree_intersect(current, ids);
         if (candidates_len == 0) break;
     }
-
-    if (!had_any_token or candidates_full == null) return buf[0..0];
+    if (!had_any_token) assert(candidates_full == null);
+    if (candidates_full) |candidates| assert(candidates_len <= candidates.len);
+    if (!had_any_token or candidates_full == null) return buffer[0..0];
 
     var count: u32 = 0;
     for (candidates_full.?[0..candidates_len]) |id| {
         if (count >= max) break;
         if (getter(db, id) catch null) |item| {
-            buf[count] = item;
+            buffer[count] = item;
             count += 1;
         }
     }
 
-    return buf[0..count];
+    assert(count <= max);
+    return buffer[0..count];
 }
 
+// Both lists ascend, so one pass keeps the ids they share, in place and still ascending.
+fn search_via_index_tree_intersect(current: []u64, ids: []const u64) usize {
+    var write: usize = 0;
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < current.len and j < ids.len) {
+        if (current[i] == ids[j]) {
+            current[write] = current[i];
+            write += 1;
+            i += 1;
+            j += 1;
+        } else if (current[i] < ids[j]) {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    assert(write <= current.len);
+    assert(write <= ids.len);
+    return write;
+}
+
+// Goal: a title word finds its link through the token index. Method: one link, one word.
 test "search: B+Tree-backed link search finds tokenised title" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const link_id = try link_mod.createLink(db, top_id, "https://example.com/c", "Cannabis Stuff", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const link_id = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/c", .title = "Cannabis Stuff", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinks(db, "cannabis", 8, &buf);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links(db, "cannabis", 8, &buffer);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(link_id, hits[0].id);
 }
 
+// Goal: a name word finds its category through the token index. Method: one category, one
+// word, then look for its id among the hits.
 test "search: B+Tree-backed category search finds tokenised name" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const cat_id = try category.createCategory(db, top_id, "Computers", "computers", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const category_id = try category.create_category(
+        db,
+        top_id,
+        .{ .name = "Computers", .slug = "computers", .description = "" },
+    );
 
-    var buf: [8]schema.Category = undefined;
-    const hits = try searchCategories(db, "computers", 8, &buf);
+    var buffer: [8]schema.Category = undefined;
+    const hits = try search_categories(db, "computers", 8, &buffer);
 
     var found = false;
-    for (hits) |c| if (c.id == cat_id) {
+    for (hits) |hit| if (hit.id == category_id) {
         found = true;
     };
     try std.testing.expect(found);
 }
 
+// Goal: every query token must match, so a link with only one of two tokens is left out.
+// Method: `alpha beta` against an `alpha beta` link and an `alpha only` link.
 test "search: multi-token query AND-intersects per-token posting lists" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const l1 = try link_mod.createLink(db, top_id, "https://example.com/1", "Alpha Beta", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/2", "Alpha Only", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const l1 = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/1", .title = "Alpha Beta", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/2", .title = "Alpha Only", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinks(db, "alpha beta", 8, &buf);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links(db, "alpha beta", 8, &buffer);
 
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(l1, hits[0].id);
 }
 
+// Goal: the intersection keeps the document holding both tokens and drops the one holding
+// just `foo`. Method: two links sharing `foo` and `test`, queried for `foo bar`.
 test "search: AND-of-tokens — \"foo bar\" excludes the foo-only doc" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const foo_bar_test = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const foo_bar_test = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/a", .title = "foo bar test", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/b", .title = "foo baz test", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinks(db, "foo bar", 8, &buf);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links(db, "foo bar", 8, &buffer);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(foo_bar_test, hits[0].id);
 }
 
+// Goal: a token shared by two links returns both, ascending by id. Method: two links, one
+// shared token.
 test "search: shared token \"test\" returns both docs in ascending id order" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const a = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
-    const b = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const a = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/a", .title = "foo bar test", .description = "" },
+    );
+    const b = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/b", .title = "foo baz test", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinks(db, "test", 8, &buf);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links(db, "test", 8, &buffer);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expect(hits[0].id < hits[1].id);
     try std.testing.expectEqual(a, hits[0].id);
     try std.testing.expectEqual(b, hits[1].id);
 }
 
+// Goal: a token nobody holds gives an empty result. Method: two links, a missing word.
 test "search: token absent from corpus returns empty result set" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/a", "foo bar test", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/b", "foo baz test", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/a", .title = "foo bar test", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/b", .title = "foo baz test", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinks(db, "nonexistent", 8, &buf);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links(db, "nonexistent", 8, &buffer);
     try std.testing.expectEqual(@as(usize, 0), hits.len);
 }
 
+// Goal: ranked search is an OR over terms where the exact search is an AND. Method: the same
+// `alpha gamma` query against both searches.
 test "ranked search: a query sharing only some terms still matches" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const alpha = try link_mod.createLink(db, top_id, "https://example.com/1", "Alpha Beta", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const alpha = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/1", .title = "Alpha Beta", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    try std.testing.expectEqual(@as(usize, 0), (try searchLinks(db, "alpha gamma", 8, &buf)).len);
+    var buffer: [8]schema.Link = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try search_links(db, "alpha gamma", 8, &buffer)).len,
+    );
 
-    const hits = try searchLinksRanked(db, "alpha gamma", 8, &buf, null);
+    const hits = try search_links_ranked(db, "alpha gamma", 8, &buffer, null);
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqual(alpha, hits[0].id);
 }
 
+// Goal: a link matching both terms outranks one matching the rarer term, which outranks the
+// common term. Method: three `garden` links, one `bonsai`, one with both.
 test "ranked search: more matched terms rank first, then rarer terms" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const common_only = try link_mod.createLink(db, top_id, "https://example.com/1", "garden", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/2", "garden", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/3", "garden", "");
-    const rare_only = try link_mod.createLink(db, top_id, "https://example.com/4", "bonsai", "");
-    const both = try link_mod.createLink(db, top_id, "https://example.com/5", "garden bonsai", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const common_only = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/1", .title = "garden", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/2", .title = "garden", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/3", .title = "garden", .description = "" },
+    );
+    const rare_only = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/4", .title = "bonsai", .description = "" },
+    );
+    const both = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/5", .title = "garden bonsai", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinksRanked(db, "bonsai garden", 8, &buf, null);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links_ranked(db, "bonsai garden", 8, &buffer, null);
     try std.testing.expectEqual(@as(usize, 5), hits.len);
     try std.testing.expectEqual(both, hits[0].id);
     try std.testing.expectEqual(rare_only, hits[1].id);
     try std.testing.expectEqual(common_only, hits[2].id);
 }
 
+// Goal: equal scores order by id and the buffer caps the page. Method: three identical
+// `orchid` links into a buffer of two.
 test "ranked search: equal scores break ties on ascending id" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const first = try link_mod.createLink(db, top_id, "https://example.com/1", "orchid", "");
-    const second = try link_mod.createLink(db, top_id, "https://example.com/2", "orchid", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/3", "orchid", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const first = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/1", .title = "orchid", .description = "" },
+    );
+    const second = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/2", .title = "orchid", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/3", .title = "orchid", .description = "" },
+    );
 
-    var buf: [2]schema.Link = undefined;
-    const hits = try searchLinksRanked(db, "orchid", 8, &buf, null);
+    var buffer: [2]schema.Link = undefined;
+    const hits = try search_links_ranked(db, "orchid", 8, &buffer, null);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(first, hits[0].id);
     try std.testing.expectEqual(second, hits[1].id);
 }
 
+// Goal: repeating a term in the query does not weight it. Method: `orchid` three times plus
+// `fern`, then both links with orchid first.
 test "ranked search: repeated query terms count once" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const orchid = try link_mod.createLink(db, top_id, "https://example.com/1", "orchid", "");
-    const fern = try link_mod.createLink(db, top_id, "https://example.com/2", "fern", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const orchid = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/1", .title = "orchid", .description = "" },
+    );
+    const fern = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/2", .title = "fern", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
-    const hits = try searchLinksRanked(db, "orchid orchid orchid fern", 8, &buf, null);
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links_ranked(db, "orchid orchid orchid fern", 8, &buffer, null);
     try std.testing.expectEqual(@as(usize, 2), hits.len);
     try std.testing.expectEqual(orchid, hits[0].id);
     try std.testing.expectEqual(fern, hits[1].id);
 }
 
+// Goal: a term whose postings exceed the cap is skipped instead of truncated, so only the
+// rare term scores. Method: cap of two against a token held by three links.
 test "ranked search: a token past the postings cap contributes nothing" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/1", "www", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/2", "www", "");
-    const rare = try link_mod.createLink(db, top_id, "https://example.com/3", "www bonsai", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/1", .title = "www", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/2", .title = "www", .description = "" },
+    );
+    const rare = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/3", .title = "www bonsai", .description = "" },
+    );
 
-    const ranked = try rankedIds(allocator, db.links_index_tree(), linkCorpusSize(db), 2, "www bonsai");
+    const ranked = try ranked_ids(
+        allocator,
+        db.links_index_tree(),
+        link_corpus_size(db),
+        2,
+        "www bonsai",
+    );
     defer allocator.free(ranked);
     try std.testing.expectEqual(@as(usize, 1), ranked.len);
     try std.testing.expectEqual(rare, ranked[0].id);
 }
 
+// Goal: the category variant ranks by matched terms too. Method: a `gardening` and a
+// `gardening bonsai` category, queried for three words.
 test "ranked search: categories rank by matched terms" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    _ = try category.createCategory(db, top_id, "Gardening", "gardening", "");
-    const both = try category.createCategory(db, top_id, "Gardening Bonsai", "gardening-bonsai", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try category.create_category(
+        db,
+        top_id,
+        .{ .name = "Gardening", .slug = "gardening", .description = "" },
+    );
+    const both = try category.create_category(
+        db,
+        top_id,
+        .{ .name = "Gardening Bonsai", .slug = "gardening-bonsai", .description = "" },
+    );
 
-    var buf: [8]schema.Category = undefined;
-    const hits = try searchCategoriesRanked(db, "bonsai gardening tools", 8, &buf);
+    var buffer: [8]schema.Category = undefined;
+    const hits = try search_categories_ranked(db, "bonsai gardening tools", 8, &buffer);
     try std.testing.expect(hits.len >= 2);
     try std.testing.expectEqual(both, hits[0].id);
 }
 
-test "ranked search: the per-site cap keeps two links a site, folds a domain's hosts together and counts the rest on its last row" {
+// Goal: at most two links per site are shown, the hosts of one domain fold into one site and
+// the overflow is counted on that site's last row, while hosted member pages stay separate
+// sites. Method: four example.com links over three hosts and two tripod member pages.
+test "ranked search caps the links shown per site" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var db = try Directory.openTestInstance(allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top_id = try category.createCategory(db, 0, "Top", "top", "");
-    const first = try link_mod.createLink(db, top_id, "https://www.example.com/a", "Bonsai A", "");
-    const second = try link_mod.createLink(db, top_id, "https://shop.example.com/b", "Bonsai B", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/c", "Bonsai C", "");
-    _ = try link_mod.createLink(db, top_id, "https://example.com/d", "Bonsai D", "");
-    const ada = try link_mod.createLink(db, top_id, "http://members.tripod.com/~ada/", "Bonsai Ada", "");
-    const bob = try link_mod.createLink(db, top_id, "http://members.tripod.com/~bob/", "Bonsai Bob", "");
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const first = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://www.example.com/a", .title = "Bonsai A", .description = "" },
+    );
+    const second = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://shop.example.com/b", .title = "Bonsai B", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/c", .title = "Bonsai C", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.com/d", .title = "Bonsai D", .description = "" },
+    );
+    const ada = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "http://members.tripod.com/~ada/", .title = "Bonsai Ada", .description = "" },
+    );
+    const bob = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "http://members.tripod.com/~bob/", .title = "Bonsai Bob", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
+    var buffer: [8]schema.Link = undefined;
     var rows: [8]RowSite = undefined;
-    const hits = try searchLinksRanked(db, "bonsai", 8, &buf, &rows);
+    const hits = try search_links_ranked(db, "bonsai", 8, &buffer, &rows);
 
     try std.testing.expectEqual(@as(usize, 4), hits.len);
-    for ([_]u64{ first, second, ada, bob }, hits) |expected, hit| try std.testing.expectEqual(expected, hit.id);
+    for (
+        [_]u64{ first, second, ada, bob },
+        hits,
+    ) |expected, hit| try std.testing.expectEqual(expected, hit.id);
 
     try std.testing.expectEqualStrings("example.com", rows[1].key());
     try std.testing.expectEqual(@as(u16, 2), rows[1].more);
@@ -756,8 +1201,10 @@ test "ranked search: the per-site cap keeps two links a site, folds a domain's h
     try std.testing.expectEqual(@as(u16, 0), rows[3].more);
 }
 
+// Goal: the inflection rules map a word to its other number and leave the exceptions alone.
+// Method: a table of tokens and their expected variants.
 test "inflection pairs a word with its plural or singular and leaves non-plural s-words alone" {
-    var buf: [inverted.MAX_TOKEN_LEN]u8 = undefined;
+    var buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
     const cases = [_]struct { token: []const u8, variant: ?[]const u8 }{
         .{ .token = "biography", .variant = "biographies" },
         .{ .token = "biographies", .variant = "biography" },
@@ -771,31 +1218,49 @@ test "inflection pairs a word with its plural or singular and leaves non-plural 
         .{ .token = "day", .variant = "days" },
     };
     for (cases) |case| {
-        try std.testing.expectEqualDeep(case.variant, inflection(case.token, &buf));
+        try std.testing.expectEqualDeep(case.variant, inflection(case.token, &buffer));
     }
 }
 
+// Goal: a query in either number finds links in both numbers as one term, and an exception
+// such as `news` is not inflected. Method: `biography` and `biographies` links, both queries.
 test "ranked search scores a word and its plural as one term, so either spelling finds both links" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const db = try Directory.openTestInstance(std.testing.allocator, &tmp);
-    defer db.deinitTestInstance();
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    const db = try Directory.open_test_instance(std.testing.allocator, &temporary_directory);
+    defer db.deinit_test_instance();
 
-    const top = try category.createCategory(db, 0, "Top", "top", "");
-    const singular = try link_mod.createLink(db, top, "https://one.example", "Keats biography", "");
-    const plural = try link_mod.createLink(db, top, "https://two.example", "Famous biographies", "");
-    const other = try link_mod.createLink(db, top, "https://three.example", "New arrivals", "");
+    const top = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const singular = try link_operations.create_link(
+        db,
+        top,
+        .{ .url = "https://one.example", .title = "Keats biography", .description = "" },
+    );
+    const plural = try link_operations.create_link(
+        db,
+        top,
+        .{ .url = "https://two.example", .title = "Famous biographies", .description = "" },
+    );
+    const other = try link_operations.create_link(
+        db,
+        top,
+        .{ .url = "https://three.example", .title = "New arrivals", .description = "" },
+    );
 
-    var buf: [8]schema.Link = undefined;
+    var buffer: [8]schema.Link = undefined;
     for ([_][]const u8{ "biography", "biographies" }) |query| {
-        const found = try searchLinksRanked(db, query, 8, &buf, null);
+        const found = try search_links_ranked(db, query, 8, &buffer, null);
         try std.testing.expectEqual(@as(usize, 2), found.len);
         const ids = [_]u64{ found[0].id, found[1].id };
         try std.testing.expect(std.mem.indexOfScalar(u64, &ids, singular) != null);
         try std.testing.expect(std.mem.indexOfScalar(u64, &ids, plural) != null);
     }
 
-    const news = try searchLinksRanked(db, "news", 8, &buf, null);
+    const news = try search_links_ranked(db, "news", 8, &buffer, null);
     try std.testing.expectEqual(@as(usize, 0), news.len);
     _ = other;
 }

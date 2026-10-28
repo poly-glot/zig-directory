@@ -283,6 +283,7 @@ are read by `zigstore.ServerConfig.fromEnv("DMOZDB_")`; the rest by `src/main.zi
 | `DMOZDB_REPAIR_WORKER_INTERVAL_MS`        | u32    | `1000`            | Repair-worker tick interval (ms)                                            |
 | `DMOZDB_REPAIR_WORKER_CHUNK_SIZE`         | u32    | `10000`           | Descendants processed per worker chunk                                      |
 | `DMOZDB_VERIFIER_INTERVAL_S`              | u32    | `300`             | Seconds between background verifier runs                                    |
+| `DMOZDB_SCRATCH_SLAB_MB`                  | u32    | `32`              | Request scratch slab per reactor thread, MiB (1–1024); a request that outgrows it fails |
 
 ---
 
@@ -770,7 +771,7 @@ namespace itself on every run.
 ```
 zig-directory/
 ├── src/
-│   ├── main.zig                          Entry point, Config.fromEnv, test root
+│   ├── main.zig                          Entry point, Config.from_env, test root
 │   ├── directory.zig                     zigstore.schema literal, Directory (commit, recover, workers, shutdown)
 │   ├── schema.zig                        Category, Link, RepairTask extern structs, composite keys
 │   ├── binary_protocol.zig               Op / Status / SubStatus enums, dispatch, one handler per op
@@ -916,7 +917,7 @@ A **rename or move of a non-leaf category** invalidates every descendant's store
 
 **Above threshold (queued).** The ChangeSet carries an `EnqueueOnApply` payload with a fresh `repair_seq`. Apply writes a `RepairTask` record (2,080 bytes: `cat_id`, op, timestamp, old slug prefix) to `slug_path_repair_queue` keyed by big-endian seq. The renamed cat itself is updated atomically; its descendants stay stale until the worker drains them.
 
-**Repair worker (`src/repair/repair_worker.zig`).** Started by `Directory.startBackgroundThreads()`. Each tick (`DMOZDB_REPAIR_WORKER_INTERVAL_MS`, default 1 s) it pops the min-key task, walks the cat's descendants via `cat_by_parent`, and emits chunked `slug_path_repair_chunk` ChangeSets (`DMOZDB_REPAIR_WORKER_CHUNK_SIZE` descendants per chunk, default 10000) until the walk completes. Each chunk is its own `db.commit()`, so progress is WAL-durable. After the final chunk, a `slug_path_repair_complete` removes the queue entry. Crash mid-walk is idempotent: the queue entry survives until the final commit, and chunk emission checks the old path still exists before scheduling a swap.
+**Repair worker (`src/repair/repair_worker.zig`).** Started by `Directory.start_background_threads()`. Each tick (`DMOZDB_REPAIR_WORKER_INTERVAL_MS`, default 1 s) it pops the min-key task, walks the cat's descendants via `cat_by_parent`, and emits chunked `slug_path_repair_chunk` ChangeSets (`DMOZDB_REPAIR_WORKER_CHUNK_SIZE` descendants per chunk, default 10000) until the walk completes. Each chunk is its own `db.commit()`, so progress is WAL-durable. After the final chunk, a `slug_path_repair_complete` removes the queue entry. Crash mid-walk is idempotent: the queue entry survives until the final commit, and chunk emission checks the old path still exists before scheduling a swap.
 
 **Read-side validation.** `resolveSlugPath` short-circuits when `slug_path_repair_queue.entry_count == 0`, so there is no extra cost in steady state. When the queue is non-empty, every resolve walks the resolved cat's parent chain and confirms its current canonical path matches the query; mismatch returns `not_found`. Stale paths are hidden from clients during the window, never returning a wrong cat_id.
 
@@ -1027,7 +1028,7 @@ so "web design" stays words. Each target shows as a chip that removes it, the wo
 link, and when nothing matches the page offers the count with each target dropped. `site:`, `country:`, `in:`,
 `religion:` and `name:` state a target outright and are what the chips link to.
 
-**Materialisation.** The first `limit` (at most 50) IDs are hydrated via `getLink` / `getCategory` (memtable → primary B+Tree). Documents that no longer exist (deleted between indexing and search) are silently skipped. Each link row carries a `match_field` byte telling the client whether the title, URL or description matched, or that only the vector half found it.
+**Materialisation.** The first `limit` (at most 50) IDs are hydrated via `get_link` / `get_category` (memtable → primary B+Tree). Documents that no longer exist (deleted between indexing and search) are silently skipped. Each link row carries a `match_field` byte telling the client whether the title, URL or description matched, or that only the vector half found it.
 
 **What the search does not do.** No term frequency or document length (IDF over binary postings measured within noise of BM25 on this corpus), no field boosting, no phrase queries or fuzzy matching. Non-ASCII characters are not lowercased; a search for "blüm" will not match a document containing "Blüm" because the tokeniser only handles ASCII case folding.
 
@@ -1291,8 +1292,19 @@ To extend an existing op without breaking older callers, append optional trailin
 
 ### Code Style
 
-- Run `zig fmt src/ bench/` before committing
-- No comments in `.zig` files; the "why" lives in test names (see `.claude/rules/zig.md`)
+All Zig follows [TigerStyle](https://tigerstyle.dev); the repo's rule file is `.claude/rules/zig.md`
+and `src/tidy.zig` enforces the mechanical part inside `zig build test` (also runnable alone with
+`zig test src/tidy.zig`).
+
+- `snake_case` functions, variables, files and constants with the qualifier last (`subtree_offset_max`);
+  `PascalCase` types; a type-returning function ends in `Type`
+- Assert arguments, return values and invariants (`const assert = std.debug.assert;`), two per
+  function on average; bytes from the network, the WAL or the disk are validated with errors, never asserted
+- Every loop has a declared bound, no recursion, no `while (true)`; `u32`/`u64` for domain values,
+  `usize` only at the slice boundary
+- Functions at most 70 lines, lines at most 100 columns, `zig fmt` clean
+- Memory is allocated at startup; the request path works in preallocated buffers
+- Comments say why (and tests say how); they are sentences with a capital letter and a full stop
 - Use `std.log.scoped(.module_name)` for logging (not `std.debug.print`)
 - Use `comptime` assertions to validate struct sizes and alignment
 - Prefix padding/reserved fields with `_`

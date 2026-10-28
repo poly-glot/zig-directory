@@ -1,4 +1,9 @@
+//! Fixtures for tests that write schema rows straight into trees and memtables: builders for a
+//! category and a link, a presence probe that honours tombstones, and a token-index key packer.
+//! Every builder refuses a field that would be silently truncated by the fixed-width codec.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const zigstore = @import("zigstore");
 const codec = zigstore.codec;
 const schema = @import("schema.zig");
@@ -13,16 +18,19 @@ pub const CategoryFields = struct {
     updated_at: i64 = 1000,
 };
 
-pub fn category(f: CategoryFields) schema.Category {
+pub fn category(fields: CategoryFields) schema.Category {
+    assert(fields.name.len <= 64);
+    assert(fields.slug.len <= 128);
+    assert(fields.description.len <= 1024);
     return .{
-        .id = f.id,
-        .parent_id = f.parent_id,
-        .name = codec.FixedString(64).fromSlice(f.name),
-        .slug = codec.FixedString(128).fromSlice(f.slug),
-        .description = codec.FixedString(1024).fromSlice(f.description),
-        .child_count = f.child_count,
+        .id = fields.id,
+        .parent_id = fields.parent_id,
+        .name = codec.FixedString(64).fromSlice(fields.name),
+        .slug = codec.FixedString(128).fromSlice(fields.slug),
+        .description = codec.FixedString(1024).fromSlice(fields.description),
+        .child_count = fields.child_count,
         .created_at = 1000,
-        .updated_at = f.updated_at,
+        .updated_at = fields.updated_at,
     };
 }
 
@@ -35,30 +43,39 @@ pub const LinkFields = struct {
     updated_at: i64 = 1000,
 };
 
-pub fn link(f: LinkFields) schema.Link {
+pub fn link(fields: LinkFields) schema.Link {
+    assert(fields.url.len <= 64);
+    assert(fields.title.len <= 128);
+    assert(fields.description.len <= 256);
     return .{
-        .id = f.id,
-        .category_id = f.category_id,
-        .url = codec.FixedString(64).fromSlice(f.url),
-        .title = codec.FixedString(128).fromSlice(f.title),
-        .description = codec.FixedString(256).fromSlice(f.description),
+        .id = fields.id,
+        .category_id = fields.category_id,
+        .url = codec.FixedString(64).fromSlice(fields.url),
+        .title = codec.FixedString(128).fromSlice(fields.title),
+        .description = codec.FixedString(256).fromSlice(fields.description),
         .created_at = 1000,
-        .updated_at = f.updated_at,
+        .updated_at = fields.updated_at,
     };
 }
 
-pub fn isPresent(mt: *zigstore.MemTable, tree: *zigstore.BPlusTree, key: []const u8) !bool {
-    var v_buf: [64]u8 = undefined;
-    return switch (mt.get(key)) {
+pub fn is_present(
+    memtable: *zigstore.MemTable,
+    tree: *zigstore.BPlusTree,
+    key: []const u8,
+) !bool {
+    assert(key.len > 0);
+    var value_buffer: [64]u8 = undefined;
+    return switch (memtable.get(key)) {
         .found => true,
         .deleted => false,
-        .not_found => (try tree.search(key, &v_buf)) != null,
+        .not_found => (try tree.search(key, &value_buffer)) != null,
     };
 }
 
-pub fn tokenKey(buf: *[32]u8, text: []const u8, id: u64) []const u8 {
-    @memcpy(buf[0..text.len], text);
-    const id_be = codec.encodeU64(id);
-    @memcpy(buf[text.len..][0..8], &id_be);
-    return buf[0 .. text.len + 8];
+pub fn token_key(buffer: *[32]u8, text: []const u8, id: u64) []const u8 {
+    assert(text.len + @sizeOf(u64) <= buffer.len);
+    @memcpy(buffer[0..text.len], text);
+    const id_big_endian = codec.encodeU64(id);
+    @memcpy(buffer[text.len..][0..8], &id_big_endian);
+    return buffer[0 .. text.len + 8];
 }

@@ -16,7 +16,7 @@ description: Review the current branch's diff against the base for this repo (Zi
 
 Run the scoped checks so the reviewer isn't reviewing broken code:
 
-- if any `src/**/*.zig` or `build.zig` changed in range: `zig build test`
+- if any `src/**/*.zig`, `bench/**/*.zig` or `build.zig` changed in range: `zig build test` (includes `src/tidy.zig`, the TigerStyle checker; on this Mac the full suite needs the Docker gate, while `~/Library/zig/0.16.0/zig test src/tidy.zig` runs the style part alone)
 - if any `web/**` source changed: `cd web && deno task check`
 
 Report failures up front; a red gate is itself a Request-changes.

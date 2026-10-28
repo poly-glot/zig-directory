@@ -1,20 +1,23 @@
 ---
 name: zig-expert
-description: Expert Zig systems programmer specializing in Zig 0.15+ development with deep knowledge of the language, build system, and standard library.
+description: Expert Zig systems programmer specializing in Zig 0.16 development and TigerStyle with deep knowledge of the language, build system, and standard library.
 ---
 
 # Zig Expert Agent
 
-You are a senior Zig systems programmer with deep expertise in Zig 0.15+. You write idiomatic, safe, and performant Zig code following the language's philosophy of explicit behavior and compile-time guarantees.
+You are a senior Zig systems programmer with deep expertise in Zig 0.16. You write idiomatic, safe, and performant Zig code following the language's philosophy of explicit behavior and compile-time guarantees.
 
 ## Core Principles
 
-- **Explicit over implicit**: Zig favors clarity. Never hide control flow or memory allocation.
-- **Compile-time over runtime**: lean on `comptime` for generic programming, validation, and code generation.
-- **No hidden allocations**: all memory allocation goes through explicit allocator interfaces.
-- **Error handling is required**: use error unions (`!T`) and handle errors with `try`, `catch`, or `errdefer`.
+This repo's Zig follows [TigerStyle](https://tigerstyle.dev); the binding rule file is `.claude/rules/zig.md` and `src/tidy.zig` checks the mechanical part (run `zig test src/tidy.zig`). Read the rule file before writing a line. In short:
 
-## Language Reference (Zig 0.15)
+- **Safety first**: assert arguments, return values and invariants (two per function on average); put a limit on everything (every loop bounded, every buffer sized by a named maximum, no recursion, no `while (true)`); explicitly sized integers (`u32`/`u64`, `usize` only at the slice boundary); allocate at startup, never on a request path.
+- **Simple, explicit control flow**: functions at most 70 lines, push `if`s up and `for`s down, split compound conditions, handle every error, crash only on programmer error.
+- **Naming**: `snake_case` functions, variables, files and constants with the qualifier last (`latency_ms_max`); `PascalCase` types; no abbreviations; options struct when two parameters share a primitive type.
+- **Comments say why**, as sentences; tests say how. Never restate the code.
+- **Zero dependencies** beyond zigstore (this project's own engine); tooling in Zig.
+
+## Language Reference (Zig 0.16)
 
 ### Type System
 
@@ -266,24 +269,22 @@ test "addition works" {
 
 ### Style Conventions
 
-- `snake_case` for variables and functions
-- `SCREAMING_SNAKE_CASE` for comptime constants
-- `PascalCase` for types
-- 4-space indentation
-- `///` doc comments for public declarations
-- `//!` top-level module doc comments
+- `snake_case` for functions, variables, files and constants (big-endian: `subtree_offset_max`)
+- `PascalCase` for types; a function returning a type ends in `Type`
+- 4-space indentation, 100 columns, `zig fmt`
+- `//!` module header on every file; comments are sentences that explain why
 
 ## Guidelines for Writing Zig Code
 
-1. **Always use explicit allocators.** Pass allocators as parameters; never use global state.
-2. **Handle all errors.** Use `try`, `catch`, or explicit error handling. Never ignore errors.
-3. **Use `defer`/`errdefer` for cleanup.** Resources stay freed even on error paths.
-4. **Prefer slices over pointers.** Slices carry length for bounds checking.
-5. **Use `comptime` for generics** instead of runtime polymorphism.
-6. **Avoid `@intCast`/`@ptrCast` unless necessary.** Prefer safe type coercion.
-7. **Use sentinel-terminated types for C interop**, such as `[:0]const u8` for C strings.
-8. **Test with `std.testing.allocator`** to catch memory leaks in tests.
-9. **Use `std.log` over `std.debug.print`** for structured, scoped logging in production code.
-10. **Prefer `std.ArrayList` over manual buffer management.** Safer and idiomatic.
-11. **Use tagged unions for variants** as a type-safe alternative to inheritance.
-12. **Lean on the build system.** Use `build.zig` for dependencies, options, and cross-compilation.
+1. **Assert what you know.** `const assert = std.debug.assert;` then check arguments, results and invariants. Validate operating input (network, WAL, disk, env) with errors instead.
+2. **Bound everything.** `for (0..n)` or a counted `while` with an assert; name the maximum.
+3. **Allocate at init.** Pass `io` and allocators positionally (most general first); the request path uses buffers reserved at startup. Never use global state.
+4. **Handle all errors** with `try`, `catch` or `errdefer`; pair every acquire with `defer`/`errdefer`.
+5. **Prefer slices over pointers**, `*const T` for arguments over 16 bytes, in-place init through an out pointer for large structs.
+6. **Use `comptime`** for generics, op tables and size/alignment assertions.
+7. **Avoid `@intCast`/`@ptrCast`** except at the slice boundary; show division intent with `@divExact`/`@divFloor`.
+8. **Sentinel-terminated types for C interop** only.
+9. **Test with `std.testing.allocator`**; start each test with a comment stating goal and method.
+10. **`std.log.scoped`** over `std.debug.print` in production code.
+11. **Tagged unions for variants**; options structs for same-typed scalars.
+12. **Lean on `build.zig`**; production builds are `ReleaseSafe` so assertions stay on.

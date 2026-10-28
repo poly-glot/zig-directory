@@ -1,8 +1,14 @@
+//! The ChangeSet is the unit of durability: every mutation is computed first, written to the
+//! WAL as one record, then applied. The wire layout is a schema version byte, an Op byte and
+//! the effect struct encoded field by field by wire_codec, so decode can route on the tag.
+
 const std = @import("std");
+const assert = std.debug.assert;
 const codec = @import("zigstore").codec;
 const wire_codec = @import("zigstore").wire_codec;
 const schema = @import("schema.zig");
 const test_support = @import("test_support.zig");
+
 pub const Op = enum(u8) {
     link_inserted = 1,
     link_deleted = 2,
@@ -162,9 +168,9 @@ pub const ChangeSet = union(Op) {
     slug_path_repair_complete: RepairTaskCompleteEffect,
 };
 
-pub const SCHEMA_VERSION: u8 = 1;
+pub const schema_version: u8 = 1;
 
-pub const CHANGESET_OP: u8 = 100;
+pub const changeset_op: u8 = 100;
 
 pub const DecodeError = error{
     BufferTooShort,
@@ -173,44 +179,56 @@ pub const DecodeError = error{
     OutOfMemory,
 };
 
-pub fn encode(allocator: std.mem.Allocator, cs: ChangeSet) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+pub fn encode(allocator: std.mem.Allocator, change_set: ChangeSet) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
 
-    try buf.append(allocator, SCHEMA_VERSION);
-    try buf.append(allocator, @intFromEnum(std.meta.activeTag(cs)));
+    try buffer.append(allocator, schema_version);
+    try buffer.append(allocator, @intFromEnum(std.meta.activeTag(change_set)));
 
-    switch (cs) {
-        inline else => |effect| try wire_codec.encodeStruct(allocator, &buf, effect),
+    switch (change_set) {
+        inline else => |effect| try wire_codec.encodeStruct(allocator, &buffer, effect),
     }
 
-    return try buf.toOwnedSlice(allocator);
+    assert(buffer.items.len >= 2);
+    assert(buffer.items[0] == schema_version);
+    assert(buffer.items[1] == @intFromEnum(std.meta.activeTag(change_set)));
+    return try buffer.toOwnedSlice(allocator);
 }
 
 pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
     if (bytes.len < 2) return DecodeError.BufferTooShort;
-    if (bytes[0] != SCHEMA_VERSION) return DecodeError.UnsupportedSchemaVersion;
+    if (bytes[0] != schema_version) return DecodeError.UnsupportedSchemaVersion;
     const tag = std.enums.fromInt(Op, bytes[1]) orelse return DecodeError.UnknownOpTag;
 
-    var cur: usize = 2;
+    var cursor: usize = 2;
     switch (tag) {
         inline else => |op| {
-            const variant = try wire_codec.decodeStruct(arena, @FieldType(ChangeSet, @tagName(op)), bytes, &cur);
+            const variant = try wire_codec.decodeStruct(
+                arena,
+                @FieldType(ChangeSet, @tagName(op)),
+                bytes,
+                &cursor,
+            );
+            assert(cursor >= 2);
+            assert(cursor <= bytes.len);
             return @unionInit(ChangeSet, @tagName(op), variant);
         },
     }
 }
 
+// The union's active tag is the Op byte encode writes, which is what decode routes on.
 test "ChangeSet variant tags match Op enum" {
-    const cs = ChangeSet{ .link_inserted = undefined };
-    try std.testing.expectEqual(Op.link_inserted, std.meta.activeTag(cs));
+    const change_set = ChangeSet{ .link_inserted = undefined };
+    try std.testing.expectEqual(Op.link_inserted, std.meta.activeTag(change_set));
 }
 
+// Round-trip a link insert with two ancestors and two tokens through encode and decode.
 test "encode/decode roundtrip — link_inserted" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const arena_alloc = arena.allocator();
+    const arena_allocator = arena.allocator();
 
     const link = test_support.link(.{
         .id = 42,
@@ -219,21 +237,21 @@ test "encode/decode roundtrip — link_inserted" {
         .title = "Example",
         .description = "desc",
     });
-    const ancestors = try arena_alloc.dupe(AncestorUpdate, &.{
+    const ancestors = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 7, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
         .{ .cat_id = 1, .link_count_subtree_delta = 1, .child_count_subtree_delta = 1 },
     });
-    const tokens = try arena_alloc.dupe(Token, &.{
-        .{ .text = try arena_alloc.dupe(u8, "example"), .field = .title },
-        .{ .text = try arena_alloc.dupe(u8, "com"), .field = .url },
+    const tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "example"), .field = .title },
+        .{ .text = try arena_allocator.dupe(u8, "com"), .field = .url },
     });
-    const cs = ChangeSet{ .link_inserted = .{
+    const change_set = ChangeSet{ .link_inserted = .{
         .link = link,
         .ancestor_updates = ancestors,
         .tokens = tokens,
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
 
     var arena2 = std.heap.ArenaAllocator.init(allocator);
@@ -241,30 +259,35 @@ test "encode/decode roundtrip — link_inserted" {
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.link_inserted, std.meta.activeTag(decoded));
-    const e = decoded.link_inserted;
-    try std.testing.expectEqual(@as(u64, 42), e.link.id);
-    try std.testing.expectEqual(@as(usize, 2), e.ancestor_updates.len);
-    try std.testing.expectEqual(@as(u64, 7), e.ancestor_updates[0].cat_id);
-    try std.testing.expectEqual(@as(usize, 2), e.tokens.len);
-    try std.testing.expectEqualStrings("example", e.tokens[0].text);
+    const effect = decoded.link_inserted;
+    try std.testing.expectEqual(@as(u64, 42), effect.link.id);
+    try std.testing.expectEqual(@as(usize, 2), effect.ancestor_updates.len);
+    try std.testing.expectEqual(@as(u64, 7), effect.ancestor_updates[0].cat_id);
+    try std.testing.expectEqual(@as(usize, 2), effect.tokens.len);
+    try std.testing.expectEqualStrings("example", effect.tokens[0].text);
 }
 
+// Round-trip a link delete with one ancestor and one token.
 test "encode/decode roundtrip — link_deleted" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
     const link = schema.Link{ .id = 99, .category_id = 5 };
-    const ancestors = try a.dupe(AncestorUpdate, &.{
+    const ancestors = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 5, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
-    const tokens = try a.dupe(Token, &.{
-        .{ .text = try a.dupe(u8, "gone"), .field = .title },
+    const tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "gone"), .field = .title },
     });
-    const cs = ChangeSet{ .link_deleted = .{ .link = link, .ancestor_updates = ancestors, .tokens = tokens } };
+    const change_set = ChangeSet{ .link_deleted = .{
+        .link = link,
+        .ancestor_updates = ancestors,
+        .tokens = tokens,
+    } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
@@ -276,289 +299,320 @@ test "encode/decode roundtrip — link_deleted" {
     try std.testing.expectEqualStrings("gone", decoded.link_deleted.tokens[0].text);
 }
 
+// Round-trip old and new link records with their token lists.
 test "encode/decode roundtrip — link_text_updated" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
     const old_link = schema.Link{ .id = 11, .title = codec.FixedString(128).fromSlice("Old") };
     const new_link = schema.Link{ .id = 11, .title = codec.FixedString(128).fromSlice("New") };
-    const old_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .title }});
-    const new_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "new"), .field = .title }});
-    const cs = ChangeSet{ .link_text_updated = .{
+    const old_tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "old"), .field = .title },
+    });
+    const new_tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "new"), .field = .title },
+    });
+    const change_set = ChangeSet{ .link_text_updated = .{
         .old_link = old_link,
         .new_link = new_link,
         .old_tokens = old_tokens,
         .new_tokens = new_tokens,
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.link_text_updated, std.meta.activeTag(decoded));
-    const e = decoded.link_text_updated;
-    try std.testing.expectEqual(@as(u64, 11), e.old_link.id);
-    try std.testing.expectEqualStrings("Old", e.old_link.title.slice());
-    try std.testing.expectEqualStrings("New", e.new_link.title.slice());
-    try std.testing.expectEqualStrings("old", e.old_tokens[0].text);
-    try std.testing.expectEqualStrings("new", e.new_tokens[0].text);
+    const effect = decoded.link_text_updated;
+    try std.testing.expectEqual(@as(u64, 11), effect.old_link.id);
+    try std.testing.expectEqualStrings("Old", effect.old_link.title.slice());
+    try std.testing.expectEqualStrings("New", effect.new_link.title.slice());
+    try std.testing.expectEqualStrings("old", effect.old_tokens[0].text);
+    try std.testing.expectEqualStrings("new", effect.new_tokens[0].text);
 }
 
+// Round-trip a recategorize carrying both ancestor chains.
 test "encode/decode roundtrip — link_recategorized" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
     const link = schema.Link{ .id = 7, .category_id = 22 };
-    const old_chain = try a.dupe(AncestorUpdate, &.{
+    const old_chain = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 5, .link_count_subtree_delta = 3, .child_count_subtree_delta = 1 },
     });
-    const new_chain = try a.dupe(AncestorUpdate, &.{
+    const new_chain = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 22, .link_count_subtree_delta = 1, .child_count_subtree_delta = 0 },
         .{ .cat_id = 1, .link_count_subtree_delta = 5, .child_count_subtree_delta = 2 },
     });
-    const cs = ChangeSet{ .link_recategorized = .{
+    const change_set = ChangeSet{ .link_recategorized = .{
         .link = link,
         .old_category_id = 5,
         .old_chain_updates = old_chain,
         .new_chain_updates = new_chain,
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.link_recategorized, std.meta.activeTag(decoded));
-    const e = decoded.link_recategorized;
-    try std.testing.expectEqual(@as(u64, 22), e.link.category_id);
-    try std.testing.expectEqual(@as(u64, 5), e.old_category_id);
-    try std.testing.expectEqual(@as(usize, 1), e.old_chain_updates.len);
-    try std.testing.expectEqual(@as(usize, 2), e.new_chain_updates.len);
+    const effect = decoded.link_recategorized;
+    try std.testing.expectEqual(@as(u64, 22), effect.link.category_id);
+    try std.testing.expectEqual(@as(u64, 5), effect.old_category_id);
+    try std.testing.expectEqual(@as(usize, 1), effect.old_chain_updates.len);
+    try std.testing.expectEqual(@as(usize, 2), effect.new_chain_updates.len);
 }
 
+// Round-trip opaque entity fact bytes for two links.
 test "encode/decode roundtrip — link_entities_put" {
     const allocator = std.testing.allocator;
-    const cs = ChangeSet{ .link_entities_put = .{ .entries = &.{
+    const change_set = ChangeSet{ .link_entities_put = .{ .entries = &.{
         .{ .link_id = 7, .facts = "\x01\x01\x00\x01PK\x00\x00" },
         .{ .link_id = 9, .facts = "\x01\x00\x00\x00\x00\x00" },
     } } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const decoded = try decode(arena.allocator(), encoded);
 
     try std.testing.expectEqual(Op.link_entities_put, std.meta.activeTag(decoded));
-    const e = decoded.link_entities_put;
-    try std.testing.expectEqual(@as(usize, 2), e.entries.len);
-    try std.testing.expectEqual(@as(u64, 9), e.entries[1].link_id);
-    try std.testing.expectEqualSlices(u8, "\x01\x01\x00\x01PK\x00\x00", e.entries[0].facts);
+    const effect = decoded.link_entities_put;
+    try std.testing.expectEqual(@as(usize, 2), effect.entries.len);
+    try std.testing.expectEqual(@as(u64, 9), effect.entries[1].link_id);
+    try std.testing.expectEqualSlices(u8, "\x01\x01\x00\x01PK\x00\x00", effect.entries[0].facts);
 }
 
+// Round-trip an int8 vector, checking the first and last lanes and the scale.
 test "encode/decode roundtrip — link_vectors_put" {
     const allocator = std.testing.allocator;
     var vector = schema.StoredVector{ .id = 12, .scale = 0.25 };
     vector.values[0] = -127;
     vector.values[383] = 64;
-    const cs = ChangeSet{ .link_vectors_put = .{ .model = 0xB6E5, .vectors = &.{vector} } };
+    const change_set = ChangeSet{ .link_vectors_put = .{ .model = 0xB6E5, .vectors = &.{vector} } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const decoded = try decode(arena.allocator(), encoded);
 
     try std.testing.expectEqual(Op.link_vectors_put, std.meta.activeTag(decoded));
-    const e = decoded.link_vectors_put;
-    try std.testing.expectEqual(@as(u64, 0xB6E5), e.model);
-    try std.testing.expectEqual(@as(usize, 1), e.vectors.len);
-    try std.testing.expectEqual(@as(u64, 12), e.vectors[0].id);
-    try std.testing.expectEqual(@as(f32, 0.25), e.vectors[0].scale);
-    try std.testing.expectEqual(@as(i8, -127), e.vectors[0].values[0]);
-    try std.testing.expectEqual(@as(i8, 64), e.vectors[0].values[383]);
+    const effect = decoded.link_vectors_put;
+    try std.testing.expectEqual(@as(u64, 0xB6E5), effect.model);
+    try std.testing.expectEqual(@as(usize, 1), effect.vectors.len);
+    try std.testing.expectEqual(@as(u64, 12), effect.vectors[0].id);
+    try std.testing.expectEqual(@as(f32, 0.25), effect.vectors[0].scale);
+    try std.testing.expectEqual(@as(i8, -127), effect.vectors[0].values[0]);
+    try std.testing.expectEqual(@as(i8, 64), effect.vectors[0].values[383]);
 }
 
+// Round-trip a category vector under the same wire shape as link vectors.
 test "encode/decode roundtrip — category_vectors_put" {
     var vector = schema.StoredVector{ .id = 3_000, .scale = 0.5 };
     vector.values[7] = 101;
-    const cs = ChangeSet{ .category_vectors_put = .{ .model = 0xB6E5, .vectors = &.{vector} } };
+    const change_set = ChangeSet{ .category_vectors_put = .{
+        .model = 0xB6E5,
+        .vectors = &.{vector},
+    } };
 
-    const bytes = try encode(std.testing.allocator, cs);
+    const bytes = try encode(std.testing.allocator, change_set);
     defer std.testing.allocator.free(bytes);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const decoded = try decode(arena.allocator(), bytes);
 
     try std.testing.expectEqual(Op.category_vectors_put, std.meta.activeTag(decoded));
-    const e = decoded.category_vectors_put;
-    try std.testing.expectEqual(@as(u64, 0xB6E5), e.model);
-    try std.testing.expectEqual(@as(usize, 1), e.vectors.len);
-    try std.testing.expectEqual(@as(u64, 3_000), e.vectors[0].id);
-    try std.testing.expectEqual(@as(f32, 0.5), e.vectors[0].scale);
-    try std.testing.expectEqual(@as(i8, 101), e.vectors[0].values[7]);
+    const effect = decoded.category_vectors_put;
+    try std.testing.expectEqual(@as(u64, 0xB6E5), effect.model);
+    try std.testing.expectEqual(@as(usize, 1), effect.vectors.len);
+    try std.testing.expectEqual(@as(u64, 3_000), effect.vectors[0].id);
+    try std.testing.expectEqual(@as(f32, 0.5), effect.vectors[0].scale);
+    try std.testing.expectEqual(@as(i8, 101), effect.vectors[0].values[7]);
 }
 
+// Round-trip a category insert with its slug path and shallowest flag.
 test "encode/decode roundtrip — category_inserted" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const cat = schema.Category{
+    const category = schema.Category{
         .id = 50,
         .parent_id = 1,
         .name = codec.FixedString(64).fromSlice("Books"),
         .slug = codec.FixedString(128).fromSlice("books"),
     };
-    const ancestors = try a.dupe(AncestorUpdate, &.{
+    const ancestors = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 1 },
     });
-    const tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "books"), .field = .slug }});
-    const cs = ChangeSet{ .category_inserted = .{
-        .cat = cat,
+    const tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "books"), .field = .slug },
+    });
+    const change_set = ChangeSet{ .category_inserted = .{
+        .cat = category,
         .ancestor_updates = ancestors,
         .tokens = tokens,
-        .slug_path = try a.dupe(u8, "/books"),
+        .slug_path = try arena_allocator.dupe(u8, "/books"),
         .is_shallowest_for_slug = true,
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.category_inserted, std.meta.activeTag(decoded));
-    const e = decoded.category_inserted;
-    try std.testing.expectEqual(@as(u64, 50), e.cat.id);
-    try std.testing.expectEqualStrings("/books", e.slug_path);
-    try std.testing.expectEqual(true, e.is_shallowest_for_slug);
-    try std.testing.expectEqualStrings("books", e.tokens[0].text);
+    const effect = decoded.category_inserted;
+    try std.testing.expectEqual(@as(u64, 50), effect.cat.id);
+    try std.testing.expectEqualStrings("/books", effect.slug_path);
+    try std.testing.expectEqual(true, effect.is_shallowest_for_slug);
+    try std.testing.expectEqualStrings("books", effect.tokens[0].text);
 }
 
+// Round-trip a category delete with its slug path and token list.
 test "encode/decode roundtrip — category_deleted" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const cat = schema.Category{ .id = 60, .parent_id = 1 };
-    const ancestors = try a.dupe(AncestorUpdate, &.{
+    const category = schema.Category{ .id = 60, .parent_id = 1 };
+    const ancestors = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 1, .link_count_subtree_delta = 0, .child_count_subtree_delta = 0 },
     });
-    const tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .name }});
-    const cs = ChangeSet{ .category_deleted = .{
-        .cat = cat,
+    const tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "old"), .field = .name },
+    });
+    const change_set = ChangeSet{ .category_deleted = .{
+        .cat = category,
         .ancestor_updates = ancestors,
         .tokens = tokens,
-        .slug_path = try a.dupe(u8, "/old"),
+        .slug_path = try arena_allocator.dupe(u8, "/old"),
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.category_deleted, std.meta.activeTag(decoded));
-    const e = decoded.category_deleted;
-    try std.testing.expectEqual(@as(u64, 60), e.cat.id);
-    try std.testing.expectEqualStrings("/old", e.slug_path);
-    try std.testing.expectEqual(@as(usize, 1), e.tokens.len);
+    const effect = decoded.category_deleted;
+    try std.testing.expectEqual(@as(u64, 60), effect.cat.id);
+    try std.testing.expectEqualStrings("/old", effect.slug_path);
+    try std.testing.expectEqual(@as(usize, 1), effect.tokens.len);
 }
 
+// Round-trip old and new category records with description tokens.
 test "encode/decode roundtrip — category_text_updated" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const old_cat = schema.Category{ .id = 70, .description = codec.FixedString(1024).fromSlice("Old desc") };
-    const new_cat = schema.Category{ .id = 70, .description = codec.FixedString(1024).fromSlice("New desc") };
-    const old_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "old"), .field = .desc }});
-    const new_tokens = try a.dupe(Token, &.{.{ .text = try a.dupe(u8, "new"), .field = .desc }});
-    const cs = ChangeSet{ .category_text_updated = .{
+    const old_cat = schema.Category{
+        .id = 70,
+        .description = codec.FixedString(1024).fromSlice("Old desc"),
+    };
+    const new_cat = schema.Category{
+        .id = 70,
+        .description = codec.FixedString(1024).fromSlice("New desc"),
+    };
+    const old_tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "old"), .field = .desc },
+    });
+    const new_tokens = try arena_allocator.dupe(Token, &.{
+        .{ .text = try arena_allocator.dupe(u8, "new"), .field = .desc },
+    });
+    const change_set = ChangeSet{ .category_text_updated = .{
         .old_cat = old_cat,
         .new_cat = new_cat,
         .old_tokens = old_tokens,
         .new_tokens = new_tokens,
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.category_text_updated, std.meta.activeTag(decoded));
-    const e = decoded.category_text_updated;
-    try std.testing.expectEqualStrings("Old desc", e.old_cat.description.slice());
-    try std.testing.expectEqualStrings("New desc", e.new_cat.description.slice());
-    try std.testing.expectEqualStrings("new", e.new_tokens[0].text);
+    const effect = decoded.category_text_updated;
+    try std.testing.expectEqualStrings("Old desc", effect.old_cat.description.slice());
+    try std.testing.expectEqualStrings("New desc", effect.new_cat.description.slice());
+    try std.testing.expectEqualStrings("new", effect.new_tokens[0].text);
 }
 
+// Round-trip a rename with no descendant swaps and no enqueue.
 test "encode/decode roundtrip — category_renamed" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
     const old_cat = schema.Category{ .id = 80, .slug = codec.FixedString(128).fromSlice("old") };
     const new_cat = schema.Category{ .id = 80, .slug = codec.FixedString(128).fromSlice("new") };
-    const cs = ChangeSet{ .category_renamed = .{
+    const change_set = ChangeSet{ .category_renamed = .{
         .old_cat = old_cat,
         .new_cat = new_cat,
-        .old_slug_path = try a.dupe(u8, "/parent/old"),
-        .new_slug_path = try a.dupe(u8, "/parent/new"),
+        .old_slug_path = try arena_allocator.dupe(u8, "/parent/old"),
+        .new_slug_path = try arena_allocator.dupe(u8, "/parent/new"),
         .descendant_swaps = &.{},
         .above_threshold = false,
         .enqueue = .{},
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.category_renamed, std.meta.activeTag(decoded));
-    const e = decoded.category_renamed;
-    try std.testing.expectEqualStrings("old", e.old_cat.slug.slice());
-    try std.testing.expectEqualStrings("new", e.new_cat.slug.slice());
-    try std.testing.expectEqualStrings("/parent/old", e.old_slug_path);
-    try std.testing.expectEqualStrings("/parent/new", e.new_slug_path);
+    const effect = decoded.category_renamed;
+    try std.testing.expectEqualStrings("old", effect.old_cat.slug.slice());
+    try std.testing.expectEqualStrings("new", effect.new_cat.slug.slice());
+    try std.testing.expectEqualStrings("/parent/old", effect.old_slug_path);
+    try std.testing.expectEqualStrings("/parent/new", effect.new_slug_path);
 }
 
+// Round-trip a move with both ancestor chains and subtree deltas.
 test "encode/decode roundtrip — category_moved" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const cat = schema.Category{ .id = 90, .parent_id = 200 };
-    const old_chain = try a.dupe(AncestorUpdate, &.{
+    const category = schema.Category{ .id = 90, .parent_id = 200 };
+    const old_chain = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 100, .link_count_subtree_delta = 4, .child_count_subtree_delta = 2 },
     });
-    const new_chain = try a.dupe(AncestorUpdate, &.{
+    const new_chain = try arena_allocator.dupe(AncestorUpdate, &.{
         .{ .cat_id = 200, .link_count_subtree_delta = 7, .child_count_subtree_delta = 3 },
         .{ .cat_id = 1, .link_count_subtree_delta = 11, .child_count_subtree_delta = 5 },
     });
-    const cs = ChangeSet{ .category_moved = .{
-        .cat = cat,
+    const change_set = ChangeSet{ .category_moved = .{
+        .cat = category,
         .old_parent_id = 100,
         .new_parent_id = 200,
         .old_chain_updates = old_chain,
         .new_chain_updates = new_chain,
-        .old_slug_path = try a.dupe(u8, "/a/x"),
-        .new_slug_path = try a.dupe(u8, "/b/x"),
+        .old_slug_path = try arena_allocator.dupe(u8, "/a/x"),
+        .new_slug_path = try arena_allocator.dupe(u8, "/b/x"),
         .link_subtree_delta = 3,
         .child_subtree_delta = 1,
         .descendant_swaps = &.{},
@@ -566,122 +620,142 @@ test "encode/decode roundtrip — category_moved" {
         .enqueue = .{},
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
 
     try std.testing.expectEqual(Op.category_moved, std.meta.activeTag(decoded));
-    const e = decoded.category_moved;
-    try std.testing.expectEqual(@as(u64, 100), e.old_parent_id);
-    try std.testing.expectEqual(@as(u64, 200), e.new_parent_id);
-    try std.testing.expectEqual(@as(usize, 2), e.new_chain_updates.len);
-    try std.testing.expectEqualStrings("/a/x", e.old_slug_path);
-    try std.testing.expectEqualStrings("/b/x", e.new_slug_path);
-    try std.testing.expectEqual(@as(u64, 3), e.link_subtree_delta);
-    try std.testing.expectEqual(@as(u32, 1), e.child_subtree_delta);
+    const effect = decoded.category_moved;
+    try std.testing.expectEqual(@as(u64, 100), effect.old_parent_id);
+    try std.testing.expectEqual(@as(u64, 200), effect.new_parent_id);
+    try std.testing.expectEqual(@as(usize, 2), effect.new_chain_updates.len);
+    try std.testing.expectEqualStrings("/a/x", effect.old_slug_path);
+    try std.testing.expectEqualStrings("/b/x", effect.new_slug_path);
+    try std.testing.expectEqual(@as(u64, 3), effect.link_subtree_delta);
+    try std.testing.expectEqual(@as(u32, 1), effect.child_subtree_delta);
 }
 
+// Round-trip a rename whose descendant swaps were computed inline.
 test "encode/decode roundtrip — category_renamed with descendant_swaps" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const aa = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const swaps = try aa.dupe(SlugPathSwap, &.{
-        .{ .old_path = try aa.dupe(u8, "top/old/a"), .new_path = try aa.dupe(u8, "top/new/a"), .cat_id = 100 },
-        .{ .old_path = try aa.dupe(u8, "top/old/b"), .new_path = try aa.dupe(u8, "top/new/b"), .cat_id = 101 },
+    const swaps = try arena_allocator.dupe(SlugPathSwap, &.{
+        .{
+            .old_path = try arena_allocator.dupe(u8, "top/old/a"),
+            .new_path = try arena_allocator.dupe(u8, "top/new/a"),
+            .cat_id = 100,
+        },
+        .{
+            .old_path = try arena_allocator.dupe(u8, "top/old/b"),
+            .new_path = try arena_allocator.dupe(u8, "top/new/b"),
+            .cat_id = 101,
+        },
     });
-    const cs = ChangeSet{ .category_renamed = .{
+    const change_set = ChangeSet{ .category_renamed = .{
         .old_cat = .{},
         .new_cat = .{},
-        .old_slug_path = try aa.dupe(u8, "top/old"),
-        .new_slug_path = try aa.dupe(u8, "top/new"),
+        .old_slug_path = try arena_allocator.dupe(u8, "top/old"),
+        .new_slug_path = try arena_allocator.dupe(u8, "top/new"),
         .descendant_swaps = swaps,
         .above_threshold = false,
         .enqueue = .{ .seq = 0, .op = .renamed_slug, .old_slug_prefix = &.{}, .created_at = 0 },
     } };
 
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
     try std.testing.expectEqual(Op.category_renamed, std.meta.activeTag(decoded));
-    const e = decoded.category_renamed;
-    try std.testing.expectEqual(@as(usize, 2), e.descendant_swaps.len);
-    try std.testing.expectEqualStrings("top/old/a", e.descendant_swaps[0].old_path);
-    try std.testing.expectEqualStrings("top/new/a", e.descendant_swaps[0].new_path);
-    try std.testing.expectEqual(@as(u64, 100), e.descendant_swaps[0].cat_id);
-    try std.testing.expect(!e.above_threshold);
-    try std.testing.expectEqual(@as(u64, 0), e.enqueue.seq);
+    const effect = decoded.category_renamed;
+    try std.testing.expectEqual(@as(usize, 2), effect.descendant_swaps.len);
+    try std.testing.expectEqualStrings("top/old/a", effect.descendant_swaps[0].old_path);
+    try std.testing.expectEqualStrings("top/new/a", effect.descendant_swaps[0].new_path);
+    try std.testing.expectEqual(@as(u64, 100), effect.descendant_swaps[0].cat_id);
+    try std.testing.expect(!effect.above_threshold);
+    try std.testing.expectEqual(@as(u64, 0), effect.enqueue.seq);
 }
 
+// Round-trip a rename above the inline threshold: no swaps, a populated enqueue.
 test "encode/decode roundtrip — category_renamed with enqueue (above_threshold)" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const aa = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const cs = ChangeSet{ .category_renamed = .{
+    const change_set = ChangeSet{ .category_renamed = .{
         .old_cat = .{},
         .new_cat = .{},
-        .old_slug_path = try aa.dupe(u8, "top/regional"),
-        .new_slug_path = try aa.dupe(u8, "top/worldwide"),
+        .old_slug_path = try arena_allocator.dupe(u8, "top/regional"),
+        .new_slug_path = try arena_allocator.dupe(u8, "top/worldwide"),
         .descendant_swaps = &.{},
         .above_threshold = true,
         .enqueue = .{
             .seq = 42,
             .op = .renamed_slug,
-            .old_slug_prefix = try aa.dupe(u8, "top/regional"),
+            .old_slug_prefix = try arena_allocator.dupe(u8, "top/regional"),
             .created_at = 1714838400000,
         },
     } };
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
-    const e = decoded.category_renamed;
-    try std.testing.expect(e.above_threshold);
-    try std.testing.expectEqual(@as(u64, 42), e.enqueue.seq);
-    try std.testing.expectEqual(@as(usize, 0), e.descendant_swaps.len);
-    try std.testing.expectEqualStrings("top/regional", e.enqueue.old_slug_prefix);
+    const effect = decoded.category_renamed;
+    try std.testing.expect(effect.above_threshold);
+    try std.testing.expectEqual(@as(u64, 42), effect.enqueue.seq);
+    try std.testing.expectEqual(@as(usize, 0), effect.descendant_swaps.len);
+    try std.testing.expectEqualStrings("top/regional", effect.enqueue.old_slug_prefix);
 }
 
+// Round-trip a repair chunk of two swaps.
 test "encode/decode roundtrip — slug_path_repair_chunk" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const aa = arena.allocator();
+    const arena_allocator = arena.allocator();
 
-    const swaps = try aa.dupe(SlugPathSwap, &.{
-        .{ .old_path = try aa.dupe(u8, "old/a"), .new_path = try aa.dupe(u8, "new/a"), .cat_id = 1 },
-        .{ .old_path = try aa.dupe(u8, "old/b"), .new_path = try aa.dupe(u8, "new/b"), .cat_id = 2 },
+    const swaps = try arena_allocator.dupe(SlugPathSwap, &.{
+        .{
+            .old_path = try arena_allocator.dupe(u8, "old/a"),
+            .new_path = try arena_allocator.dupe(u8, "new/a"),
+            .cat_id = 1,
+        },
+        .{
+            .old_path = try arena_allocator.dupe(u8, "old/b"),
+            .new_path = try arena_allocator.dupe(u8, "new/b"),
+            .cat_id = 2,
+        },
     });
-    const cs = ChangeSet{ .slug_path_repair_chunk = .{
+    const change_set = ChangeSet{ .slug_path_repair_chunk = .{
         .task_seq = 7,
         .swaps = swaps,
     } };
-    const encoded = try encode(allocator, cs);
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
     const decoded = try decode(arena2.allocator(), encoded);
     try std.testing.expectEqual(Op.slug_path_repair_chunk, std.meta.activeTag(decoded));
-    const e = decoded.slug_path_repair_chunk;
-    try std.testing.expectEqual(@as(u64, 7), e.task_seq);
-    try std.testing.expectEqual(@as(usize, 2), e.swaps.len);
-    try std.testing.expectEqualStrings("old/a", e.swaps[0].old_path);
-    try std.testing.expectEqualStrings("new/a", e.swaps[0].new_path);
-    try std.testing.expectEqual(@as(u64, 1), e.swaps[0].cat_id);
+    const effect = decoded.slug_path_repair_chunk;
+    try std.testing.expectEqual(@as(u64, 7), effect.task_seq);
+    try std.testing.expectEqual(@as(usize, 2), effect.swaps.len);
+    try std.testing.expectEqualStrings("old/a", effect.swaps[0].old_path);
+    try std.testing.expectEqualStrings("new/a", effect.swaps[0].new_path);
+    try std.testing.expectEqual(@as(u64, 1), effect.swaps[0].cat_id);
 }
 
+// Round-trip the one-field completion record.
 test "encode/decode roundtrip — slug_path_repair_complete" {
     const allocator = std.testing.allocator;
-    const cs = ChangeSet{ .slug_path_repair_complete = .{ .seq = 99 } };
-    const encoded = try encode(allocator, cs);
+    const change_set = ChangeSet{ .slug_path_repair_complete = .{ .seq = 99 } };
+    const encoded = try encode(allocator, change_set);
     defer allocator.free(encoded);
     var arena2 = std.heap.ArenaAllocator.init(allocator);
     defer arena2.deinit();
@@ -690,22 +764,24 @@ test "encode/decode roundtrip — slug_path_repair_complete" {
     try std.testing.expectEqual(@as(u64, 99), decoded.slug_path_repair_complete.seq);
 }
 
-fn fuzzDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+fn fuzz_decode_one(_: void, smith: *std.testing.Smith) anyerror!void {
     var input: [4096]u8 = undefined;
     const len = smith.slice(&input);
+    assert(len <= input.len);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     _ = decode(arena.allocator(), input[0..len]) catch {};
 }
 
+// Decode must reject or accept arbitrary bytes without crashing or leaking.
 test "fuzz: changeset.decode tolerates arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzDecodeOne, .{
+    try std.testing.fuzz({}, fuzz_decode_one, .{
         .corpus = &.{
             &.{},
-            &.{SCHEMA_VERSION},
-            &.{ SCHEMA_VERSION, @intFromEnum(Op.link_inserted) },
-            &.{ SCHEMA_VERSION, @intFromEnum(Op.category_renamed) },
-            &.{ SCHEMA_VERSION, @intFromEnum(Op.category_renamed), 0xFF, 0xFF, 0xFF, 0xFF },
+            &.{schema_version},
+            &.{ schema_version, @intFromEnum(Op.link_inserted) },
+            &.{ schema_version, @intFromEnum(Op.category_renamed) },
+            &.{ schema_version, @intFromEnum(Op.category_renamed), 0xFF, 0xFF, 0xFF, 0xFF },
         },
     });
 }
