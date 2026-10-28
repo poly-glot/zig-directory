@@ -41,6 +41,10 @@ spec:
               value: "256"
             - name: DMOZDB_THREAD_COUNT
               value: "4"
+            # Domain-filter link searches failed with a generic error at the 32 MiB
+            # default; 128 MiB cleared them on the live fleet (2026-10-28).
+            - name: DMOZDB_SCRATCH_SLAB_MB
+              value: "128"
             # The verifier rescans the whole 17 GB store (15 min per pass);
             # links are rarely added, so one pass a month is plenty. The
             # run_verifier op still triggers a pass on demand.
