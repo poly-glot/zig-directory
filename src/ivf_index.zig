@@ -7,6 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const ranking = @import("ranking.zig");
 const vector_model = @import("vector_model.zig");
+const derived_snapshot = @import("derived_snapshot.zig");
 
 const Model = vector_model.Model;
 const Codes = vector_model.Codes;
@@ -89,6 +90,23 @@ const Cell = struct {
     fn blocks(self: *const Cell) usize {
         assert(self.codes.items.len % block_bytes == 0);
         return @divExact(self.codes.items.len, block_bytes);
+    }
+
+    fn snapshot_restore(
+        self: *Cell,
+        allocator: std.mem.Allocator,
+        rows: u32,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        assert(self.ids.items.len == 0);
+        assert(self.codes.items.len == 0);
+        const blocks_needed = try std.math.divCeil(usize, rows, block_vectors);
+        try self.ids.resize(allocator, rows);
+        try self.codes.resize(allocator, blocks_needed * block_bytes);
+        try payload.take(std.mem.sliceAsBytes(self.ids.items));
+        try payload.take(self.codes.items);
+        assert(self.ids.items.len <= self.blocks() * block_vectors);
+        assert(self.blocks() * block_vectors < self.ids.items.len + block_vectors);
     }
 };
 
@@ -173,6 +191,72 @@ pub const LinkVectorIndex = struct {
         for (&self.cells) |*cell| stored += cell.ids.items.len;
         assert(stored == self.position.count());
         return self.position.count();
+    }
+
+    /// One consistent cut of every cell under the shared lock: the ids and the transposed code
+    /// blocks as they sit in memory, so a restore is two reads per cell and no re-encoding.
+    pub fn snapshot_write(
+        self: *LinkVectorIndex,
+        io: std.Io,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        self.lock.lockSharedUncancelable(io);
+        defer self.lock.unlockShared(io);
+        assert(self.ready.load(.acquire));
+        try payload.put_u64(self.position.count());
+        var stored: usize = 0;
+        for (&self.cells) |*cell| {
+            assert(cell.ids.items.len <= std.math.maxInt(u32));
+            try payload.put_u32(@intCast(cell.ids.items.len));
+            try payload.put(std.mem.sliceAsBytes(cell.ids.items));
+            try payload.put(cell.codes.items);
+            stored += cell.ids.items.len;
+        }
+        assert(stored == self.position.count());
+    }
+
+    pub fn snapshot_restore(
+        self: *LinkVectorIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        assert(!self.ready.load(.acquire));
+        assert(self.position.count() == 0);
+        const total = try payload.take_u64();
+        if (total > std.math.maxInt(u32)) return error.SnapshotCorrupt;
+        try self.position.ensureTotalCapacity(allocator, @intCast(total));
+        var restored: u64 = 0;
+        for (&self.cells, 0..) |*cell, cell_index| {
+            const rows = try payload.take_u32();
+            if (restored + rows > total) return error.SnapshotCorrupt;
+            try cell.snapshot_restore(allocator, rows, payload);
+            try self.snapshot_place(cell, @intCast(cell_index));
+            restored += rows;
+        }
+        if (restored != total) return error.SnapshotCorrupt;
+        assert(self.position.count() == total);
+    }
+
+    fn snapshot_place(self: *LinkVectorIndex, cell: *const Cell, cell_index: u16) !void {
+        assert(cell_index < cell_count);
+        for (cell.ids.items, 0..) |id, index| {
+            if (id == 0) return error.SnapshotCorrupt;
+            if (self.position.contains(id)) return error.SnapshotCorrupt;
+            self.position.putAssumeCapacity(id, .{
+                .cell = cell_index,
+                .index = @intCast(index),
+            });
+        }
+        assert(self.position.count() >= cell.ids.items.len);
+    }
+
+    pub fn snapshot_discard(self: *LinkVectorIndex, allocator: std.mem.Allocator) void {
+        assert(!self.ready.load(.acquire));
+        for (&self.cells) |*cell| cell.deinit(allocator);
+        self.position.deinit(allocator);
+        self.cells = @splat(.{});
+        self.position = .empty;
+        assert(self.position.count() == 0);
     }
 
     pub fn shortlist(
@@ -350,6 +434,45 @@ test "put of an existing id re-codes it in place or moves it to its new cell" {
         );
     }
     try testing.expectEqual(@as(usize, 10), total);
+}
+
+// Goal: a snapshot round trip reproduces every cell and the position map. Method: fill fifty
+// vectors, remove a few so cells carry holes, write, restore into a fresh index and compare
+// the count, the shortlist for every id and the exact cell layout.
+test "snapshot round trip reproduces the cells, the positions and every shortlist" {
+    const model = try Model.synthetic(testing.allocator, 16);
+    defer model.deinit(testing.allocator);
+    var index = LinkVectorIndex{ .codebooks = model };
+    defer index.deinit(testing.allocator);
+
+    try fill(&index, 1, 50);
+    for ([_]u64{ 4, 25, 50 }) |id| index.remove(testing.io, id);
+    index.ready.store(true, .release);
+
+    var buffer: [64 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    var payload = derived_snapshot.SectionWriter.init(&writer);
+    try index.snapshot_write(testing.io, &payload);
+
+    var reader = std.Io.Reader.fixed(buffer[0..writer.end]);
+    var incoming = derived_snapshot.SectionReader.init(&reader);
+    var restored = LinkVectorIndex{ .codebooks = model };
+    defer restored.deinit(testing.allocator);
+    try restored.snapshot_restore(testing.allocator, &incoming);
+    try testing.expectEqual(payload.crc.final(), incoming.crc.final());
+    restored.ready.store(true, .release);
+
+    try testing.expectEqual(index.count(testing.io), restored.count(testing.io));
+    for (&index.cells, &restored.cells) |*cell, *copy| {
+        try testing.expectEqualSlices(u64, cell.ids.items, copy.ids.items);
+        try testing.expectEqualSlices(u8, cell.codes.items, copy.codes.items);
+    }
+    var buffer_hits: [3]ranking.ScoredId = undefined;
+    for (1..51) |id| {
+        const hits = restored.shortlist(testing.io, &unit(id), &buffer_hits);
+        const expect_present = id != 4 and id != 25 and id != 50;
+        try testing.expectEqual(expect_present, hits[0].id == id);
+    }
 }
 
 // Score a handful of ids including an unknown one and check only the stored ids come back, with

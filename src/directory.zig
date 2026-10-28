@@ -159,6 +159,8 @@ pub const Directory = struct {
 
     facts: facts_index.FactsIndex,
     facts_loader: ?std.Thread,
+    derived_restored: @import("derived_snapshot.zig").Restored,
+    checkpoint_last_s: i64,
 
     next_category_id: std.atomic.Value(u64),
     next_link_id: std.atomic.Value(u64),
@@ -244,7 +246,7 @@ pub const Directory = struct {
 
     fn checkpoint_on_shutdown(context: *anyopaque) void {
         const directory = as_directory(context);
-        directory.checkpoint() catch |err| {
+        _ = directory.checkpoint() catch |err| {
             log.err(
                 "checkpoint on shutdown failed: {} — recovery will replay on next boot",
                 .{err},
@@ -470,6 +472,8 @@ pub const Directory = struct {
             .vector_loader = null,
             .facts = .{},
             .facts_loader = null,
+            .derived_restored = .{},
+            .checkpoint_last_s = 0,
             .next_category_id = std.atomic.Value(u64).init(store.counter("next_category_id").*),
             .next_link_id = std.atomic.Value(u64).init(store.counter("next_link_id").*),
             .next_repair_seq = std.atomic.Value(u64).init(store.counter("next_repair_seq").*),
@@ -612,34 +616,71 @@ pub const Directory = struct {
             .interval_ns = @as(u64, self.config.repair_worker_interval_ms) * std.time.ns_per_ms,
             .tick = &repair_tick,
         }) catch null;
-        self.checkpointer = self.store.spawnCheckpointer(
-            self.config.server.snapshot_interval_s,
-        ) catch blk: {
+        // Our own checkpoint worker, not zigstore's: a derived snapshot is only worth writing
+        // right after a checkpoint, stamped with the sequence it made durable.
+        self.checkpoint_last_s = self.now_seconds();
+        self.checkpointer = self.store.spawnWorker(self, .{
+            .interval_ns = std.time.ns_per_s,
+            .tick = &checkpoint_tick,
+        }) catch blk: {
             log.warn(
                 "Checkpointer thread failed to start — only shutdown checkpoints will run",
                 .{},
             );
             break :blk null;
         };
-        self.url_bloom_seeder = std.Thread.spawn(
-            .{},
-            seed_url_bloom_in_background,
-            .{self},
-        ) catch blk: {
-            log.warn(
-                "url bloom seeder failed to start — duplicate checks keep reading the url index",
+        self.start_index_loaders();
+    }
+
+    // A restored index is complete once recovery has replayed the WAL tail into it, so it is
+    // ready here; only an index the snapshot did not carry is rebuilt from the store.
+    fn start_index_loaders(self: *Directory) void {
+        const restored = self.derived_restored;
+        assert(self.url_bloom_seeder == null);
+        assert(self.facts_loader == null);
+        if (restored.url_bloom) {
+            self.url_bloom_ready.store(true, .release);
+        } else {
+            self.url_bloom_seeder = std.Thread.spawn(
                 .{},
-            );
-            break :blk null;
-        };
-        self.vector_loader = std.Thread.spawn(.{}, load_vectors_in_background, .{self}) catch blk: {
-            log.warn("vector loader failed to start — hybrid search stays keyword-only", .{});
-            break :blk null;
-        };
-        self.facts_loader = std.Thread.spawn(.{}, load_facts_in_background, .{self}) catch blk: {
-            log.warn("facts loader failed to start — query_links answers not ready", .{});
-            break :blk null;
-        };
+                seed_url_bloom_in_background,
+                .{self},
+            ) catch blk: {
+                log.warn(
+                    "url bloom seeder failed to start — duplicate checks keep reading " ++
+                        "the url index",
+                    .{},
+                );
+                break :blk null;
+            };
+        }
+        if (restored.link_vectors) self.link_vector_index.ready.store(true, .release);
+        if (restored.category_vectors) self.category_vector_index.ready.store(true, .release);
+        if (!restored.link_vectors or !restored.category_vectors) {
+            self.vector_loader = std.Thread.spawn(
+                .{},
+                load_vectors_in_background,
+                .{self},
+            ) catch blk: {
+                log.warn(
+                    "vector loader failed to start — hybrid search stays keyword-only",
+                    .{},
+                );
+                break :blk null;
+            };
+        }
+        if (restored.facts) {
+            self.facts.ready.store(true, .release);
+        } else {
+            self.facts_loader = std.Thread.spawn(
+                .{},
+                load_facts_in_background,
+                .{self},
+            ) catch blk: {
+                log.warn("facts loader failed to start — query_links answers not ready", .{});
+                break :blk null;
+            };
+        }
     }
 
     // WAL replay and the first spawn both need the trees to themselves: no worker may be
@@ -675,8 +716,16 @@ pub const Directory = struct {
     }
 
     fn load_vectors_in_background(self: *Directory) void {
+        const restored = self.derived_restored;
+        assert(!restored.link_vectors or !restored.category_vectors);
+        if (restored.link_vectors) assert(self.link_vector_index.ready.load(.acquire));
+        if (!restored.link_vectors) self.load_link_vectors();
+        if (!restored.category_vectors) self.load_category_vectors();
+    }
+
+    fn load_link_vectors(self: *Directory) void {
         assert(!self.link_vector_index.ready.load(.acquire));
-        assert(!self.category_vector_index.ready.load(.acquire));
+        assert(!self.derived_restored.link_vectors);
         const started = std.Io.Clock.awake.now(self.io);
         @import("operations/operations.zig").load_vector_index(self) catch |err| {
             log.warn("vector index load stopped: {} — hybrid search stays keyword-only", .{err});
@@ -691,6 +740,12 @@ pub const Directory = struct {
                 },
             );
         }
+    }
+
+    fn load_category_vectors(self: *Directory) void {
+        assert(!self.category_vector_index.ready.load(.acquire));
+        assert(!self.derived_restored.category_vectors);
+        const started = std.Io.Clock.awake.now(self.io);
         @import("operations/operations.zig").load_category_vector_index(self) catch |err| {
             log.warn(
                 "category vector index load stopped: {} — search ignores category meaning",
@@ -732,6 +787,26 @@ pub const Directory = struct {
 
     fn as_directory(context: *anyopaque) *Directory {
         return @ptrCast(@alignCast(context));
+    }
+
+    // Every tick eases dirty-page pressure, as zigstore's own checkpointer did; the checkpoint
+    // itself runs on `snapshot_interval_s` and the derived snapshot follows it at once.
+    fn checkpoint_tick(context: *anyopaque) anyerror!void {
+        const self = as_directory(context);
+        try self.store.relieveDirtyPressure();
+        const now = self.now_seconds();
+        const interval: i64 = self.config.server.snapshot_interval_s;
+        assert(interval >= 0);
+        if (now - self.checkpoint_last_s < interval) return;
+        const seq = try self.checkpoint();
+        self.checkpoint_last_s = now;
+        assert(self.store.header.seq == seq);
+        @import("derived_snapshot.zig").write(self, seq) catch |err| {
+            log.warn(
+                "derived snapshot not written: {} — the next boot scans the store",
+                .{err},
+            );
+        };
     }
 
     fn flush_tick(context: *anyopaque) anyerror!void {
@@ -862,12 +937,19 @@ pub const Directory = struct {
         if (self.memtable_flusher) |worker| worker.stop();
 
         if (persist) {
-            self.checkpoint() catch |err| {
+            if (self.checkpoint()) |seq| {
+                @import("derived_snapshot.zig").write(self, seq) catch |err| {
+                    log.warn(
+                        "derived snapshot not written on shutdown: {} — the next boot scans",
+                        .{err},
+                    );
+                };
+            } else |err| {
                 log.err(
                     "checkpoint on shutdown failed: {} — recovery will replay on next boot",
                     .{err},
                 );
-            };
+            }
         } else {
             if (self.store.wal_writer) |*wal| wal.deinit();
         }
@@ -898,6 +980,9 @@ pub const Directory = struct {
 
     pub fn recover(self: *Directory) !void {
         self.assert_background_idle();
+        // Before replay: the snapshot stands at the superblock's sequence, and the tail above
+        // it is applied into the restored indexes by the same path that built them.
+        self.derived_restored = @import("derived_snapshot.zig").restore(self);
         try self.store.recover(self, .{
             .apply_entry = &apply_entry,
             .on_replayed = &restore_derived_counts,
@@ -1012,9 +1097,12 @@ pub const Directory = struct {
         return std.Io.Clock.real.now(self.io).toMilliseconds();
     }
 
-    pub fn checkpoint(self: *Directory) !void {
+    pub fn checkpoint(self: *Directory) !u64 {
         self.sync_persisted_counters();
-        _ = try self.store.checkpoint();
+        const seq = try self.store.checkpoint();
+        assert(self.store.header.seq == seq);
+        assert(self.store.header.format_version == schema.format_version);
+        return seq;
     }
 
     pub fn get_stats(self: *Directory) Stats {
@@ -1116,7 +1204,7 @@ test "next_repair_seq: persists across reopen" {
         _ = directory.next_repair_seq.fetchAdd(1, .monotonic);
         _ = directory.next_repair_seq.fetchAdd(1, .monotonic);
         _ = directory.next_repair_seq.fetchAdd(1, .monotonic);
-        try directory.checkpoint();
+        _ = try directory.checkpoint();
     }
     {
         var directory = try Directory.open_test_instance(allocator, &temporary_directory);
@@ -1173,4 +1261,171 @@ test "a commit made outside a dispatched request is durable when it returns" {
 test "a changeset that reached the WAL is applied or the process aborts, never acked as failed" {
     const info = @typeInfo(@TypeOf(Directory.apply_or_abort)).@"fn";
     try std.testing.expectEqual(void, info.return_type.?);
+}
+
+const derived_snapshot = @import("derived_snapshot.zig");
+const link_operations = @import("operations/operations_link.zig");
+const category_operations = @import("operations/operations_category.zig");
+
+fn seed_two_links(directory: *Directory, out: *[2]u64) !u64 {
+    const ops = @import("operations/operations.zig");
+    const top = (try ops.resolve_slug_path(directory, "top")) orelse
+        return error.BootstrapTopMissing;
+    const arts = try category_operations.create_category(
+        directory,
+        top,
+        .{ .name = "Arts", .slug = "arts", .description = "" },
+    );
+    out[0] = try link_operations.create_link(
+        directory,
+        arts,
+        .{ .url = "http://one.tripod.com/", .title = "One", .description = "" },
+    );
+    out[1] = try link_operations.create_link(
+        directory,
+        arts,
+        .{ .url = "http://two.tripod.com/", .title = "Two", .description = "" },
+    );
+    assert(out[0] != out[1]);
+    assert(arts != top);
+    return arts;
+}
+
+fn load_every_index(directory: *Directory) !void {
+    const ops = @import("operations/operations.zig");
+    try ops.load_facts_index(directory);
+    try ops.load_vector_index(directory);
+    try ops.load_category_vector_index(directory);
+    try ops.seed_url_bloom(directory, .full_speed);
+    assert(directory.facts.ready.load(.acquire));
+    assert(directory.url_bloom_ready.load(.acquire));
+}
+
+// Goal: a clean shutdown leaves a snapshot the next boot restores instead of scanning, and
+// the WAL tail written after it is replayed on top. Method: three boots. Write and shut down;
+// reopen and check every index restored; insert and delete, crash, reopen and check the facts
+// match the acknowledged writes, not the snapshot.
+test "derived snapshot: restored on reopen and caught up by the WAL tail after a crash" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    var links: [2]u64 = undefined;
+    var arts: u64 = 0;
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        try std.testing.expect(!directory.derived_restored.facts);
+        arts = try seed_two_links(directory, &links);
+        try load_every_index(directory);
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_crash_test_instance();
+        try directory.recover();
+        try std.testing.expect(directory.derived_restored.facts);
+        try std.testing.expect(directory.derived_restored.url_bloom);
+        try std.testing.expect(directory.derived_restored.category_vectors);
+        try std.testing.expect(directory.derived_restored.link_vectors);
+        directory.start_background_threads();
+        try std.testing.expect(directory.facts.ready.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), directory.facts.link_count(directory.io));
+        try std.testing.expect(directory.url_bloom.mayContain("http://two.tripod.com/"));
+        _ = try link_operations.create_link(
+            directory,
+            arts,
+            .{ .url = "http://three.tripod.com/", .title = "Three", .description = "" },
+        );
+        try link_operations.delete_link(directory, links[0]);
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        try std.testing.expect(directory.derived_restored.facts);
+        directory.start_background_threads();
+        try std.testing.expect(directory.facts.ready.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), directory.facts.link_count(directory.io));
+        try std.testing.expect(!directory.facts.links.contains(links[0]));
+        try std.testing.expect(directory.facts.links.contains(links[1]));
+        try std.testing.expect(directory.url_bloom.mayContain("http://three.tripod.com/"));
+    }
+}
+
+// Goal: a snapshot from an older checkpoint is never restored. Method: shut down cleanly so a
+// snapshot exists, reopen, write a link and checkpoint without snapshotting, crash, reopen:
+// nothing restores and the facts loader still finds every link.
+test "derived snapshot: a stale snapshot is ignored and the store is scanned" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    var links: [2]u64 = undefined;
+    var arts: u64 = 0;
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        arts = try seed_two_links(directory, &links);
+        try load_every_index(directory);
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_crash_test_instance();
+        try directory.recover();
+        try std.testing.expect(directory.derived_restored.facts);
+        _ = try link_operations.create_link(
+            directory,
+            arts,
+            .{ .url = "http://three.tripod.com/", .title = "Three", .description = "" },
+        );
+        _ = try directory.checkpoint();
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        try std.testing.expect(!directory.derived_restored.facts);
+        try std.testing.expect(!directory.derived_restored.link_vectors);
+        try load_every_index(directory);
+        try std.testing.expectEqual(@as(usize, 3), directory.facts.link_count(directory.io));
+    }
+}
+
+// Goal: a damaged snapshot never poisons an index. Method: shut down cleanly, cut the file
+// short inside the facts section, reopen: nothing restores, the loaders rebuild everything.
+test "derived snapshot: a truncated file is ignored and the indexes load by scanning" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    var links: [2]u64 = undefined;
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        _ = try seed_two_links(directory, &links);
+        try load_every_index(directory);
+    }
+    {
+        const file = try temporary_directory.dir.openFile(
+            std.testing.io,
+            derived_snapshot.file_name,
+            .{ .mode = .read_write },
+        );
+        defer file.close(std.testing.io);
+        try std.testing.expect((try file.length(std.testing.io)) > 120);
+        try file.setLength(std.testing.io, 120);
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        try std.testing.expect(!directory.derived_restored.facts);
+        try std.testing.expect(!directory.derived_restored.url_bloom);
+        try std.testing.expectEqual(@as(usize, 0), directory.facts.links.count());
+        try load_every_index(directory);
+        try std.testing.expectEqual(@as(usize, 2), directory.facts.link_count(directory.io));
+    }
 }

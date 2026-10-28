@@ -446,7 +446,7 @@ test "E2E: data persists across database close and reopen" {
                 .description = "Persistent link",
             },
         );
-        try db.checkpoint();
+        _ = try db.checkpoint();
         db.deinit_test_instance();
     }
 

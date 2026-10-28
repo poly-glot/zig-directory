@@ -13,6 +13,7 @@ const countries = @import("countries.zig");
 const url_facts = @import("url_facts.zig");
 const sites = @import("sites.zig");
 const entities = @import("entities.zig");
+const derived_snapshot = @import("../derived_snapshot.zig");
 
 pub const StringId = u32;
 pub const IdSet = std.AutoHashMapUnmanaged(u64, void);
@@ -175,6 +176,58 @@ const Strings = struct {
     }
 };
 
+// The fixed rows of the derived snapshot. The string table is written first so every id a
+// later row carries is checked against it as the row is read.
+const LinkRecord = extern struct {
+    id: u64,
+    category_id: u64,
+    host: StringId,
+    domain: StringId,
+    site: StringId,
+    cctld: countries.Code,
+    status: u8,
+    hosted: u8,
+    subdomain: u8,
+    reserved: [7]u8,
+};
+
+const CategoryRecord = extern struct {
+    id: u64,
+    parent_id: u64,
+    name: StringId,
+    named_country: countries.Code,
+    files_things_by_name: u8,
+    reserved: [1]u8,
+};
+
+const entity_record_payload = 8 + 4 * 2 * entities.names_max + 2 * entities.countries_max + 5;
+const entity_record_reserved = (8 - entity_record_payload % 8) % 8;
+
+const EntityRecord = extern struct {
+    link_id: u64,
+    name_ids: [2 * entities.names_max]StringId,
+    countries: [entities.countries_max]countries.Code,
+    religions: u16,
+    country_count: u8,
+    people_count: u8,
+    org_count: u8,
+    reserved: [entity_record_reserved]u8,
+};
+
+comptime {
+    assert(@sizeOf(LinkRecord) == 40);
+    assert(@sizeOf(CategoryRecord) == 24);
+    assert(@sizeOf(EntityRecord) == entity_record_payload + entity_record_reserved);
+}
+
+// The longest string the table can hold: hosts, registrable domains, site keys, entity names
+// and folded category names are each bounded by their own maximum.
+const snapshot_string_len_max: usize = @max(
+    @max(url_facts.host_len_max, sites.site_len_max),
+    @max(entities.name_len_max, folded_name_len_max),
+);
+const snapshot_rows_max: u64 = std.math.maxInt(u32);
+
 pub const FactsIndex = struct {
     lock: std.Io.RwLock = .init,
     links: std.AutoHashMapUnmanaged(u64, LinkFact) = .empty,
@@ -321,6 +374,277 @@ pub const FactsIndex = struct {
         self.touched_categories.clearAndFree(allocator);
         self.touched_entities.clearAndFree(allocator);
         self.ready.store(true, .release);
+    }
+
+    /// One consistent cut of the whole index under the shared lock: queries go on, the apply
+    /// path waits for the section. Strings first, then the rows that refer to them.
+    pub fn snapshot_write(
+        self: *FactsIndex,
+        io: std.Io,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        self.lock.lockSharedUncancelable(io);
+        defer self.lock.unlockShared(io);
+        assert(self.ready.load(.acquire));
+        assert(!self.loading);
+        try self.snapshot_write_strings(payload);
+        try self.snapshot_write_categories(payload);
+        try self.snapshot_write_links(payload);
+        try self.snapshot_write_entities(payload);
+    }
+
+    fn snapshot_write_strings(
+        self: *const FactsIndex,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        const values = self.strings.values.items;
+        assert(values.len == self.strings.ids.count());
+        try payload.put_u64(values.len);
+        for (values) |value| {
+            assert(value.len <= snapshot_string_len_max);
+            try payload.put_u32(@intCast(value.len));
+            try payload.put(value);
+        }
+    }
+
+    fn snapshot_write_categories(
+        self: *const FactsIndex,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        try payload.put_u64(self.categories.count());
+        var categories = self.categories.iterator();
+        var written: usize = 0;
+        while (categories.next()) |entry| : (written += 1) {
+            assert(written < self.categories.count());
+            const fact = entry.value_ptr;
+            const record = CategoryRecord{
+                .id = entry.key_ptr.*,
+                .parent_id = fact.parent_id,
+                .name = fact.name,
+                .named_country = fact.named_country,
+                .files_things_by_name = @intFromBool(fact.files_things_by_name),
+                .reserved = @splat(0),
+            };
+            try payload.put(std.mem.asBytes(&record));
+        }
+        assert(written == self.categories.count());
+    }
+
+    fn snapshot_write_links(
+        self: *const FactsIndex,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        try payload.put_u64(self.links.count());
+        var links = self.links.iterator();
+        var written: usize = 0;
+        while (links.next()) |entry| : (written += 1) {
+            assert(written < self.links.count());
+            const fact = entry.value_ptr;
+            if (fact.subdomain) assert(fact.hosted);
+            const record = LinkRecord{
+                .id = entry.key_ptr.*,
+                .category_id = fact.category_id,
+                .host = fact.host,
+                .domain = fact.domain,
+                .site = fact.site,
+                .cctld = fact.cctld,
+                .status = fact.status,
+                .hosted = @intFromBool(fact.hosted),
+                .subdomain = @intFromBool(fact.subdomain),
+                .reserved = @splat(0),
+            };
+            try payload.put(std.mem.asBytes(&record));
+        }
+        assert(written == self.links.count());
+    }
+
+    fn snapshot_write_entities(
+        self: *const FactsIndex,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        try payload.put_u64(self.entities.count());
+        var facts = self.entities.iterator();
+        var written: usize = 0;
+        while (facts.next()) |entry| : (written += 1) {
+            assert(written < self.entities.count());
+            const fact = entry.value_ptr;
+            const names = fact.all_names();
+            var record = EntityRecord{
+                .link_id = entry.key_ptr.*,
+                .name_ids = @splat(0),
+                .countries = @splat(countries.none),
+                .religions = fact.religions,
+                .country_count = fact.country_count,
+                .people_count = fact.people_count,
+                .org_count = fact.org_count,
+                .reserved = @splat(0),
+            };
+            @memcpy(record.name_ids[0..names.len], names);
+            @memcpy(record.countries[0..fact.country_count], fact.country_slice());
+            try payload.put(std.mem.asBytes(&record));
+        }
+        assert(written == self.entities.count());
+    }
+
+    /// Fills an empty index from a section in the order `snapshot_write` produced it. Every
+    /// value is operating input: a bad one returns an error and the caller discards the index.
+    pub fn snapshot_restore(
+        self: *FactsIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        assert(!self.ready.load(.acquire));
+        assert(!self.loading);
+        assert(self.links.count() == 0);
+        assert(self.strings.values.items.len == 0);
+        try self.snapshot_restore_strings(allocator, payload);
+        try self.snapshot_restore_categories(allocator, payload);
+        try self.snapshot_restore_links(allocator, payload);
+        try self.snapshot_restore_entities(allocator, payload);
+        self.views_stale = true;
+    }
+
+    pub fn snapshot_discard(self: *FactsIndex, allocator: std.mem.Allocator) void {
+        assert(!self.ready.load(.acquire));
+        assert(!self.loading);
+        self.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn snapshot_restore_strings(
+        self: *FactsIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        const count = try payload.take_u64();
+        if (count > std.math.maxInt(StringId)) return error.SnapshotCorrupt;
+        try self.strings.values.ensureTotalCapacity(allocator, @intCast(count));
+        try self.strings.ids.ensureTotalCapacity(allocator, @intCast(count));
+        var buffer: [snapshot_string_len_max]u8 = undefined;
+        for (0..@intCast(count)) |index| {
+            const len = try payload.take_u32();
+            if (len > buffer.len) return error.SnapshotCorrupt;
+            try payload.take(buffer[0..len]);
+            const id = try self.strings.intern(allocator, buffer[0..len]);
+            if (id != index) return error.SnapshotCorrupt;
+        }
+        assert(self.strings.values.items.len == count);
+        assert(self.strings.ids.count() == count);
+    }
+
+    fn snapshot_restore_categories(
+        self: *FactsIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        const count = try payload.take_u64();
+        if (count > snapshot_rows_max) return error.SnapshotCorrupt;
+        try self.categories.ensureTotalCapacity(allocator, @intCast(count));
+        const strings_total = self.strings.values.items.len;
+        for (0..@intCast(count)) |_| {
+            var record: CategoryRecord = undefined;
+            try payload.take(std.mem.asBytes(&record));
+            if (record.id == 0) return error.SnapshotCorrupt;
+            if (record.name >= strings_total) return error.SnapshotCorrupt;
+            if (record.files_things_by_name > 1) return error.SnapshotCorrupt;
+            if (self.categories.contains(record.id)) return error.SnapshotCorrupt;
+            self.categories.putAssumeCapacity(record.id, .{
+                .parent_id = record.parent_id,
+                .name = record.name,
+                .named_country = record.named_country,
+                .files_things_by_name = record.files_things_by_name == 1,
+            });
+            if (self.strings.get(record.name).len > 0) {
+                try self.list_category_name(allocator, record.name, record.id);
+            }
+        }
+        assert(self.categories.count() == count);
+        assert(self.category_names.count() <= count);
+    }
+
+    fn snapshot_restore_links(
+        self: *FactsIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        const count = try payload.take_u64();
+        if (count > snapshot_rows_max) return error.SnapshotCorrupt;
+        try self.links.ensureTotalCapacity(allocator, @intCast(count));
+        const strings_total = self.strings.values.items.len;
+        for (0..@intCast(count)) |_| {
+            var record: LinkRecord = undefined;
+            try payload.take(std.mem.asBytes(&record));
+            if (record.id == 0) return error.SnapshotCorrupt;
+            if (record.host >= strings_total) return error.SnapshotCorrupt;
+            if (record.domain >= strings_total) return error.SnapshotCorrupt;
+            if (record.site >= strings_total) return error.SnapshotCorrupt;
+            if (record.hosted > 1) return error.SnapshotCorrupt;
+            if (record.subdomain > record.hosted) return error.SnapshotCorrupt;
+            if (self.links.contains(record.id)) return error.SnapshotCorrupt;
+            self.links.putAssumeCapacity(record.id, .{
+                .category_id = record.category_id,
+                .host = record.host,
+                .domain = record.domain,
+                .site = record.site,
+                .cctld = record.cctld,
+                .status = record.status,
+                .hosted = record.hosted == 1,
+                .subdomain = record.subdomain == 1,
+            });
+        }
+        assert(self.links.count() == count);
+    }
+
+    fn snapshot_restore_entities(
+        self: *FactsIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        const count = try payload.take_u64();
+        if (count > snapshot_rows_max) return error.SnapshotCorrupt;
+        try self.entities.ensureTotalCapacity(allocator, @intCast(count));
+        for (0..@intCast(count)) |_| {
+            var record: EntityRecord = undefined;
+            try payload.take(std.mem.asBytes(&record));
+            if (record.link_id == 0) return error.SnapshotCorrupt;
+            if (record.country_count > entities.countries_max) return error.SnapshotCorrupt;
+            if (record.people_count > entities.names_max) return error.SnapshotCorrupt;
+            if (record.org_count > entities.names_max) return error.SnapshotCorrupt;
+            if (record.religions & ~entities.religion_mask != 0) return error.SnapshotCorrupt;
+            if (self.entities.contains(record.link_id)) return error.SnapshotCorrupt;
+            const names: usize = @as(usize, record.people_count) + record.org_count;
+            for (record.name_ids[0..names]) |id| try self.snapshot_list_name(allocator, id);
+            var fact: EntityFact = .{
+                .religions = record.religions,
+                .country_count = record.country_count,
+                .people_count = record.people_count,
+                .org_count = record.org_count,
+            };
+            const country_count: usize = record.country_count;
+            @memcpy(fact.countries[0..country_count], record.countries[0..country_count]);
+            @memcpy(fact.name_ids[0..names], record.name_ids[0..names]);
+            self.entities.putAssumeCapacity(record.link_id, fact);
+        }
+        assert(self.entities.count() == count);
+    }
+
+    /// `intern_name` keeps one id per folded name, the first display form interned, so every
+    /// name id an entity carries maps back to its own folded form without ambiguity.
+    fn snapshot_list_name(self: *FactsIndex, allocator: std.mem.Allocator, id: StringId) !void {
+        if (id >= self.strings.values.items.len) return error.SnapshotCorrupt;
+        const display = self.strings.get(id);
+        if (display.len == 0) return error.SnapshotCorrupt;
+        if (display.len > entities.name_len_max) return error.SnapshotCorrupt;
+        var folded_buffer: [entities.name_len_max]u8 = undefined;
+        const folded = std.ascii.lowerString(&folded_buffer, display);
+        if (self.name_ids.contains(folded)) return;
+
+        const owned = try allocator.dupe(u8, folded);
+        errdefer allocator.free(owned);
+
+        try self.name_ids.put(allocator, owned, id);
+        assert(self.name_ids.contains(folded));
+        assert(self.name_ids.count() <= self.strings.values.items.len);
     }
 
     pub fn link_count(self: *FactsIndex, io: std.Io) usize {
@@ -1255,6 +1579,97 @@ test "subtree_link_ids collects the links under known roots and nothing for unkn
     const none = try index.subtree_link_ids(io, allocator, &.{ 999, 998 });
     defer allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+// Goal: a snapshot round trip reproduces the index. Method: load links on two hosts, write the
+// section into a buffer, restore it into a fresh index and compare counts, strings and a query.
+test "snapshot round trip reproduces links, strings and a domain query" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    index.begin_load(io);
+    const one = test_link(.{ .id = 1, .category_id = 10 }, "http://one.tripod.com/");
+    const two = test_link(.{ .id = 2, .category_id = 10 }, "http://two.tripod.com/");
+    const three = test_link(.{ .id = 3, .category_id = 11 }, "http://www.example.org/");
+    try index.load_link(io, allocator, &one);
+    try index.load_link(io, allocator, &two);
+    try index.load_link(io, allocator, &three);
+    index.finish_load(io, allocator);
+
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    var payload = derived_snapshot.SectionWriter.init(&writer);
+    try index.snapshot_write(io, &payload);
+
+    var reader = std.Io.Reader.fixed(buffer[0..writer.end]);
+    var incoming = derived_snapshot.SectionReader.init(&reader);
+    var restored: FactsIndex = .{};
+    defer restored.deinit(allocator);
+    try restored.snapshot_restore(allocator, &incoming);
+    try testing.expectEqual(payload.bytes, incoming.bytes);
+    try testing.expectEqual(payload.crc.final(), incoming.crc.final());
+    restored.ready.store(true, .release);
+
+    try testing.expectEqual(index.links.count(), restored.links.count());
+    try testing.expectEqual(index.strings.values.items.len, restored.strings.values.items.len);
+    const domain_of_two = restored.strings.get(restored.links.get(2).?.domain);
+    try testing.expectEqualStrings("tripod.com", domain_of_two);
+    try testing.expect(restored.links.get(3).?.subdomain == false);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const on_tripod = try restored.query(io, allocator, arena.allocator(), .{
+        .domain_suffix = "tripod.com",
+        .subdomain_only = true,
+        .page_limit = 5,
+    });
+    try testing.expectEqual(@as(u64, 2), on_tripod.total);
+}
+
+// Goal: a damaged section never half-fills an index. Method: restore from a truncated buffer
+// and from one whose link row names a string the table does not hold.
+test "snapshot restore refuses a truncated section and a row with a foreign string id" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    index.begin_load(io);
+    const one = test_link(.{ .id = 1, .category_id = 10 }, "http://one.tripod.com/");
+    try index.load_link(io, allocator, &one);
+    index.finish_load(io, allocator);
+
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    var payload = derived_snapshot.SectionWriter.init(&writer);
+    try index.snapshot_write(io, &payload);
+    const written = buffer[0..writer.end];
+
+    var truncated_reader = std.Io.Reader.fixed(written[0 .. written.len - 8]);
+    var truncated = derived_snapshot.SectionReader.init(&truncated_reader);
+    var from_truncated: FactsIndex = .{};
+    defer from_truncated.deinit(allocator);
+    try testing.expectError(
+        error.EndOfStream,
+        from_truncated.snapshot_restore(allocator, &truncated),
+    );
+    from_truncated.snapshot_discard(allocator);
+
+    // The link row is the last 40 bytes: its host id sits right after the two u64s.
+    const host_offset = written.len - @sizeOf(LinkRecord) + 16;
+    std.mem.writeInt(u32, written[host_offset..][0..4], 9999, .little);
+    var foreign_reader = std.Io.Reader.fixed(written);
+    var foreign = derived_snapshot.SectionReader.init(&foreign_reader);
+    var from_foreign: FactsIndex = .{};
+    defer from_foreign.deinit(allocator);
+    try testing.expectError(
+        error.SnapshotCorrupt,
+        from_foreign.snapshot_restore(allocator, &foreign),
+    );
+    from_foreign.snapshot_discard(allocator);
+    try testing.expectEqual(@as(usize, 0), from_foreign.links.count());
 }
 
 // While loading, apply a newer insert and a delete before the loader hands over its older reads
