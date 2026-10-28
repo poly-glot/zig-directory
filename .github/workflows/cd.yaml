@@ -30,9 +30,14 @@ jobs:
     name: Build & Push Docker Images
     outputs:
       REPO_PATH: ${{ steps.get-ocir-repository.outputs.repo_path }}
+      BACKEND_SHA: ${{ steps.backend.outputs.sha }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          # The backend tag below is the last commit that touched its inputs,
+          # which needs the history, not just the checked-out commit.
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,18 +55,41 @@ jobs:
         with:
           auth_token: ${{ secrets.OCI_AUTH_TOKEN }}
 
+      # dmozdb restarts whenever its image tag changes, and a restart costs
+      # about fifteen minutes of search while it rescans an 18 GB store to
+      # rebuild its in-memory indexes. So the backend is tagged by the last
+      # commit that touched what Dockerfile.backend copies in (plus the file
+      # itself), not by the push: a merge that leaves those alone keeps the
+      # tag, skips the build, and leaves the StatefulSet untouched. The web
+      # and mcp Deployments restart in seconds and keep per-push tags.
+      - name: Resolve the backend image tag
+        id: backend
+        env:
+          REPO_PATH: ${{ steps.get-ocir-repository.outputs.repo_path }}
+        run: |
+          SHA="$(git log -1 --format=%H -- \
+            Dockerfile.backend entrypoint.backend.sh build.zig build.zig.zon \
+            src models/vector_model.bin)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$REPO_PATH:$SHA-backend" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Three images sharing one OCIR repo, distinguished by tag suffix: the
       # Zig backend, the Deno/Fresh frontend and the FastMCP server, each its
       # own OKE workload. All target linux/arm64 (the OKE Ampere A1 nodes);
       # separate gha cache scopes keep the builds from evicting each other.
       - name: Build and push backend
+        if: steps.backend.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.backend
           platforms: linux/arm64
           push: true
-          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ github.event.pull_request.head.sha || github.sha }}-backend"
+          tags: "${{ steps.get-ocir-repository.outputs.repo_path }}:${{ steps.backend.outputs.sha }}-backend"
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
@@ -124,12 +152,13 @@ jobs:
       - name: Deploy
         env:
           REPO_PATH: ${{ needs.ci.outputs.REPO_PATH }}
+          BACKEND_SHA: ${{ needs.ci.outputs.BACKEND_SHA }}
           SHA: ${{ github.sha }}
         run: |
           cd deployment/overlays/main
 
           kustomize edit set image \
-            dmozdb-backend=$REPO_PATH:$SHA-backend \
+            dmozdb-backend=$REPO_PATH:$BACKEND_SHA-backend \
             dmozdb-web=$REPO_PATH:$SHA-web \
             dmozdb-mcp=$REPO_PATH:$SHA-mcp
 
