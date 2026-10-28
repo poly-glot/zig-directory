@@ -144,6 +144,7 @@ test {
     _ = @import("facts/sites.zig");
     _ = @import("facts/facts_index.zig");
     _ = @import("facts/entities.zig");
+    _ = @import("derived_snapshot.zig");
 }
 
 // Goal: the documented defaults are the real defaults. Method: compare a default Config field

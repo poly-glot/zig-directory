@@ -6,6 +6,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const schema = @import("schema.zig");
 const ranking = @import("ranking.zig");
+const derived_snapshot = @import("derived_snapshot.zig");
 
 const dimensions = schema.embedding_dimensions;
 const Row = [dimensions]i8;
@@ -147,6 +148,65 @@ pub const VectorIndex = struct {
         return self.ids.items.len;
     }
 
+    /// One consistent cut of the three column arrays under the shared lock; the position map
+    /// is rebuilt on restore.
+    pub fn snapshot_write(
+        self: *VectorIndex,
+        io: std.Io,
+        payload: *derived_snapshot.SectionWriter,
+    ) !void {
+        self.lock.lockSharedUncancelable(io);
+        defer self.lock.unlockShared(io);
+        assert(self.ready.load(.acquire));
+        assert(self.ids.items.len == self.scales.items.len);
+        assert(self.ids.items.len == self.rows.items.len);
+        try payload.put_u64(self.ids.items.len);
+        try payload.put(std.mem.sliceAsBytes(self.ids.items));
+        try payload.put(std.mem.sliceAsBytes(self.scales.items));
+        try payload.put(std.mem.sliceAsBytes(self.rows.items));
+    }
+
+    pub fn snapshot_restore(
+        self: *VectorIndex,
+        allocator: std.mem.Allocator,
+        payload: *derived_snapshot.SectionReader,
+    ) !void {
+        assert(!self.ready.load(.acquire));
+        assert(self.ids.items.len == 0);
+        const count_stored = try payload.take_u64();
+        if (count_stored > std.math.maxInt(u32)) return error.SnapshotCorrupt;
+        const rows: usize = @intCast(count_stored);
+        try self.ids.resize(allocator, rows);
+        try self.scales.resize(allocator, rows);
+        try self.rows.resize(allocator, rows);
+        try self.position.ensureTotalCapacity(allocator, @intCast(rows));
+        try payload.take(std.mem.sliceAsBytes(self.ids.items));
+        try payload.take(std.mem.sliceAsBytes(self.scales.items));
+        try payload.take(std.mem.sliceAsBytes(self.rows.items));
+        for (self.ids.items, self.scales.items, 0..) |id, scale, index| {
+            if (id == 0) return error.SnapshotCorrupt;
+            if (!std.math.isFinite(scale)) return error.SnapshotCorrupt;
+            if (!(scale > 0)) return error.SnapshotCorrupt;
+            if (self.position.contains(id)) return error.SnapshotCorrupt;
+            self.position.putAssumeCapacity(id, @intCast(index));
+        }
+        assert(self.position.count() == rows);
+        assert(self.ids.items.len == self.rows.items.len);
+    }
+
+    pub fn snapshot_discard(self: *VectorIndex, allocator: std.mem.Allocator) void {
+        assert(!self.ready.load(.acquire));
+        self.ids.deinit(allocator);
+        self.scales.deinit(allocator);
+        self.rows.deinit(allocator);
+        self.position.deinit(allocator);
+        self.ids = .empty;
+        self.scales = .empty;
+        self.rows = .empty;
+        self.position = .empty;
+        assert(self.position.count() == 0);
+    }
+
     pub fn nearest(
         self: *VectorIndex,
         io: std.Io,
@@ -208,6 +268,44 @@ fn stored_vector(id: u64, embedding: *const Embedding) schema.StoredVector {
     const quantized = quantize(embedding).?;
     assert(quantized.scale > 0);
     return .{ .id = id, .scale = quantized.scale, .values = quantized.values };
+}
+
+// Goal: a snapshot round trip reproduces the rows and the positions. Method: put three axis
+// vectors, remove the middle one, write, restore into a fresh index and compare row by row.
+test "snapshot round trip reproduces the rows, scales and positions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var index: VectorIndex = .{};
+    defer index.deinit(allocator);
+    try index.put(io, allocator, &stored_vector(5, &unit_vector(0)));
+    try index.put(io, allocator, &stored_vector(6, &unit_vector(1)));
+    try index.put(io, allocator, &stored_vector(7, &unit_vector(2)));
+    index.remove(io, 6);
+    index.ready.store(true, .release);
+
+    var buffer: [8 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    var payload = derived_snapshot.SectionWriter.init(&writer);
+    try index.snapshot_write(io, &payload);
+
+    var reader = std.Io.Reader.fixed(buffer[0..writer.end]);
+    var incoming = derived_snapshot.SectionReader.init(&reader);
+    var restored: VectorIndex = .{};
+    defer restored.deinit(allocator);
+    try restored.snapshot_restore(allocator, &incoming);
+    try std.testing.expectEqual(payload.crc.final(), incoming.crc.final());
+    restored.ready.store(true, .release);
+
+    try std.testing.expectEqual(@as(usize, 2), restored.count(io));
+    try std.testing.expectEqualSlices(u64, index.ids.items, restored.ids.items);
+    try std.testing.expectEqualSlices(f32, index.scales.items, restored.scales.items);
+    for (index.ids.items) |id| {
+        const at = index.position.get(id).?;
+        const copy_at = restored.position.get(id).?;
+        const row: []const i8 = &index.rows.items[at];
+        const copy: []const i8 = &restored.rows.items[copy_at];
+        try std.testing.expectEqualSlices(i8, row, copy);
+    }
 }
 
 // Fill two rows with the extreme int8 values in different patterns and compare the vector dot

@@ -19,6 +19,10 @@ spec:
       # legacy service-link env var, clobbering the backend's own DMOZDB_PORT.
       # The app needs no service-link vars, so disable them.
       enableServiceLinks: false
+      # On SIGTERM dmozdb checkpoints and then writes the derived-index snapshot
+      # (~0.8 GB at the volume's ~24 MB/s); the 30 s default would SIGKILL it
+      # mid-write and the next boot would rescan the store for fifteen minutes.
+      terminationGracePeriodSeconds: 300
       containers:
         - name: dmozdb
           image: dmozdb-backend:latest
