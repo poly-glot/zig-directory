@@ -22,7 +22,7 @@ images:
   newTag: 937ad27039f9b4f80102c13a5ca02c75a390a137-backend
 - name: dmozdb-mcp
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: 937ad27039f9b4f80102c13a5ca02c75a390a137-mcp
+  newTag: 8cf6a0385f0e08f97d8bd41225d4c7a613fb28b3-mcp
 - name: dmozdb-web
   newName: lhr.ocir.io/lrhvckxzwf3l/zig-directory
-  newTag: 937ad27039f9b4f80102c13a5ca02c75a390a137-web
+  newTag: 8cf6a0385f0e08f97d8bd41225d4c7a613fb28b3-web
