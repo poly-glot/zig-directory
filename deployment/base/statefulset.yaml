@@ -49,6 +49,13 @@ spec:
             # default; 128 MiB cleared them on the live fleet (2026-10-28).
             - name: DMOZDB_SCRATCH_SLAB_MB
               value: "128"
+            # The derived-index snapshot follows every checkpoint and holds each
+            # index's lock while its section goes to disk: measured 46.7 s for
+            # the 1.17 GB file on 2026-10-28, during which the apply path waits.
+            # Hourly keeps that to one window an hour; a clean shutdown always
+            # writes a fresh snapshot, so only a crash pays a full rescan.
+            - name: DMOZDB_SNAPSHOT_INTERVAL_S
+              value: "3600"
             # The verifier rescans the whole 17 GB store (15 min per pass);
             # links are rarely added, so one pass a month is plenty. The
             # run_verifier op still triggers a pass on demand.
