@@ -15,6 +15,7 @@ const changeset = @import("../changeset.zig");
 const link_operations = @import("operations_link.zig");
 const category = @import("operations_category.zig");
 const search = @import("operations_search.zig");
+const scratch_memory = @import("../scratch.zig");
 
 const load_chunk: u32 = 512;
 pub const query_words_max: usize = 32;
@@ -229,7 +230,7 @@ pub fn query_links(
         query.allowed_ids = &allowed;
     }
     if (request.words.len == 0) assert(query.allowed_ids == null);
-    const answer = try db.facts.query(db.io, db.scratch(), arena, query);
+    const answer = try db.facts.query(db.io, db.allocator, arena, query);
     assert(answer.page.len <= request.facts.page_limit);
 
     var links = try std.ArrayListUnmanaged(QueriedLink).initCapacity(arena, answer.page.len);
@@ -350,6 +351,56 @@ test "query_links is not ready until the loader has read the trees" {
 
     try load_facts_index(db);
     try testing.expect((try query_links(db, &.{}, arena_state.allocator())).ready);
+}
+
+// Goal: the category views a query rebuilds outlive the request that rebuilt them; on
+// 2026-11-19 they were allocated from the request's scratch slab and a later large request
+// overwrote them, which crashed production. Method: let the first query after a category
+// write run inside a request, fill the same slab with noise in a second request, then ask
+// again in a third.
+test "category views rebuilt inside a request survive that request's scratch slab" {
+    var temporary_directory = testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    const db = try Directory.open_test_instance(testing.allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+    try load_facts_index(db);
+
+    const top = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const arts = try category.create_category(
+        db,
+        top,
+        .{ .name = "Arts", .slug = "arts", .description = "" },
+    );
+    _ = try link_operations.create_link(
+        db,
+        arts,
+        .{ .url = "http://example.com/", .title = "Example", .description = "" },
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const under_arts: LinkQuery = .{ .facts = .{ .category_id = arts } };
+
+    scratch_memory.begin(&db.scratch_pool);
+    const first = answer_for(db, arena, under_arts);
+    scratch_memory.end();
+    try testing.expectEqual(@as(u64, 1), (try first).total);
+
+    scratch_memory.begin(&db.scratch_pool);
+    const noise = db.scratch().alloc(u8, db.scratch_pool.slab_bytes);
+    if (noise) |bytes| @memset(bytes, 0xAA) else |_| {}
+    scratch_memory.end();
+    _ = try noise;
+
+    scratch_memory.begin(&db.scratch_pool);
+    const second = answer_for(db, arena, under_arts);
+    scratch_memory.end();
+    try testing.expectEqual(@as(u64, 1), (try second).total);
 }
 
 // Goal: the live facts index follows creates, moves, edits, deletes and status changes, and a

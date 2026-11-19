@@ -577,7 +577,12 @@ fn subtree_candidates(
     var root_ids: [category_candidates]u64 = undefined;
     for (roots, root_ids[0..roots.len]) |root, *id| id.* = root.id;
 
-    const ids = try db.facts.subtree_link_ids(db.io, db.scratch(), root_ids[0..roots.len]);
+    const ids = try db.facts.subtree_link_ids(
+        db.io,
+        db.allocator,
+        db.scratch(),
+        root_ids[0..roots.len],
+    );
     defer db.scratch().free(ids);
 
     const scored = db.link_vector_index.score_ids(db.io, ids, unit, out);
