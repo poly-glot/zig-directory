@@ -59,6 +59,17 @@ export interface DbStats {
   walPending: number;
 }
 
+export interface OpLatency {
+  op: number;
+  p50Ns: number;
+  p95Ns: number;
+  p99Ns: number;
+  p999Ns: number;
+  maxNs: number;
+  meanNs: number;
+  samples: number;
+}
+
 export interface BrowseResult {
   category: Category;
   ancestors: Category[];
@@ -724,6 +735,22 @@ export class DmozClient {
       cacheMisses: r.u64(),
       walPending: r.u64(),
     };
+  }
+
+  async opLatency(): Promise<OpLatency[]> {
+    const resp = await this.request(Op.OpLatencyStats, new Uint8Array(0));
+    this.assertOk(resp);
+    const r = new BufferReader(resp.payload);
+    return Array.from({ length: r.u8() }, () => ({
+      op: r.u8(),
+      p50Ns: r.u64(),
+      p95Ns: r.u64(),
+      p99Ns: r.u64(),
+      p999Ns: r.u64(),
+      maxNs: r.u64(),
+      meanNs: r.u64(),
+      samples: r.u64(),
+    }));
   }
 
   // -- Categories --

@@ -81,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
 
     try write_header(writer);
     try tsgen.writeOpEnum(writer, "Op", protocol.Op);
+    try tsgen.writeStatusMap(writer, "OP_NAME", protocol.Op);
     try tsgen.writeStatusEnum(writer, "Status", protocol.Status);
     try tsgen.writeStatusEnum(writer, "SubStatus", protocol.SubStatus);
     try tsgen.writeStatusMap(writer, "STATUS_MSG", protocol.Status);
