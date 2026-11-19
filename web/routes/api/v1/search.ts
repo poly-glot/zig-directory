@@ -3,6 +3,7 @@ import { getClient } from "../../../lib/dmoz-client.ts";
 import { categoryPath } from "../../../lib/format.ts";
 import { embedQuery } from "../../../lib/embedder.ts";
 import { rankedQuery } from "../../search/_lib/targets.ts";
+import { logSearch, stopwatch } from "../../../lib/timing.ts";
 import { categoryJson, errorResponse, linkJson, pageSize } from "./_lib/api.ts";
 
 type Scope = "both" | "links" | "categories";
@@ -27,21 +28,33 @@ export const handler = define.handlers({
     }
     try {
       const client = getClient();
+      const watch = stopwatch();
       const scope = parseScope(searchParams.get("scope"));
       const ranked = rankedQuery(query);
-      const result = await client.search(ranked, {
-        limit: pageSize(searchParams.get("limit")),
-        scope,
-        mode: "ranked",
-        capPerSite: true,
-        queryEmbedding: scope === "categories"
-          ? undefined
-          : await embedQuery(ranked),
+      const queryEmbedding = scope === "categories"
+        ? undefined
+        : await watch.time("embed", () => embedQuery(ranked));
+      const result = await watch.time("search", () =>
+        client.search(ranked, {
+          limit: pageSize(searchParams.get("limit")),
+          scope,
+          mode: "ranked",
+          capPerSite: true,
+          queryEmbedding,
+        }));
+      const chains = await watch.time("crumbs", () =>
+        client.breadcrumbsByIds([
+          ...result.categories.map((c) => c.id),
+          ...result.links.map((l) => l.categoryId),
+        ]));
+
+      logSearch({
+        query,
+        path: "api",
+        links: result.links.length,
+        categories: result.categories.length,
+        watch,
       });
-      const chains = await client.breadcrumbsByIds([
-        ...result.categories.map((c) => c.id),
-        ...result.links.map((l) => l.categoryId),
-      ]);
       return Response.json({
         query,
         categories: result.categories.map((c) =>
@@ -54,7 +67,7 @@ export const handler = define.handlers({
           site: l.site,
           moreFromSite: l.moreFromSite,
         })),
-      });
+      }, { headers: { "Server-Timing": watch.serverTiming() } });
     } catch (e) {
       return errorResponse(e);
     }
