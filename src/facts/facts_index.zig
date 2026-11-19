@@ -836,7 +836,7 @@ pub const FactsIndex = struct {
         }
         assert(filled == rows.len);
         try self.by_name.rebuild(gpa, rows);
-        assert(self.by_name.link_ids.len == names_total);
+        assert(self.by_name.link_ids.len <= names_total);
     }
 
     /// The links whose registrable domain `suffix` sits at or below, or null when `suffix` is
@@ -2000,7 +2000,10 @@ test "every driver answers what a scan of every link answers, through writes and
     var buffer: [256]u8 = undefined;
     const named = try entity_blob(&buffer, &.{.islam}, &.{"PK"}, &.{}, &.{"Jamia Farooqia"});
     try put_entities(&index, io, allocator, 3, named);
-    try put_entities(&index, io, allocator, 5, named);
+    var twice_buffer: [256]u8 = undefined;
+    const farooqia = [_][]const u8{"Jamia Farooqia"};
+    const named_twice = try entity_blob(&twice_buffer, &.{}, &.{}, &farooqia, &farooqia);
+    try put_entities(&index, io, allocator, 5, named_twice);
 
     var words: IdSet = .empty;
     defer words.deinit(allocator);

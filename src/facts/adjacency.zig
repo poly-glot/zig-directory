@@ -33,11 +33,13 @@ pub const Adjacency = struct {
         self.* = .{};
     }
 
-    /// Replaces every group with `rows`, which are sorted in place. The old groups stay intact
-    /// if an allocation fails, so a reader never sees half of each.
-    pub fn rebuild(self: *Adjacency, gpa: std.mem.Allocator, rows: []Row) !void {
-        assert(rows.len <= rows_max);
-        std.sort.pdq(Row, rows, {}, Row.before);
+    /// Replaces every group with `unsorted`, which is sorted in place. A row given twice (a
+    /// link naming one entity as both a person and an organisation) is kept once, so a group
+    /// never lists a link twice. The old groups stay intact if an allocation fails.
+    pub fn rebuild(self: *Adjacency, gpa: std.mem.Allocator, unsorted: []Row) !void {
+        assert(unsorted.len <= rows_max);
+        std.sort.pdq(Row, unsorted, {}, Row.before);
+        const rows = without_repeats(unsorted);
 
         const keys = try gpa.alloc(u64, distinct_keys(rows));
         errdefer gpa.free(keys);
@@ -78,10 +80,23 @@ pub const Adjacency = struct {
     }
 };
 
+/// Compacts sorted rows over their repeats and returns the rows that remain.
+fn without_repeats(sorted: []Row) []Row {
+    var kept: usize = 0;
+    for (sorted, 0..) |row, index| {
+        if (index > 0) assert(!Row.before({}, row, sorted[index - 1]));
+        if (kept > 0 and std.meta.eql(sorted[kept - 1], row)) continue;
+        sorted[kept] = row;
+        kept += 1;
+    }
+    assert(kept <= sorted.len);
+    return sorted[0..kept];
+}
+
 fn distinct_keys(sorted: []const Row) usize {
     var distinct: usize = 0;
     for (sorted, 0..) |row, index| {
-        if (index > 0) assert(!Row.before({}, row, sorted[index - 1]));
+        if (index > 0) assert(Row.before({}, sorted[index - 1], row));
         if (index == 0 or sorted[index - 1].key != row.key) distinct += 1;
     }
     assert(distinct <= sorted.len);
@@ -95,8 +110,8 @@ fn order_u64(context: u64, item: u64) std.math.Order {
 const testing = std.testing;
 
 // Goal: a rebuild groups rows by key whatever order they arrive in, and a lookup returns each
-// group's links in ascending order. Method: build from shuffled rows, look up every key, a
-// missing key, then rebuild from nothing.
+// group's links in ascending order, each once. Method: build from shuffled rows with one row
+// repeated, look up every key and a missing key, then rebuild from nothing.
 test "adjacency groups rows by key and answers a missing key with nothing" {
     var groups: Adjacency = .{};
     defer groups.deinit(testing.allocator);
@@ -108,6 +123,7 @@ test "adjacency groups rows by key and answers a missing key with nothing" {
         .{ .key = 9, .link_id = 4 },
         .{ .key = 2, .link_id = 10 },
         .{ .key = 5, .link_id = 77 },
+        .{ .key = 9, .link_id = 30 },
     };
     try groups.rebuild(testing.allocator, &rows);
 
