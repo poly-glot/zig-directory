@@ -10,6 +10,7 @@ const protocol = zigstore.protocol;
 const inverted = zigstore.inverted_index;
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
+const Stage = @import("directory.zig").Stage;
 const operations = @import("operations/operations.zig");
 const operations_shared = @import("operations/operations_shared.zig");
 const facts_index = @import("facts/facts_index.zig");
@@ -123,6 +124,13 @@ pub const Op = enum(u8) {
     put_category_vectors = 41,
     ping = 255,
 };
+
+comptime {
+    // A stage is timed into the op latency table at its own value, so it must not be an op.
+    for (@typeInfo(Stage).@"enum".fields) |stage| {
+        assert(std.enums.fromInt(Op, stage.value) == null);
+    }
+}
 
 pub const get_categories_by_ids_max: u16 = 200;
 pub const breadcrumbs_by_ids_max: u16 = 200;
@@ -767,10 +775,6 @@ fn handle_browse_path(db: *Directory, response: []u8, op_byte: u8, payload: []co
         db.memtable_cat_by_parent(),
         db.cat_by_parent(),
     ) catch |err| log.warn("drain skipped before read: {}", .{err});
-    db.drain_one_memtable(
-        db.memtable_link_by_category(),
-        db.link_by_category(),
-    ) catch |err| log.warn("drain skipped before read: {}", .{err});
 
     if (response.len < browse_frame_bytes_min) return write_error_response(response, op_byte, .err);
 
@@ -790,47 +794,14 @@ fn handle_browse_path(db: *Directory, response: []u8, op_byte: u8, payload: []co
     var offset = append_row(response, response_header_size, &category);
     offset = write_counted_category_rows(response, offset, ancestors, 2 + 8);
     offset = write_counted_category_rows(response, offset, children, 8);
-    offset = write_u64s(response, offset, &.{subtree_link_total(db, category_id)});
+    // The row carries its subtree total. Counting it here meant a scan of the whole
+    // link_by_category index on each category's first visit: p50 210 ms over 1.78M calls on
+    // production (2026-11-19), the largest share of dmozdb's time.
+    offset = write_u64s(response, offset, &.{category.link_count_subtree});
     assert(offset <= response.len);
 
     write_ok_header(response, op_byte, offset, 0);
     return offset;
-}
-
-fn subtree_link_total(db: *Directory, category_id: u64) u64 {
-    if (db.subtree_cache.get_link_count(category_id)) |hit| return hit;
-
-    const descendants = subtree.collect_descendants_cached(
-        db.cat_by_parent(),
-        category_id,
-        &db.subtree_cache,
-        db.scratch(),
-    ) catch |err| {
-        log.warn(
-            "browse_path: descendants of {d} unavailable, reporting 0 subtree links: {}",
-            .{ category_id, err },
-        );
-        return 0;
-    };
-    defer db.scratch().free(descendants);
-
-    assert(descendants.len >= 1);
-    assert(descendants.len <= subtree.descendants_max);
-    const total = subtree.count_subtree_links(
-        db.link_by_category(),
-        descendants,
-        db.scratch(),
-    ) catch |err| {
-        log.warn(
-            "browse_path: subtree link count of {d} unavailable, reporting 0: {}",
-            .{ category_id, err },
-        );
-        return 0;
-    };
-    db.subtree_cache.put_link_count(.{ .root = category_id, .count = total }) catch |err| {
-        log.warn("browse_path: subtree link count of {d} not cached: {}", .{ category_id, err });
-    };
-    return total;
 }
 
 const OptionalListExtras = struct { status: ?u8, after_id: u64 };
@@ -2436,6 +2407,30 @@ test "op_latency_stats (23): empty histograms produce count=0 response" {
     try std.testing.expectEqual(@as(usize, response_header_size + 1), offset);
     try std.testing.expectEqual(@intFromEnum(Status.ok), response[5]);
     try std.testing.expectEqual(@as(u8, 0), response[response_header_size]);
+}
+
+// Goal: a timed stage shows up in the latency frame under its own value, beside the ops.
+// Method: time one stage twice and read the frame.
+test "op_latency_stats (23): reports a timed stage beside the ops" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    db.time_stage(.search_subtree).stop();
+    db.time_stage(.search_subtree).stop();
+
+    var response: [4096]u8 = undefined;
+    const reply_len = handle_op_latency_stats(db, &response, @intFromEnum(Op.op_latency_stats));
+    const per_row: usize = 1 + 7 * @sizeOf(u64);
+    try std.testing.expectEqual(response_header_size + 1 + per_row, reply_len);
+    try std.testing.expectEqual(@as(u8, 1), response[response_header_size]);
+
+    const row = response[response_header_size + 1 ..][0..per_row];
+    try std.testing.expectEqual(@intFromEnum(Stage.search_subtree), row[0]);
+    const samples = std.mem.readInt(u64, row[per_row - 8 ..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 2), samples);
 }
 
 // Pipelines five pings through process_frames and finds a ping row with five samples.

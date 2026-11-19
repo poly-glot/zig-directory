@@ -114,6 +114,30 @@ pub const Stats = struct {
     wal_pending_batch_entries: u64 = 0,
 };
 
+/// The legs of a search, timed into the slots of the per-op latency table that no op uses, so
+/// op 23 reports them beside the ops without a change to its frame. `binary_protocol.zig`
+/// asserts at compile time that no stage shares a value with an op.
+pub const Stage = enum(u8) {
+    search_keyword = 200,
+    search_vector_shortlist = 201,
+    search_vector_rerank = 202,
+    search_subtree = 203,
+    search_fetch = 204,
+};
+
+pub const StageClock = struct {
+    directory: *Directory,
+    stage: Stage,
+    started: std.Io.Timestamp,
+
+    pub fn stop(clock: StageClock) void {
+        const directory = clock.directory;
+        const elapsed = clock.started.untilNow(directory.io, .awake).toNanoseconds();
+        assert(elapsed >= 0);
+        directory.op_latency[@intFromEnum(clock.stage)].recordValue(@intCast(elapsed));
+    }
+};
+
 pub const url_bloom_capacity_initial: u64 = 1_000_000;
 pub const derived_counts_version_current: u64 = 1;
 const memtable_flush_interval_ns: u64 = 5 * std.time.ns_per_ms;
@@ -195,6 +219,17 @@ pub const Directory = struct {
         }
         directory.await_durable(deferred_durable_seq.?);
         return written;
+    }
+
+    /// Starts timing one leg of an op; `stop` records it. A leg that returns early without
+    /// stopping is simply not recorded.
+    pub fn time_stage(self: *Directory, stage: Stage) StageClock {
+        assert(self.op_latency.len == 256);
+        return .{
+            .directory = self,
+            .stage = stage,
+            .started = std.Io.Clock.awake.now(self.io),
+        };
     }
 
     /// Memory that lives no longer than the current request: the thread's scratch slab inside

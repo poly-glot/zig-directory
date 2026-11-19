@@ -87,6 +87,14 @@ export const OP_NAME: Record<number, string> = {
   255: "ping",
 };
 
+export const STAGE_NAME: Record<number, string> = {
+  200: "search keyword",
+  201: "search vector shortlist",
+  202: "search vector rerank",
+  203: "search subtree",
+  204: "search fetch",
+};
+
 export const enum Status {
   Ok = 0,
   NotFound = 1,

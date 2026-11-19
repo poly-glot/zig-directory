@@ -16,7 +16,6 @@ pub const SubtreeError = error{ SubtreeTooLarge, OutOfMemory };
 
 pub const SubtreeCache = struct {
     descendants: std.AutoHashMap(u64, []u64),
-    link_counts: std.AutoHashMap(u64, u64),
     mutex: std.Io.RwLock,
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -24,7 +23,6 @@ pub const SubtreeCache = struct {
     pub fn init(io: std.Io, allocator: std.mem.Allocator) SubtreeCache {
         return .{
             .descendants = std.AutoHashMap(u64, []u64).init(allocator),
-            .link_counts = std.AutoHashMap(u64, u64).init(allocator),
             .mutex = .init,
             .io = io,
             .allocator = allocator,
@@ -34,7 +32,6 @@ pub const SubtreeCache = struct {
     pub fn deinit(self: *SubtreeCache) void {
         self.free_descendant_lists();
         self.descendants.deinit();
-        self.link_counts.deinit();
     }
 
     fn free_descendant_lists(self: *SubtreeCache) void {
@@ -75,26 +72,12 @@ pub const SubtreeCache = struct {
         slot.value_ptr.* = copy;
     }
 
-    pub fn get_link_count(self: *SubtreeCache, root: u64) ?u64 {
-        self.mutex.lockSharedUncancelable(self.io);
-        defer self.mutex.unlockShared(self.io);
-        return self.link_counts.get(root);
-    }
-
-    pub fn put_link_count(self: *SubtreeCache, options: struct { root: u64, count: u64 }) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.link_counts.put(options.root, options.count);
-    }
-
     pub fn invalidate_all(self: *SubtreeCache) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.free_descendant_lists();
         self.descendants.clearRetainingCapacity();
-        self.link_counts.clearRetainingCapacity();
         assert(self.descendants.count() == 0);
-        assert(self.link_counts.count() == 0);
     }
 };
 
@@ -244,28 +227,6 @@ pub fn list_subtree_link_ids_scan(
         .link_ids = try page_ids.toOwnedSlice(allocator),
         .total = total,
     };
-}
-
-pub fn count_subtree_links(
-    link_by_category: anytype,
-    descendants: []const u64,
-    allocator: std.mem.Allocator,
-) !u64 {
-    var descendant_set = std.AutoHashMap(u64, void).init(allocator);
-    defer descendant_set.deinit();
-    for (descendants) |descendant| try descendant_set.put(descendant, {});
-    assert(descendant_set.count() == descendants.len);
-
-    var total: u64 = 0;
-    const min_key: [16]u8 = @splat(0);
-    var iterator = try link_by_category.rangeScan(&min_key, null);
-    defer iterator.deinit();
-    while (try iterator.next()) |entry| {
-        if (entry.key.len < 16) continue;
-        const category_id = codec.decodeU64(entry.key[0..8]);
-        if (descendant_set.contains(category_id)) total += 1;
-    }
-    return total;
 }
 
 // Walk a five-node tree rooted at 1 and expect the root included and the ids sorted.

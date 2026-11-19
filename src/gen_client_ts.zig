@@ -8,6 +8,7 @@ const zigstore = @import("zigstore");
 const tsgen = zigstore.tsgen;
 const protocol = @import("binary_protocol.zig");
 const schema = @import("schema.zig");
+const Stage = @import("directory.zig").Stage;
 const entities = @import("facts/entities.zig");
 
 const FixedStringMeta = struct { capacity: u32 };
@@ -82,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
     try write_header(writer);
     try tsgen.writeOpEnum(writer, "Op", protocol.Op);
     try tsgen.writeStatusMap(writer, "OP_NAME", protocol.Op);
+    try tsgen.writeStatusMap(writer, "STAGE_NAME", Stage);
     try tsgen.writeStatusEnum(writer, "Status", protocol.Status);
     try tsgen.writeStatusEnum(writer, "SubStatus", protocol.SubStatus);
     try tsgen.writeStatusMap(writer, "STATUS_MSG", protocol.Status);
