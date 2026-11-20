@@ -2,11 +2,16 @@ import { page } from "fresh";
 import { define } from "../../utils.ts";
 import {
   type BrowseResult,
+  type DmozClient,
   getClient,
   type Link,
 } from "../../lib/dmoz-client.ts";
 import Crumbs from "../../components/common/Crumbs/Crumbs.tsx";
-import { formatCategoryName } from "../../lib/format.ts";
+import { categoryPath, formatCategoryName, pad2 } from "../../lib/format.ts";
+import { buildPathLabel } from "../search/_lib/facets.ts";
+import RelatedCategories, {
+  type RelatedCategory,
+} from "../../components/category/RelatedCategories/RelatedCategories.tsx";
 import CatHero from "../../components/category/CatHero/CatHero.tsx";
 import SubcategoriesList from "../../components/category/SubcategoriesList/SubcategoriesList.tsx";
 import ListingsSection, {
@@ -45,7 +50,40 @@ interface Data {
   tagChips: TagChip[];
   clearTagHref: string;
   rawCount: number;
+  related: RelatedCategory[];
   error?: string;
+}
+
+const RELATED_CATEGORIES = 6;
+
+async function relatedCategories(
+  client: DmozClient,
+  categoryId: number,
+): Promise<RelatedCategory[]> {
+  try {
+    const neighbours = await client.neighbours("category", {
+      categoryId,
+      limit: RELATED_CATEGORIES,
+    });
+    const ids = (neighbours ?? []).map((neighbour) => neighbour.categoryId);
+    if (ids.length === 0) return [];
+
+    const chains = await client.breadcrumbsByIds(ids);
+    const categories = await client.getCategoriesByIds(ids);
+    const subtreeLinks = new Map(
+      categories.map((c) => [c.id, c.linkCountSubtree]),
+    );
+
+    return ids.filter((id) => chains.has(id)).map((id) => ({
+      id,
+      label: buildPathLabel(id, chains),
+      href: `/category/${categoryPath(chains.get(id) ?? [])}`,
+      linkCountSubtree: subtreeLinks.get(id) ?? 0,
+    }));
+  } catch (e) {
+    console.error("relatedCategories failed, the page goes without:", e);
+    return [];
+  }
 }
 
 async function annotateLinks(
@@ -105,6 +143,7 @@ function emptyData(
     tagChips: [],
     clearTagHref: buildToolbarHref(currentPath, 1, sort, ""),
     rawCount: 0,
+    related: [],
     error,
   };
 }
@@ -158,6 +197,9 @@ export const handler = define.handlers<Data>({
         activeTag,
       );
       const sorted = applySort(applyTagFilter(annotated, activeTag), sort);
+      const related = pageNum === 1
+        ? await relatedCategories(client, result.category.id)
+        : [];
 
       return page({
         result,
@@ -171,6 +213,7 @@ export const handler = define.handlers<Data>({
         tagChips,
         clearTagHref: buildToolbarHref(currentPath, pageNum, sort, ""),
         rawCount: annotated.length,
+        related,
       });
     } catch (e) {
       console.error("Failed to browse category path:", e);
@@ -194,6 +237,7 @@ export default define.page<typeof handler>(function CategoryPage(props) {
     tagChips,
     clearTagHref,
     rawCount,
+    related,
     error,
   } = props.data;
   const category = result?.category;
@@ -207,6 +251,8 @@ export default define.page<typeof handler>(function CategoryPage(props) {
   const showListings = !offsetCapHit && rawCount > 0;
   const isEmpty = Boolean(category) && !error && !offsetCapHit &&
     children.length === 0 && rawCount === 0;
+  const sectionsBeforeRelated = Number(children.length > 0) +
+    Number(showListings);
 
   return (
     <>
@@ -263,6 +309,15 @@ export default define.page<typeof handler>(function CategoryPage(props) {
             tagChips={tagChips}
             clearTagHref={clearTagHref}
             rawCount={rawCount}
+          />
+        )
+        : null}
+
+      {related.length > 0
+        ? (
+          <RelatedCategories
+            items={related}
+            num={pad2(sectionsBeforeRelated + 1)}
           />
         )
         : null}

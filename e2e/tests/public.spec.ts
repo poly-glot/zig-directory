@@ -287,3 +287,74 @@ test.describe('Deno App - Static pages (redesign)', () => {
     expect(await rows.count()).toBeGreaterThanOrEqual(1);
   });
 });
+
+test.describe('Deno App - Graph neighbours', () => {
+  test('a site search offers similar sites that lead to their own site search', async ({ page }) => {
+    await page.goto('/search?q=' + encodeURIComponent('sites like imdb.com'), {
+      waitUntil: 'networkidle',
+    });
+
+    const similar = page.locator('[data-suggestion="Similar sites"] a');
+    await expect(similar.first()).toBeVisible();
+    expect(await similar.count()).toBeGreaterThanOrEqual(3);
+
+    const href = await similar.first().getAttribute('href');
+    expect(decodeURIComponent(href ?? '')).toMatch(/^\/search\?q=site:[a-z0-9.-]+$/);
+
+    await similar.first().click();
+    await expect(page.locator('[aria-label^="Remove On "]')).toBeVisible();
+  });
+
+  test('a category page lists related categories that are not its own children', async ({ page }) => {
+    const path = '/category/science/math/number_theory';
+    await page.goto(path, { waitUntil: 'networkidle' });
+
+    const related = page.locator('[data-related-categories] li.list-row a[href^="/category/"]');
+    await expect(related.first()).toBeVisible();
+
+    const hrefs = await related.evaluateAll((links) =>
+      links.map((link) => link.getAttribute('href') ?? '')
+    );
+    expect(hrefs.length).toBeGreaterThanOrEqual(1);
+    for (const href of hrefs) expect(href.startsWith(path + '/')).toBe(false);
+  });
+});
+
+test.describe('Deno App - Roles and facets', () => {
+  test('a role query lists the people filed under it, and offers the plain search', async ({ page }) => {
+    await page.goto('/search?q=' + encodeURIComponent('biographies of politicians'), {
+      waitUntil: 'networkidle',
+    });
+
+    await expect(page.locator('[aria-label="Remove People filed as Politicians"]')).toBeVisible();
+    expect(await page.locator('.cards .card').count()).toBeGreaterThanOrEqual(3);
+    await expect(page.getByText('Search the words instead')).toBeVisible();
+  });
+
+  test('a role nobody is filed under falls back to the ranked search', async ({ page }) => {
+    await page.goto('/search?q=' + encodeURIComponent('prime minister'), {
+      waitUntil: 'networkidle',
+    });
+
+    await expect(page.locator('[aria-label^="Remove People filed as"]')).toHaveCount(0);
+    expect(await page.locator('.cards .card').count()).toBeGreaterThanOrEqual(1);
+  });
+
+  test('a ranked search loads country facets that narrow it', async ({ page }) => {
+    await page.goto('/search?q=' + encodeURIComponent('jazz festival'), {
+      waitUntil: 'networkidle',
+    });
+
+    const facets = page.locator('[data-facet="country"] a');
+    await expect(facets.first()).toBeVisible();
+    expect(await facets.count()).toBeGreaterThanOrEqual(2);
+
+    const href = await facets.first().getAttribute('href');
+    expect(decodeURIComponent((href ?? '').replace(/\+/g, ' '))).toMatch(
+      /^\/search\?q=country:[a-z]{2} jazz festival$/,
+    );
+
+    await facets.first().click();
+    await expect(page.locator('[aria-label^="Remove Tied to "]')).toBeVisible();
+  });
+});

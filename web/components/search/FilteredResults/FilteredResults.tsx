@@ -3,6 +3,7 @@ import type {
   Chip,
   LinkCounts,
   Relaxation,
+  Suggestion,
 } from "../../../routes/search/_lib/types.ts";
 import SectionHead from "../../common/SectionHead/SectionHead.tsx";
 import ResultArticle from "../ResultArticle/ResultArticle.tsx";
@@ -12,6 +13,7 @@ interface Props {
   chips: Chip[];
   plainHref: string;
   relaxations: Relaxation[];
+  suggestions: Suggestion[];
   links: Link[];
   tokens: string[];
   nextHref?: string;
@@ -56,6 +58,27 @@ function Targets({ chips, plainHref }: { chips: Chip[]; plainHref: string }) {
   );
 }
 
+function Suggested({ suggestions }: { suggestions: Suggestion[] }) {
+  return (
+    <>
+      {suggestions.map((suggestion) => (
+        <div
+          key={suggestion.heading}
+          class={styles.suggested}
+          data-suggestion={suggestion.heading}
+        >
+          <span class="micro">{suggestion.heading}</span>
+          {suggestion.chips.map((chip) => (
+            <a key={chip.href} class={styles.chip} href={chip.href}>
+              {chip.label}
+            </a>
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
 function NoMatch({ relaxations }: { relaxations: Relaxation[] }) {
   return (
     <div class="banner">
@@ -82,7 +105,8 @@ function NoMatch({ relaxations }: { relaxations: Relaxation[] }) {
 }
 
 export default function FilteredResults(
-  { chips, plainHref, relaxations, links, tokens, nextHref }: Props,
+  { chips, plainHref, relaxations, suggestions, links, tokens, nextHref }:
+    Props,
 ) {
   return (
     <section class="section">
@@ -91,6 +115,7 @@ export default function FilteredResults(
           <SectionHead num="01" topic="Listings" title="Matching links." />
         </div>
         <Targets chips={chips} plainHref={plainHref} />
+        <Suggested suggestions={suggestions} />
         {links.length === 0
           ? <NoMatch relaxations={relaxations} />
           : (

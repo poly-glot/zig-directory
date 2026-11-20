@@ -59,6 +59,17 @@ export interface DbStats {
   walPending: number;
 }
 
+export interface OpLatency {
+  op: number;
+  p50Ns: number;
+  p95Ns: number;
+  p99Ns: number;
+  p999Ns: number;
+  maxNs: number;
+  meanNs: number;
+  samples: number;
+}
+
 export interface BrowseResult {
   category: Category;
   ancestors: Category[];
@@ -94,6 +105,8 @@ export interface SearchResult {
 }
 
 export const QUERY_LINKS_MAX_ROWS = 50;
+export const CATEGORY_NAMES_MAX = 16;
+export const CATEGORY_NAME_MAX_BYTES = 128;
 export const MATCH_NAMES_MAX = 32;
 export const MATCH_NAME_MAX_BYTES = 128;
 
@@ -101,6 +114,28 @@ export interface NameMatch {
   categoryId: number;
   namesSomeone: boolean;
 }
+
+export type NeighbourKind = "site" | "category" | "entity";
+
+export interface Neighbour {
+  label: string;
+  categoryId: number;
+  shared: number;
+}
+
+export interface NeighbourOf {
+  categoryId?: number;
+  name?: string;
+  limit?: number;
+}
+
+const NEIGHBOUR_KIND_CODE: Record<NeighbourKind, number> = {
+  site: 1,
+  category: 2,
+  entity: 3,
+};
+export const NEIGHBOURS_MAX = 50;
+const NEIGHBOURS_DEFAULT = 8;
 
 export type LinkQueryGroupBy =
   | "none"
@@ -121,6 +156,8 @@ export const COUNTRY_EDGES: readonly CountryEdge[] = [
 
 export interface LinkQuery {
   categoryId?: number;
+  categoryNames?: readonly string[];
+  wordsWithinBudget?: boolean;
   domain?: string;
   country?: string;
   via?: readonly CountryEdge[];
@@ -158,6 +195,7 @@ export interface LinkQueryResult {
   sites: number;
   hosts: number;
   domains: number;
+  categories: number;
   groups: LinkQueryGroup[];
   links: QueriedLink[];
   nextAfterId: number;
@@ -238,6 +276,7 @@ function linkQueryOptions(q: LinkQuery): bigint {
     [q.limit ?? 20, 8],
     [religionMask(q.religions ?? []), 16],
     [q.subdomainOnly ? 1 : 0, 1],
+    [q.wordsWithinBudget ? 1 : 0, 1],
   ];
   let packed = 0n;
   let shift = 0n;
@@ -726,6 +765,22 @@ export class DmozClient {
     };
   }
 
+  async opLatency(): Promise<OpLatency[]> {
+    const resp = await this.request(Op.OpLatencyStats, new Uint8Array(0));
+    this.assertOk(resp);
+    const r = new BufferReader(resp.payload);
+    return Array.from({ length: r.u8() }, () => ({
+      op: r.u8(),
+      p50Ns: r.u64(),
+      p95Ns: r.u64(),
+      p99Ns: r.u64(),
+      p999Ns: r.u64(),
+      maxNs: r.u64(),
+      meanNs: r.u64(),
+      samples: r.u64(),
+    }));
+  }
+
   // -- Categories --
 
   createCategory(
@@ -1200,6 +1255,13 @@ export class DmozClient {
       .str(q.words ?? "")
       .str(q.entity ?? "")
       .u64(q.afterId ?? 0);
+
+    const names = q.categoryNames ?? [];
+    if (names.length > 0) {
+      w.u8(names.length);
+      for (const name of names) w.str(name);
+    }
+
     const resp = await this.request(Op.QueryLinks, w.build());
     this.assertOk(resp);
 
@@ -1238,16 +1300,42 @@ export class DmozClient {
         religions,
       });
     }
+
+    const nextAfterId = r.u64();
+    const hasCategories = resp.payload.length - r.offset >= 8;
     return {
       ready,
       total,
       sites,
       hosts,
       domains,
+      categories: hasCategories ? r.u64() : 0,
       groups,
       links,
-      nextAfterId: r.u64(),
+      nextAfterId,
     };
+  }
+
+  async neighbours(
+    kind: NeighbourKind,
+    of: NeighbourOf,
+  ): Promise<Neighbour[] | null> {
+    const w = new BufferWriter()
+      .u32(NEIGHBOUR_KIND_CODE[kind])
+      .u32(of.limit ?? NEIGHBOURS_DEFAULT)
+      .u64(of.categoryId ?? 0)
+      .str(of.name ?? "");
+    const resp = await this.request(Op.Neighbours, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const ready = r.u8() === 1;
+    const neighbours = Array.from({ length: r.u16() }, () => ({
+      label: r.str(),
+      categoryId: r.u64(),
+      shared: r.u32(),
+    }));
+    return ready ? neighbours : null;
   }
 
   async putLinkEntities(

@@ -10,6 +10,7 @@ const protocol = zigstore.protocol;
 const inverted = zigstore.inverted_index;
 const schema = @import("schema.zig");
 const Directory = @import("directory.zig").Directory;
+const Stage = @import("directory.zig").Stage;
 const operations = @import("operations/operations.zig");
 const operations_shared = @import("operations/operations_shared.zig");
 const facts_index = @import("facts/facts_index.zig");
@@ -121,8 +122,16 @@ pub const Op = enum(u8) {
     put_link_entities = 39,
     match_names = 40,
     put_category_vectors = 41,
+    neighbours = 42,
     ping = 255,
 };
+
+comptime {
+    // A stage is timed into the op latency table at its own value, so it must not be an op.
+    for (@typeInfo(Stage).@"enum".fields) |stage| {
+        assert(std.enums.fromInt(Op, stage.value) == null);
+    }
+}
 
 pub const get_categories_by_ids_max: u16 = 200;
 pub const breadcrumbs_by_ids_max: u16 = 200;
@@ -471,6 +480,7 @@ pub fn dispatch(
         .put_link_entities => handle_put_link_entities(db, response, op_byte, payload),
         .match_names => handle_match_names(db, response, op_byte, payload),
         .put_category_vectors => handle_put_category_vectors(db, response, op_byte, payload),
+        .neighbours => handle_neighbours(db, response, op_byte, payload),
     };
     assert(written <= response.len);
     if (written > 0) assert(written >= response_header_size);
@@ -767,10 +777,6 @@ fn handle_browse_path(db: *Directory, response: []u8, op_byte: u8, payload: []co
         db.memtable_cat_by_parent(),
         db.cat_by_parent(),
     ) catch |err| log.warn("drain skipped before read: {}", .{err});
-    db.drain_one_memtable(
-        db.memtable_link_by_category(),
-        db.link_by_category(),
-    ) catch |err| log.warn("drain skipped before read: {}", .{err});
 
     if (response.len < browse_frame_bytes_min) return write_error_response(response, op_byte, .err);
 
@@ -790,47 +796,14 @@ fn handle_browse_path(db: *Directory, response: []u8, op_byte: u8, payload: []co
     var offset = append_row(response, response_header_size, &category);
     offset = write_counted_category_rows(response, offset, ancestors, 2 + 8);
     offset = write_counted_category_rows(response, offset, children, 8);
-    offset = write_u64s(response, offset, &.{subtree_link_total(db, category_id)});
+    // The row carries its subtree total. Counting it here meant a scan of the whole
+    // link_by_category index on each category's first visit: p50 210 ms over 1.78M calls on
+    // production (2026-11-19), the largest share of dmozdb's time.
+    offset = write_u64s(response, offset, &.{category.link_count_subtree});
     assert(offset <= response.len);
 
     write_ok_header(response, op_byte, offset, 0);
     return offset;
-}
-
-fn subtree_link_total(db: *Directory, category_id: u64) u64 {
-    if (db.subtree_cache.get_link_count(category_id)) |hit| return hit;
-
-    const descendants = subtree.collect_descendants_cached(
-        db.cat_by_parent(),
-        category_id,
-        &db.subtree_cache,
-        db.scratch(),
-    ) catch |err| {
-        log.warn(
-            "browse_path: descendants of {d} unavailable, reporting 0 subtree links: {}",
-            .{ category_id, err },
-        );
-        return 0;
-    };
-    defer db.scratch().free(descendants);
-
-    assert(descendants.len >= 1);
-    assert(descendants.len <= subtree.descendants_max);
-    const total = subtree.count_subtree_links(
-        db.link_by_category(),
-        descendants,
-        db.scratch(),
-    ) catch |err| {
-        log.warn(
-            "browse_path: subtree link count of {d} unavailable, reporting 0: {}",
-            .{ category_id, err },
-        );
-        return 0;
-    };
-    db.subtree_cache.put_link_count(.{ .root = category_id, .count = total }) catch |err| {
-        log.warn("browse_path: subtree link count of {d} not cached: {}", .{ category_id, err });
-    };
-    return total;
 }
 
 const OptionalListExtras = struct { status: ?u8, after_id: u64 };
@@ -1296,7 +1269,8 @@ const QueryLinksOptions = packed struct(u64) {
     limit: u8 = 0,
     religions: u16 = 0,
     subdomain_only: bool = false,
-    _unused: u13 = 0,
+    words_within_budget: bool = false,
+    _unused: u12 = 0,
 };
 
 const query_links_fields = &[_]struct { []const u8, type }{
@@ -1313,7 +1287,10 @@ fn handle_query_links(db: *Directory, response: []u8, op_byte: u8, payload: []co
     const parsed = parsePayload(query_links_fields, payload) orelse
         return write_error_response(response, op_byte, .invalid);
     var domain_buffer: [url_facts.host_len_max]u8 = undefined;
-    const request = link_query_from(&parsed.result, &domain_buffer) orelse
+    var request = link_query_from(&parsed.result, &domain_buffer) orelse
+        return write_error_response(response, op_byte, .invalid);
+    var names_buffer: [facts_index.scope_names_max][]const u8 = undefined;
+    request.facts.category_names = category_names_from(parsed.rest, &names_buffer) orelse
         return write_error_response(response, op_byte, .invalid);
 
     var arena = std.heap.ArenaAllocator.init(db.scratch());
@@ -1339,6 +1316,33 @@ fn handle_query_links(db: *Directory, response: []u8, op_byte: u8, payload: []co
     return len;
 }
 
+// The optional tail of a query: `[u8 count]` and that many length-prefixed category names,
+// confining the answer to every category that carries one of them. No tail at all is what a
+// client that predates the names sends.
+fn category_names_from(
+    tail: []const u8,
+    out: *[facts_index.scope_names_max][]const u8,
+) ?[]const []const u8 {
+    if (tail.len == 0) return out[0..0];
+    const count = tail[0];
+    if (count > out.len) return null;
+
+    var offset: usize = 1;
+    for (out[0..count]) |*name| {
+        if (offset + 2 > tail.len) return null;
+        const len = std.mem.readInt(u16, tail[offset..][0..2], .little);
+        offset += 2;
+        if (len == 0) return null;
+        if (len > facts_index.folded_name_len_max) return null;
+        if (offset + len > tail.len) return null;
+        name.* = tail[offset..][0..len];
+        offset += len;
+    }
+    if (offset != tail.len) return null;
+    assert(count <= facts_index.scope_names_max);
+    return out[0..count];
+}
+
 fn link_query_from(
     parsed: anytype,
     domain_buffer: *[url_facts.host_len_max]u8,
@@ -1355,6 +1359,7 @@ fn link_query_from(
     if (options.via > facts_index.Via.all) return null;
     if (options.religions & ~entities.religion_mask != 0) return null;
     if (parsed.entity.len > entities.name_len_max) return null;
+    if (options.words_within_budget and !options.all_words) return null;
 
     const group_by = std.enums.fromInt(facts_index.GroupBy, options.group_by) orelse return null;
     const country: ?countries.Code = switch (parsed.country.len) {
@@ -1386,10 +1391,18 @@ fn link_query_from(
             .after_id = parsed.after_id,
         },
         .words = parsed.words,
-        .words_match = if (options.all_words) .all else .any,
+        .words_match = words_match_of(options),
     };
     assert(query.facts.page_limit <= query_links_rows_max);
     return query;
+}
+
+// The budget only means something when every word must hold: any one of several words has no
+// rarest list to drive from.
+fn words_match_of(options: QueryLinksOptions) operations.WordsMatch {
+    if (options.words_within_budget) assert(options.all_words);
+    if (!options.all_words) return .any;
+    return if (options.words_within_budget) .all_within_budget else .all;
 }
 
 fn write_query_links_body(
@@ -1429,6 +1442,88 @@ fn write_query_links_body(
         for (item.row.entity_countries) |code| try writer.writeAll(&code);
     }
     try writer.writeInt(u64, answer.next_after_id, .little);
+    // Appended after the cursor, where a client that predates it stops reading.
+    try writer.writeInt(u64, answer.categories, .little);
+}
+
+const neighbours_fields = &[_]struct { []const u8, type }{
+    .{ "kind", u32 },
+    .{ "limit", u32 },
+    .{ "category_id", u64 },
+    .{ "name", []const u8 },
+};
+
+fn handle_neighbours(db: *Directory, response: []u8, op_byte: u8, payload: []const u8) usize {
+    const parsed = parsePayload(neighbours_fields, payload) orelse
+        return write_error_response(response, op_byte, .invalid);
+    if (parsed.rest.len != 0) return write_error_response(response, op_byte, .invalid);
+    var name_buffer: [url_facts.host_len_max]u8 = undefined;
+    const request = neighbour_request_from(&parsed.result, &name_buffer) orelse
+        return write_error_response(response, op_byte, .invalid);
+
+    var arena = std.heap.ArenaAllocator.init(db.scratch());
+    defer arena.deinit();
+
+    const result = operations.neighbours(db, arena.allocator(), &request) catch |err|
+        return write_mapped_error(response, op_byte, err);
+    assert(result.neighbours.len <= request.limit);
+    if (!result.ready) assert(result.neighbours.len == 0);
+
+    var body: std.Io.Writer = .fixed(response[response_header_size..]);
+    write_neighbours_body(&body, &result) catch
+        return write_error_response_sub(response, op_byte, .invalid, .buffer_too_small);
+    const len = response_header_size + body.end;
+    assert(len <= response.len);
+    write_ok_header(response, op_byte, len, @intCast(result.neighbours.len));
+    return len;
+}
+
+// A site is asked for by a host suffix, folded to lower case like a domain filter; an entity
+// by its name, which the index folds itself; a category by its id alone.
+fn neighbour_request_from(
+    parsed: anytype,
+    name_buffer: *[url_facts.host_len_max]u8,
+) ?operations.NeighbourRequest {
+    const kind_byte = std.math.cast(u8, parsed.kind) orelse return null;
+    const kind = std.enums.fromInt(operations.NeighbourKind, kind_byte) orelse return null;
+    if (parsed.limit == 0) return null;
+    if (parsed.limit > facts_index.neighbours_max) return null;
+
+    switch (kind) {
+        .category => {
+            if (parsed.category_id == 0) return null;
+            if (parsed.name.len != 0) return null;
+            return .{ .kind = kind, .category_id = parsed.category_id, .limit = parsed.limit };
+        },
+        .entity => {
+            if (parsed.name.len == 0) return null;
+            if (parsed.name.len > entities.name_len_max) return null;
+            return .{ .kind = kind, .name = parsed.name, .limit = parsed.limit };
+        },
+        .site => {
+            const suffix = std.mem.trim(u8, parsed.name, ".");
+            if (suffix.len == 0) return null;
+            if (suffix.len > name_buffer.len) return null;
+            const folded = std.ascii.lowerString(name_buffer, suffix);
+            return .{ .kind = kind, .name = folded, .limit = parsed.limit };
+        },
+    }
+}
+
+fn write_neighbours_body(
+    writer: *std.Io.Writer,
+    result: *const operations.NeighbourResult,
+) std.Io.Writer.Error!void {
+    assert(result.neighbours.len <= facts_index.neighbours_max);
+    try writer.writeByte(@intFromBool(result.ready));
+    try writer.writeInt(u16, @intCast(result.neighbours.len), .little);
+    for (result.neighbours) |neighbour| {
+        assert(neighbour.label.len <= std.math.maxInt(u16));
+        try writer.writeInt(u16, @intCast(neighbour.label.len), .little);
+        try writer.writeAll(neighbour.label);
+        try writer.writeInt(u64, neighbour.category_id, .little);
+        try writer.writeInt(u32, neighbour.shared, .little);
+    }
 }
 
 fn handle_match_names(db: *Directory, response: []u8, op_byte: u8, payload: []const u8) usize {
@@ -2436,6 +2531,30 @@ test "op_latency_stats (23): empty histograms produce count=0 response" {
     try std.testing.expectEqual(@as(usize, response_header_size + 1), offset);
     try std.testing.expectEqual(@intFromEnum(Status.ok), response[5]);
     try std.testing.expectEqual(@as(u8, 0), response[response_header_size]);
+}
+
+// Goal: a timed stage shows up in the latency frame under its own value, beside the ops.
+// Method: time one stage twice and read the frame.
+test "op_latency_stats (23): reports a timed stage beside the ops" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    db.time_stage(.search_subtree).stop();
+    db.time_stage(.search_subtree).stop();
+
+    var response: [4096]u8 = undefined;
+    const reply_len = handle_op_latency_stats(db, &response, @intFromEnum(Op.op_latency_stats));
+    const per_row: usize = 1 + 7 * @sizeOf(u64);
+    try std.testing.expectEqual(response_header_size + 1 + per_row, reply_len);
+    try std.testing.expectEqual(@as(u8, 1), response[response_header_size]);
+
+    const row = response[response_header_size + 1 ..][0..per_row];
+    try std.testing.expectEqual(@intFromEnum(Stage.search_subtree), row[0]);
+    const samples = std.mem.readInt(u64, row[per_row - 8 ..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 2), samples);
 }
 
 // Pipelines five pings through process_frames and finds a ping row with five samples.
@@ -3988,6 +4107,31 @@ fn query_links_request(
     return buffer[0..writer.end];
 }
 
+// Goal: the optional names tail of a query is read whole or refused. Method: no tail, two
+// names, then a tail cut short, one with bytes left over, an empty name and too many names.
+test "query_links (op=38) reads an optional tail of category names" {
+    var out: [facts_index.scope_names_max][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), category_names_from("", &out).?.len);
+
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.writeByte(2);
+    for ([_][]const u8{ "politicians", "prime ministers" }) |name| {
+        try writer.writeInt(u16, @intCast(name.len), .little);
+        try writer.writeAll(name);
+    }
+    const tail = buffer[0..writer.end];
+    const names = category_names_from(tail, &out).?;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("politicians", names[0]);
+    try std.testing.expectEqualStrings("prime ministers", names[1]);
+
+    try std.testing.expect(category_names_from(tail[0 .. tail.len - 1], &out) == null);
+    try std.testing.expect(category_names_from(buffer[0 .. tail.len + 1], &out) == null);
+    try std.testing.expect(category_names_from(&.{ 1, 0, 0 }, &out) == null);
+    try std.testing.expect(category_names_from(&.{facts_index.scope_names_max + 1}, &out) == null);
+}
+
 // Unready answers a zero byte; ready answers totals, groups and rows; bad options are refused.
 test "query_links (op=38) answers counts, groups and a page" {
     const allocator = std.testing.allocator;
@@ -4095,7 +4239,13 @@ test "query_links (op=38) answers counts, groups and a page" {
     try std.testing.expectEqualStrings("samvak.tripod.com", response[offset + 2 ..][0..site_len]);
     const row_tail = 4 + 2 + 1;
     const fuzzy_row = @sizeOf(schema.Link) + 2 + "members.tripod.com/~fuzzy".len + row_tail;
-    try std.testing.expectEqual(len - 8, offset + 2 + site_len + row_tail + fuzzy_row);
+    const cursor_and_categories = 2 * @sizeOf(u64);
+    try std.testing.expectEqual(
+        len - cursor_and_categories,
+        offset + 2 + site_len + row_tail + fuzzy_row,
+    );
+    const categories = std.mem.readInt(u64, response[len - 8 ..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 1), categories);
 
     _ = handle_query_links(
         db,
@@ -4192,6 +4342,84 @@ test "match_names (op=40) answers each phrase with its category" {
     try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, body[1..3], .little));
     try std.testing.expectEqual(arts, std.mem.readInt(u64, body[3..11], .little));
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, body[12..20], .little));
+}
+
+// Goal: the neighbours frame carries one row per neighbour and refuses a request that does not
+// fit its kind. Method: two Chess categories and two sites sharing one, asked for by category
+// and by site, then with a truncated frame, a zero limit and a category kind carrying a name.
+test "neighbours (op=42) answers namesakes for a category and co-filed sites for a site" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+    try operations.load_facts_index(db);
+
+    const top = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const games = try operations.create_category(
+        db,
+        top,
+        .{ .name = "Games", .slug = "games", .description = "" },
+    );
+    const chess = try operations.create_category(
+        db,
+        games,
+        .{ .name = "Chess", .slug = "chess", .description = "" },
+    );
+    const other_chess = try operations.create_category(
+        db,
+        top,
+        .{ .name = "Chess", .slug = "chess", .description = "" },
+    );
+    for ([_][]const u8{ "http://one.example.com/", "http://two.example.org/" }) |url| {
+        _ = try operations.create_link(db, chess, .{ .url = url, .title = "", .description = "" });
+    }
+
+    var response: [512]u8 = undefined;
+    const op = @intFromEnum(Op.neighbours);
+    var request: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&request);
+    try writer.writeInt(u32, @intFromEnum(operations.NeighbourKind.category), .little);
+    try writer.writeInt(u32, 5, .little);
+    try writer.writeInt(u64, chess, .little);
+    try writer.writeInt(u16, 0, .little);
+
+    _ = handle_neighbours(db, &response, op, request[0 .. writer.end - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
+
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[5]);
+    var body = response[response_header_size..];
+    try std.testing.expectEqual(@as(u8, 1), body[0]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, body[1..3], .little));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, body[3..5], .little));
+    try std.testing.expectEqual(other_chess, std.mem.readInt(u64, body[5..13], .little));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[13..17], .little));
+
+    std.mem.writeInt(u32, request[4..8], 0, .little);
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
+
+    const site = "example.com";
+    writer = .fixed(&request);
+    try writer.writeInt(u32, @intFromEnum(operations.NeighbourKind.site), .little);
+    try writer.writeInt(u32, 5, .little);
+    try writer.writeInt(u64, 0, .little);
+    try writer.writeInt(u16, site.len, .little);
+    try writer.writeAll(site);
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[5]);
+    body = response[response_header_size..];
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, body[1..3], .little));
+    try std.testing.expectEqualStrings("example.org", body[5..16]);
+
+    std.mem.writeInt(u32, request[0..4], @intFromEnum(operations.NeighbourKind.category), .little);
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
 }
 
 // One valid and one invalid record answer their codes; the stored religion then filters a query.

@@ -167,9 +167,55 @@ Deno.test("targets round-trip through a canonical query and become one query_lin
     country: "",
     religions: ["islam"],
     entity: "moniza alvi",
+    categoryNames: [],
     words: "anime",
     allWords: true,
   });
+});
+
+Deno.test("a role word alone, or with a person cue, targets the people filed under it", () => {
+  const politicians = { kind: "role", value: "politicians" } as const;
+  assertEquals(understand("biographies of politicians"), {
+    targets: [politicians],
+    words: [],
+  });
+  assertEquals(understand("famous politician").targets, [politicians]);
+  assertEquals(understand("role:actress").targets, [
+    { kind: "role", value: "actresses" },
+  ]);
+  assertEquals(understand("poets from Pakistan"), {
+    targets: [{ kind: "country", value: "PK" }, {
+      kind: "role",
+      value: "poets",
+    }],
+    words: [],
+  });
+  assertEquals(
+    linkQueryFor([politicians], []).categoryNames?.includes("prime ministers"),
+    true,
+  );
+});
+
+Deno.test("a role word beside free words stays a ranked search", () => {
+  assertEquals(understand("jazz saxophonists"), {
+    targets: [],
+    words: ["jazz", "saxophonists"],
+  });
+  assertEquals(understand("device drivers").targets, []);
+  assertEquals(understand("female physicists").targets, []);
+});
+
+Deno.test("words that only ask for neighbours or a life story do not filter once a target is found", () => {
+  assertEquals(understand("sites like tripod.com"), {
+    targets: [{ kind: "site", value: "tripod.com" }],
+    words: [],
+  });
+  const names = known({ "moniza alvi": { namesSomeone: true } });
+  assertEquals(understand("moniza alvi biography", names), {
+    targets: [{ kind: "name", value: "moniza alvi" }],
+    words: [],
+  });
+  assertEquals(understand("biography of jazz").words, ["biography", "jazz"]);
 });
 
 Deno.test("a sentence ranks by its content words only, and an all-stopword query ranks as typed", () => {

@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
 import {
+  type Crumb,
   type DmozClient,
   getClient,
   type Link,
@@ -26,8 +27,11 @@ import {
 import {
   canonicalQuery,
   constraintsOf,
+  isOnlyAGuessedRole,
   linkQueryFor,
   namePhrases,
+  neighbourAsks,
+  neighbourChip,
   rankedQuery,
   recognise,
   type Target,
@@ -37,12 +41,14 @@ import {
 } from "./_lib/targets.ts";
 import { queryVocabulary } from "../../lib/entities.ts";
 import { categoryPath } from "../../lib/format.ts";
+import { logSearch, type Stopwatch, stopwatch } from "../../lib/timing.ts";
 import type {
   Chip,
   Facets,
   LinkCounts,
   Relaxation,
   Sort,
+  Suggestion,
 } from "./_lib/types.ts";
 import Hero from "../../components/search/Hero/Hero.tsx";
 import ResultsBody from "../../components/search/ResultsBody/ResultsBody.tsx";
@@ -54,6 +60,7 @@ interface Filtered {
   counts: LinkCounts;
   chips: Chip[];
   relaxations: Relaxation[];
+  suggestions: Suggestion[];
   plainHref: string;
   words: string[];
   links: Link[];
@@ -131,24 +138,69 @@ async function withCategoryPath(
   };
 }
 
+const SUGGESTION_CHIPS = 8;
+
+async function suggestionsFor(
+  client: DmozClient,
+  targets: readonly Target[],
+): Promise<Suggestion[]> {
+  const asks = neighbourAsks(targets);
+  if (asks.length === 0) return [];
+
+  const vocabulary = await queryVocabulary();
+  const suggestions: Suggestion[] = [];
+  for (const ask of asks) {
+    const of = ask.kind === "category"
+      ? { categoryId: ask.target.categoryId }
+      : { name: ask.target.value };
+    const neighbours = await client.neighbours(ask.kind, {
+      ...of,
+      limit: SUGGESTION_CHIPS,
+    }).catch(() => null) ?? [];
+
+    const categoryIds = neighbours.map((n) => n.categoryId).filter(Boolean);
+    const chains = categoryIds.length > 0
+      ? await client.breadcrumbsByIds(categoryIds)
+      : new Map<number, Crumb[]>();
+
+    const chips = neighbours.flatMap((neighbour) => {
+      const chain = chains.get(neighbour.categoryId);
+      const named = chain
+        ? {
+          label: buildPathLabel(neighbour.categoryId, chains),
+          raw: categoryPath(chain),
+        }
+        : { label: neighbour.label, raw: neighbour.label };
+      return neighbourChip(ask, named, vocabulary) ?? [];
+    });
+    if (chips.length > 0) suggestions.push({ heading: ask.heading, chips });
+  }
+  return suggestions;
+}
+
 async function buildTargetedResult(
   base: Data,
   understanding: Understanding,
   after: number,
+  watch: Stopwatch,
 ): Promise<Data> {
   const client = getClient();
-  const resolved = await withCategoryPath(client, understanding.targets);
+  const resolved = await watch.time(
+    "category",
+    () => withCategoryPath(client, understanding.targets),
+  );
   if ("missing" in resolved) {
     return { ...base, error: unmatched("category", resolved.missing) };
   }
 
   const { targets, label } = resolved;
   const { words } = understanding;
-  const result = await client.queryLinks({
-    ...linkQueryFor(targets, words),
-    limit: QUERY_LINKS_MAX_ROWS,
-    afterId: after,
-  });
+  const result = await watch.time("facts", () =>
+    client.queryLinks({
+      ...linkQueryFor(targets, words),
+      limit: QUERY_LINKS_MAX_ROWS,
+      afterId: after,
+    }));
   if (!result.ready) {
     return { ...base, error: "Link facts are still loading, retry shortly" };
   }
@@ -160,16 +212,22 @@ async function buildTargetedResult(
   }));
   const relaxable = result.total === 0 && constraints.length > 1;
   const relaxed = relaxable
-    ? await Promise.all(
-      constraints.map((c) =>
-        client.queryLinks({ ...linkQueryFor(c.targets, c.words), limit: 0 })
-      ),
-    )
+    ? await watch.time("relaxed", () =>
+      Promise.all(
+        constraints.map((c) =>
+          client.queryLinks({ ...linkQueryFor(c.targets, c.words), limit: 0 })
+        ),
+      ))
+    : [];
+
+  const suggestions = after === 0
+    ? await watch.time("neighbours", () => suggestionsFor(client, targets))
     : [];
 
   return {
     ...base,
     filtered: {
+      suggestions,
       counts: {
         total: result.total,
         sites: result.sites,
@@ -195,19 +253,26 @@ async function buildSearchResult(
   sort: Sort,
   cat: number,
   year: number,
+  watch: Stopwatch,
 ): Promise<Data> {
   const client = getClient();
   const ranked = rankedQuery(q);
-  const rawResults = await client.search(ranked, {
-    limit: 50,
-    mode: "ranked",
-    capPerSite: true,
-    queryEmbedding: await embedQuery(ranked),
-  });
+  const queryEmbedding = await watch.time("embed", () => embedQuery(ranked));
+  const rawResults = await watch.time("search", () =>
+    client.search(ranked, {
+      limit: 50,
+      mode: "ranked",
+      capPerSite: true,
+      queryEmbedding,
+    }));
+
   const crumbIds = new Set<number>();
   for (const c of rawResults.categories) crumbIds.add(c.id);
   for (const l of rawResults.links) crumbIds.add(l.categoryId);
-  const chains = await client.breadcrumbsByIds([...crumbIds]);
+  const chains = await watch.time(
+    "crumbs",
+    () => client.breadcrumbsByIds([...crumbIds]),
+  );
   const categoryPaths: Record<number, string> = {};
   for (const c of rawResults.categories) {
     categoryPaths[c.id] = buildPathLabel(c.id, chains);
@@ -234,20 +299,8 @@ async function buildSearchResult(
   return { query: q, rawResults, filteredLinks, facets, sort, categoryPaths };
 }
 
-function logSearch(
-  q: string,
-  path: "targeted" | "ranked",
-  links: number,
-  categories: number,
-  started: number,
-): void {
-  console.log(JSON.stringify({
-    search: q,
-    path,
-    links,
-    categories,
-    ms: Math.round(performance.now() - started),
-  }));
+function timed(data: Data, watch: Stopwatch) {
+  return page(data, { headers: { "Server-Timing": watch.serverTiming() } });
 }
 
 export const handler = define.handlers<Data>({
@@ -263,35 +316,48 @@ export const handler = define.handlers<Data>({
     if (!q) return page(emptyData(q, sort, cat, year));
 
     try {
-      const started = performance.now();
+      const watch = stopwatch();
       if (url.searchParams.get("plain") !== "1") {
-        const understanding = await understand(q);
+        const understanding = await watch.time(
+          "understand",
+          () => understand(q),
+        );
         const base = emptyData(q, sort, cat, year);
         if (understanding.error) {
           return page({ ...base, error: understanding.error });
         }
         if (understanding.targets.length > 0) {
           const after = parsePositiveInt(url.searchParams.get("after"));
-          const data = await buildTargetedResult(base, understanding, after);
-          logSearch(
-            q,
-            "targeted",
-            data.filtered?.links.length ?? 0,
-            0,
-            started,
+          const data = await buildTargetedResult(
+            base,
+            understanding,
+            after,
+            watch,
           );
-          return page(data);
+          const nothingFiledAsRole = data.filtered?.counts.total === 0 &&
+            isOnlyAGuessedRole(q, understanding.targets);
+          if (!nothingFiledAsRole) {
+            logSearch({
+              query: q,
+              path: "targeted",
+              links: data.filtered?.links.length ?? 0,
+              categories: 0,
+              watch,
+            });
+            return timed(data, watch);
+          }
         }
       }
-      const data = await buildSearchResult(q, sort, cat, year);
-      logSearch(
-        q,
-        "ranked",
-        data.rawResults.links.length,
-        data.rawResults.categories.length,
-        started,
-      );
-      return page(data);
+
+      const data = await buildSearchResult(q, sort, cat, year, watch);
+      logSearch({
+        query: q,
+        path: "ranked",
+        links: data.rawResults.links.length,
+        categories: data.rawResults.categories.length,
+        watch,
+      });
+      return timed(data, watch);
     } catch (e) {
       console.error("Search failed:", e);
       return page({
@@ -325,6 +391,7 @@ export default define.page<typeof handler>(function SearchPage(props) {
           chips={filtered.chips}
           plainHref={filtered.plainHref}
           relaxations={filtered.relaxations}
+          suggestions={filtered.suggestions}
           links={filtered.links}
           tokens={filtered.words}
           nextHref={filtered.nextHref}

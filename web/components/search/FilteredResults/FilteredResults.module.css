@@ -24,6 +24,14 @@
   font-size: 13px;
 }
 
+.suggested {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 24px;
+}
+
 .relaxations {
   margin: 12px 0 0;
   padding-left: 18px;

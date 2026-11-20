@@ -77,6 +77,19 @@ pub fn registrable_domain(host: []const u8) []const u8 {
     return domain;
 }
 
+/// Whether `name` is a suffix that many registrable domains share (`com`, `pk`, `ac.uk`), by
+/// the same rule `registrable_domain` cuts with. Anything longer sits at or below one domain.
+pub fn is_public_suffix(name: []const u8) bool {
+    assert(name.len > 0);
+    const last_dot = std.mem.findScalarLast(u8, name, '.') orelse return true;
+    if (std.mem.findScalarLast(u8, name[0..last_dot], '.') != null) return false;
+
+    const tld = name[last_dot + 1 ..];
+    const second_level = name[0..last_dot];
+    if (tld.len != 2) return false;
+    return public_second_levels.has(second_level);
+}
+
 pub fn has_suffix(host: []const u8, suffix: []const u8) bool {
     assert(suffix.len > 0);
     if (std.mem.eql(u8, host, suffix)) return true;
@@ -134,6 +147,44 @@ test "a domain suffix matches on label boundaries only" {
     try testing.expect(has_suffix("www.example.com.pk", "pk"));
     try testing.expect(!has_suffix("nottripod.com", "tripod.com"));
     try testing.expect(!has_suffix("tripod.com.au", "tripod.com"));
+}
+
+// Goal: a suffix that is not a public suffix pins one registrable domain, which is what lets
+// the facts index look a domain filter up instead of scanning. Method: for hosts and suffixes
+// across the cut rules, wherever the suffix matches the host and is not public, both must
+// share a registrable domain.
+test "a suffix that is not public shares its registrable domain with every host it matches" {
+    try std.testing.expect(is_public_suffix("com"));
+    try std.testing.expect(is_public_suffix("pk"));
+    try std.testing.expect(is_public_suffix("ac.uk"));
+    try std.testing.expect(is_public_suffix("edu.pk"));
+    try std.testing.expect(!is_public_suffix("tripod.com"));
+    try std.testing.expect(!is_public_suffix("ca.us"));
+    try std.testing.expect(!is_public_suffix("uet.edu.pk"));
+
+    const hosts = [_][]const u8{
+        "tripod.com",      "samvak.tripod.com", "a.b.tripod.com", "uet.edu.pk",
+        "cs.uet.edu.pk",   "bbc.co.uk",         "news.bbc.co.uk", "x.k12.ca.us",
+        "geocities.co.jp", "a.geocities.co.jp", "localhost",      "192.168.1.1",
+    };
+    const suffixes = [_][]const u8{
+        "com",   "tripod.com", "b.tripod.com", "pk",        "edu.pk", "uet.edu.pk",
+        "co.uk", "bbc.co.uk",  "ca.us",        "k12.ca.us", "co.jp",  "geocities.co.jp",
+        "1.1",   "168.1.1",    "localhost",
+    };
+    var pinned: u32 = 0;
+    for (hosts) |host| {
+        for (suffixes) |suffix| {
+            if (!has_suffix(host, suffix)) continue;
+            if (is_public_suffix(suffix)) continue;
+            try std.testing.expectEqualStrings(
+                registrable_domain(host),
+                registrable_domain(suffix),
+            );
+            pinned += 1;
+        }
+    }
+    try std.testing.expect(pinned >= 12);
 }
 
 // A real ccTLD names its country and .uk maps to GB; a vanity ccTLD, a generic TLD and a host

@@ -141,6 +141,7 @@ test {
     _ = @import("ivf_index.zig");
     _ = @import("facts/countries.zig");
     _ = @import("facts/url_facts.zig");
+    _ = @import("facts/adjacency.zig");
     _ = @import("facts/sites.zig");
     _ = @import("facts/facts_index.zig");
     _ = @import("facts/entities.zig");

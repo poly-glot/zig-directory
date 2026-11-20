@@ -3,12 +3,21 @@ import {
   MATCH_NAME_MAX_BYTES,
   MATCH_NAMES_MAX,
   type NameMatch,
+  type NeighbourKind,
 } from "../../../lib/dmoz-client.ts";
 import type { Religion } from "../../../lib/dmoz-protocol.gen.ts";
 import type { QueryVocabulary } from "../../../lib/entities.ts";
 import { searchHref } from "./queryParams.ts";
+import { ROLE_CUES, roleCategories, roleOf } from "./roles.ts";
+import type { Chip } from "./types.ts";
 
-type TargetKind = "site" | "country" | "category" | "religion" | "name";
+type TargetKind =
+  | "site"
+  | "country"
+  | "category"
+  | "religion"
+  | "name"
+  | "role";
 
 export interface Target {
   kind: TargetKind;
@@ -34,11 +43,22 @@ interface Typed {
   error?: string;
 }
 
+interface NeighbourRule {
+  heading: string;
+  kind: NeighbourKind;
+}
+
+export interface NeighbourAsk extends NeighbourRule {
+  target: Target;
+}
+
 interface KindRule {
   operator: string;
   single: boolean;
   noun: string;
   example: string;
+  neighbours?: NeighbourRule;
+  cues?: ReadonlySet<string>;
   normalise(raw: string, vocabulary: QueryVocabulary): string | undefined;
   label(target: Target, categoryLabel: string): string;
 }
@@ -57,9 +77,14 @@ const MAX_PLACE_WORDS = 8;
 const REGION = new Intl.DisplayNames(["en"], { type: "region" });
 
 const STOPWORDS = new Set(
-  "a about all an and any are as at be by can categories category count do does find for from get give how i in inside into is it link links list many me my number of on or page pages please section show site sites some subdomain subdomains that the there these this those to under website websites what where which who with within"
+  "a about all alongside an and any are as at be by can categories category count do does everything find for from get give how i in inside into is it link links list many me my number of on or page pages please section show site sites some subdomain subdomains that the there these this those to under website websites what where which who with within"
     .split(" "),
 );
+const NEIGHBOUR_CUES = new Set(
+  "alternative alternatives like named organisation organisations organization organizations people related similar"
+    .split(" "),
+);
+const PERSON_CUES = new Set([...NEIGHBOUR_CUES, ...ROLE_CUES]);
 const CUE_BEFORE = new Set(["in", "under", "within", "inside", "into"]);
 const CUE_AFTER = new Set(["category", "categories", "section"]);
 
@@ -80,6 +105,8 @@ const KINDS: Record<TargetKind, KindRule> = {
     single: true,
     noun: "domain",
     example: "site:tripod.com",
+    neighbours: { heading: "Similar sites", kind: "site" },
+    cues: NEIGHBOUR_CUES,
     normalise: (raw) => {
       const site = raw.toLowerCase().replace(EDGE_DOTS, "");
       return isHostSuffix(site) ? site : undefined;
@@ -100,6 +127,8 @@ const KINDS: Record<TargetKind, KindRule> = {
     single: true,
     noun: "category path",
     example: "in:arts/literature",
+    neighbours: { heading: "Related categories", kind: "category" },
+    cues: NEIGHBOUR_CUES,
     normalise: (raw) =>
       raw.toLowerCase().replace(EDGE_SLASHES, "") || undefined,
     label: (_, categoryLabel) => `In ${categoryLabel}`,
@@ -117,8 +146,18 @@ const KINDS: Record<TargetKind, KindRule> = {
     single: true,
     noun: "person or organisation",
     example: 'name:"moniza alvi"',
+    neighbours: { heading: "Named alongside", kind: "entity" },
+    cues: PERSON_CUES,
     normalise: (raw) => raw.trim() || undefined,
     label: (target) => `Naming ${capitalised(target.value)}`,
+  },
+  role: {
+    operator: "role",
+    single: true,
+    noun: "kind of person",
+    example: "role:politicians",
+    normalise: (raw) => roleOf(raw),
+    label: (target) => `People filed as ${capitalised(target.value)}`,
   },
 };
 
@@ -292,7 +331,47 @@ export function recognise(
     start += found.length;
   }
 
-  return { targets, words: [...new Set(rest.filter(isContentWord))] };
+  const cues = new Set(targets.flatMap((t) => [...(KINDS[t.kind].cues ?? [])]));
+  const kept = rest.filter((word) => isContentWord(word) && !cues.has(word));
+
+  const role = taken.has("role")
+    ? undefined
+    : roleOf(kept.filter((word) => !ROLE_CUES.has(word)).join(" "));
+  if (role) {
+    return { targets: [...targets, { kind: "role", value: role }], words: [] };
+  }
+
+  return { targets, words: [...new Set(kept)] };
+}
+
+export function isOnlyAGuessedRole(
+  query: string,
+  targets: readonly Target[],
+): boolean {
+  const typed = new RegExp(`(^|\\s)${KINDS.role.operator}:`, "i").test(query);
+  return !typed && targets.length === 1 && targets[0].kind === "role";
+}
+
+export function neighbourAsks(targets: readonly Target[]): NeighbourAsk[] {
+  return targets.flatMap((target) => {
+    const rule = KINDS[target.kind].neighbours;
+    return rule ? [{ ...rule, target }] : [];
+  });
+}
+
+export function neighbourChip(
+  ask: NeighbourAsk,
+  neighbour: { label: string; raw: string },
+  vocabulary: QueryVocabulary,
+): Chip | undefined {
+  const { kind } = ask.target;
+  const value = KINDS[kind].normalise(neighbour.raw, vocabulary);
+  if (value === undefined) return undefined;
+
+  return {
+    label: neighbour.label,
+    href: searchHref({ q: canonicalQuery([{ kind, value }], []) }),
+  };
 }
 
 export function constraintsOf(
@@ -327,6 +406,7 @@ export function linkQueryFor(
     religions: targets.filter((target) => target.kind === "religion")
       .map((target) => target.value as Religion),
     entity: valueOf("name"),
+    categoryNames: roleCategories(valueOf("role")),
     words: words.join(" "),
     allWords: true,
   };

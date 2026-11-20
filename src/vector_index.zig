@@ -229,6 +229,33 @@ pub const VectorIndex = struct {
         return hits;
     }
 
+    /// The rows nearest to the row stored for `id`, that row left out; none when `id` has no
+    /// row. Both rows are unit vectors, so the stored row stands in for a query as it is.
+    pub fn nearest_to(
+        self: *VectorIndex,
+        io: std.Io,
+        id: u64,
+        out: []ranking.ScoredId,
+    ) []ranking.ScoredId {
+        self.lock.lockSharedUncancelable(io);
+        defer self.lock.unlockShared(io);
+        assert(self.ids.items.len == self.scales.items.len);
+        assert(self.ids.items.len == self.rows.items.len);
+
+        const at = self.position.get(id) orelse return out[0..0];
+        const own = &self.rows.items[at];
+        var top = ranking.TopK.init(out);
+        for (self.ids.items, self.scales.items, self.rows.items) |other, scale, *row| {
+            if (other == id) continue;
+            const score = @as(f64, @floatFromInt(dot(row, own))) * scale;
+            top.offer(.{ .id = other, .score = score });
+        }
+        const hits = top.sorted();
+        assert(hits.len <= out.len);
+        assert(hits.len < self.ids.items.len);
+        return hits;
+    }
+
     pub fn score_ids(
         self: *VectorIndex,
         io: std.Io,
@@ -369,6 +396,30 @@ test "nearest ranks by dot product and remove keeps the remaining rows addressab
     hits = index.nearest(io, &query, &buffer);
     try std.testing.expectEqual(@as(u64, 2), hits[0].id);
     try std.testing.expectEqual(@as(usize, 2), index.count(io));
+}
+
+// Goal: a stored row finds its nearest rows without a query vector, itself left out. Method:
+// three rows, one between the other two, asked from each end and for an id with no row.
+test "nearest_to ranks the other rows by closeness to a stored row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var index: VectorIndex = .{};
+    defer index.deinit(allocator);
+
+    try index.put(io, allocator, &stored_vector(1, &unit_vector(0)));
+    try index.put(io, allocator, &stored_vector(2, &unit_vector(1)));
+    var mixed: Embedding = @splat(0);
+    mixed[0] = 1;
+    mixed[1] = 1;
+    try index.put(io, allocator, &stored_vector(3, &mixed));
+
+    var buffer: [8]ranking.ScoredId = undefined;
+    const near_first = index.nearest_to(io, 1, &buffer);
+    try std.testing.expectEqual(@as(usize, 2), near_first.len);
+    try std.testing.expectEqual(@as(u64, 3), near_first[0].id);
+    try std.testing.expectEqual(@as(u64, 2), near_first[1].id);
+
+    try std.testing.expectEqual(@as(usize, 0), index.nearest_to(io, 99, &buffer).len);
 }
 
 // Ask for a subset of ids including one that was never stored and check only the stored ones

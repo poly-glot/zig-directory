@@ -498,6 +498,7 @@ pub fn search_links_hybrid(
     buffer: []schema.Link,
     site_rows: ?[]RowSite,
 ) !HybridLinks {
+    const keyword_clock = db.time_stage(.search_keyword);
     const keyword = try ranked_ids(
         db.scratch(),
         db.links_index_tree(),
@@ -506,6 +507,7 @@ pub fn search_links_hybrid(
         query,
     );
     defer db.scratch().free(keyword);
+    keyword_clock.stop();
     const keyword_top = keyword[0..@min(keyword.len, hybrid_candidates)];
 
     const quantized = if (vector_half_usable(db, model))
@@ -520,16 +522,23 @@ pub fn search_links_hybrid(
     var unit = query_embedding.*;
     vector_model.normalize_in_place(&unit);
 
+    const shortlist_clock = db.time_stage(.search_vector_shortlist);
     var shortlist_buffer: [hybrid_candidates]ScoredId = undefined;
     const shortlist = db.link_vector_index.shortlist(db.io, &unit, &shortlist_buffer);
     assert(shortlist.len <= hybrid_candidates);
+    shortlist_clock.stop();
+
+    const rerank_clock = db.time_stage(.search_vector_rerank);
     var nearest_buffer: [hybrid_candidates]ScoredId = undefined;
     const nearest = try rerank_exact(db, shortlist, &query_quantized, &nearest_buffer);
     assert(nearest.len <= shortlist.len);
+    rerank_clock.stop();
 
+    const subtree_clock = db.time_stage(.search_subtree);
     var subtree_buffer: [hybrid_candidates]ScoredId = undefined;
     const subtree = try subtree_candidates(db, &unit, &query_quantized, &subtree_buffer);
     assert(subtree.len <= hybrid_candidates);
+    subtree_clock.stop();
 
     const fused = try ranking.reciprocal_rank_fusion(
         db.scratch(),
@@ -538,10 +547,10 @@ pub fn search_links_hybrid(
     defer db.scratch().free(fused);
     assert(fused.len <= keyword_top.len + nearest.len + subtree.len);
 
-    return .{
-        .links = try fetch_links(db, fused, limit, buffer, site_rows),
-        .vector_used = true,
-    };
+    const fetch_clock = db.time_stage(.search_fetch);
+    const links = try fetch_links(db, fused, limit, buffer, site_rows);
+    fetch_clock.stop();
+    return .{ .links = links, .vector_used = true };
 }
 
 fn rerank_exact(
