@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
 import {
+  type Crumb,
   type DmozClient,
   getClient,
   type Link,
@@ -28,6 +29,8 @@ import {
   constraintsOf,
   linkQueryFor,
   namePhrases,
+  neighbourAsks,
+  neighbourChip,
   rankedQuery,
   recognise,
   type Target,
@@ -44,6 +47,7 @@ import type {
   LinkCounts,
   Relaxation,
   Sort,
+  Suggestion,
 } from "./_lib/types.ts";
 import Hero from "../../components/search/Hero/Hero.tsx";
 import ResultsBody from "../../components/search/ResultsBody/ResultsBody.tsx";
@@ -55,6 +59,7 @@ interface Filtered {
   counts: LinkCounts;
   chips: Chip[];
   relaxations: Relaxation[];
+  suggestions: Suggestion[];
   plainHref: string;
   words: string[];
   links: Link[];
@@ -132,6 +137,46 @@ async function withCategoryPath(
   };
 }
 
+const SUGGESTION_CHIPS = 8;
+
+async function suggestionsFor(
+  client: DmozClient,
+  targets: readonly Target[],
+): Promise<Suggestion[]> {
+  const asks = neighbourAsks(targets);
+  if (asks.length === 0) return [];
+
+  const vocabulary = await queryVocabulary();
+  const suggestions: Suggestion[] = [];
+  for (const ask of asks) {
+    const of = ask.kind === "category"
+      ? { categoryId: ask.target.categoryId }
+      : { name: ask.target.value };
+    const neighbours = await client.neighbours(ask.kind, {
+      ...of,
+      limit: SUGGESTION_CHIPS,
+    }).catch(() => null) ?? [];
+
+    const categoryIds = neighbours.map((n) => n.categoryId).filter(Boolean);
+    const chains = categoryIds.length > 0
+      ? await client.breadcrumbsByIds(categoryIds)
+      : new Map<number, Crumb[]>();
+
+    const chips = neighbours.flatMap((neighbour) => {
+      const chain = chains.get(neighbour.categoryId);
+      const named = chain
+        ? {
+          label: buildPathLabel(neighbour.categoryId, chains),
+          raw: categoryPath(chain),
+        }
+        : { label: neighbour.label, raw: neighbour.label };
+      return neighbourChip(ask, named, vocabulary) ?? [];
+    });
+    if (chips.length > 0) suggestions.push({ heading: ask.heading, chips });
+  }
+  return suggestions;
+}
+
 async function buildTargetedResult(
   base: Data,
   understanding: Understanding,
@@ -174,9 +219,14 @@ async function buildTargetedResult(
       ))
     : [];
 
+  const suggestions = after === 0
+    ? await watch.time("neighbours", () => suggestionsFor(client, targets))
+    : [];
+
   return {
     ...base,
     filtered: {
+      suggestions,
       counts: {
         total: result.total,
         sites: result.sites,
@@ -336,6 +386,7 @@ export default define.page<typeof handler>(function SearchPage(props) {
           chips={filtered.chips}
           plainHref={filtered.plainHref}
           relaxations={filtered.relaxations}
+          suggestions={filtered.suggestions}
           links={filtered.links}
           tokens={filtered.words}
           nextHref={filtered.nextHref}

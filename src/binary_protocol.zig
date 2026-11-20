@@ -122,6 +122,7 @@ pub const Op = enum(u8) {
     put_link_entities = 39,
     match_names = 40,
     put_category_vectors = 41,
+    neighbours = 42,
     ping = 255,
 };
 
@@ -479,6 +480,7 @@ pub fn dispatch(
         .put_link_entities => handle_put_link_entities(db, response, op_byte, payload),
         .match_names => handle_match_names(db, response, op_byte, payload),
         .put_category_vectors => handle_put_category_vectors(db, response, op_byte, payload),
+        .neighbours => handle_neighbours(db, response, op_byte, payload),
     };
     assert(written <= response.len);
     if (written > 0) assert(written >= response_header_size);
@@ -1400,6 +1402,88 @@ fn write_query_links_body(
         for (item.row.entity_countries) |code| try writer.writeAll(&code);
     }
     try writer.writeInt(u64, answer.next_after_id, .little);
+    // Appended after the cursor, where a client that predates it stops reading.
+    try writer.writeInt(u64, answer.categories, .little);
+}
+
+const neighbours_fields = &[_]struct { []const u8, type }{
+    .{ "kind", u32 },
+    .{ "limit", u32 },
+    .{ "category_id", u64 },
+    .{ "name", []const u8 },
+};
+
+fn handle_neighbours(db: *Directory, response: []u8, op_byte: u8, payload: []const u8) usize {
+    const parsed = parsePayload(neighbours_fields, payload) orelse
+        return write_error_response(response, op_byte, .invalid);
+    if (parsed.rest.len != 0) return write_error_response(response, op_byte, .invalid);
+    var name_buffer: [url_facts.host_len_max]u8 = undefined;
+    const request = neighbour_request_from(&parsed.result, &name_buffer) orelse
+        return write_error_response(response, op_byte, .invalid);
+
+    var arena = std.heap.ArenaAllocator.init(db.scratch());
+    defer arena.deinit();
+
+    const result = operations.neighbours(db, arena.allocator(), &request) catch |err|
+        return write_mapped_error(response, op_byte, err);
+    assert(result.neighbours.len <= request.limit);
+    if (!result.ready) assert(result.neighbours.len == 0);
+
+    var body: std.Io.Writer = .fixed(response[response_header_size..]);
+    write_neighbours_body(&body, &result) catch
+        return write_error_response_sub(response, op_byte, .invalid, .buffer_too_small);
+    const len = response_header_size + body.end;
+    assert(len <= response.len);
+    write_ok_header(response, op_byte, len, @intCast(result.neighbours.len));
+    return len;
+}
+
+// A site is asked for by a host suffix, folded to lower case like a domain filter; an entity
+// by its name, which the index folds itself; a category by its id alone.
+fn neighbour_request_from(
+    parsed: anytype,
+    name_buffer: *[url_facts.host_len_max]u8,
+) ?operations.NeighbourRequest {
+    const kind_byte = std.math.cast(u8, parsed.kind) orelse return null;
+    const kind = std.enums.fromInt(operations.NeighbourKind, kind_byte) orelse return null;
+    if (parsed.limit == 0) return null;
+    if (parsed.limit > facts_index.neighbours_max) return null;
+
+    switch (kind) {
+        .category => {
+            if (parsed.category_id == 0) return null;
+            if (parsed.name.len != 0) return null;
+            return .{ .kind = kind, .category_id = parsed.category_id, .limit = parsed.limit };
+        },
+        .entity => {
+            if (parsed.name.len == 0) return null;
+            if (parsed.name.len > entities.name_len_max) return null;
+            return .{ .kind = kind, .name = parsed.name, .limit = parsed.limit };
+        },
+        .site => {
+            const suffix = std.mem.trim(u8, parsed.name, ".");
+            if (suffix.len == 0) return null;
+            if (suffix.len > name_buffer.len) return null;
+            const folded = std.ascii.lowerString(name_buffer, suffix);
+            return .{ .kind = kind, .name = folded, .limit = parsed.limit };
+        },
+    }
+}
+
+fn write_neighbours_body(
+    writer: *std.Io.Writer,
+    result: *const operations.NeighbourResult,
+) std.Io.Writer.Error!void {
+    assert(result.neighbours.len <= facts_index.neighbours_max);
+    try writer.writeByte(@intFromBool(result.ready));
+    try writer.writeInt(u16, @intCast(result.neighbours.len), .little);
+    for (result.neighbours) |neighbour| {
+        assert(neighbour.label.len <= std.math.maxInt(u16));
+        try writer.writeInt(u16, @intCast(neighbour.label.len), .little);
+        try writer.writeAll(neighbour.label);
+        try writer.writeInt(u64, neighbour.category_id, .little);
+        try writer.writeInt(u32, neighbour.shared, .little);
+    }
 }
 
 fn handle_match_names(db: *Directory, response: []u8, op_byte: u8, payload: []const u8) usize {
@@ -4090,7 +4174,13 @@ test "query_links (op=38) answers counts, groups and a page" {
     try std.testing.expectEqualStrings("samvak.tripod.com", response[offset + 2 ..][0..site_len]);
     const row_tail = 4 + 2 + 1;
     const fuzzy_row = @sizeOf(schema.Link) + 2 + "members.tripod.com/~fuzzy".len + row_tail;
-    try std.testing.expectEqual(len - 8, offset + 2 + site_len + row_tail + fuzzy_row);
+    const cursor_and_categories = 2 * @sizeOf(u64);
+    try std.testing.expectEqual(
+        len - cursor_and_categories,
+        offset + 2 + site_len + row_tail + fuzzy_row,
+    );
+    const categories = std.mem.readInt(u64, response[len - 8 ..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 1), categories);
 
     _ = handle_query_links(
         db,
@@ -4187,6 +4277,84 @@ test "match_names (op=40) answers each phrase with its category" {
     try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, body[1..3], .little));
     try std.testing.expectEqual(arts, std.mem.readInt(u64, body[3..11], .little));
     try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, body[12..20], .little));
+}
+
+// Goal: the neighbours frame carries one row per neighbour and refuses a request that does not
+// fit its kind. Method: two Chess categories and two sites sharing one, asked for by category
+// and by site, then with a truncated frame, a zero limit and a category kind carrying a name.
+test "neighbours (op=42) answers namesakes for a category and co-filed sites for a site" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+    try operations.load_facts_index(db);
+
+    const top = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const games = try operations.create_category(
+        db,
+        top,
+        .{ .name = "Games", .slug = "games", .description = "" },
+    );
+    const chess = try operations.create_category(
+        db,
+        games,
+        .{ .name = "Chess", .slug = "chess", .description = "" },
+    );
+    const other_chess = try operations.create_category(
+        db,
+        top,
+        .{ .name = "Chess", .slug = "chess", .description = "" },
+    );
+    for ([_][]const u8{ "http://one.example.com/", "http://two.example.org/" }) |url| {
+        _ = try operations.create_link(db, chess, .{ .url = url, .title = "", .description = "" });
+    }
+
+    var response: [512]u8 = undefined;
+    const op = @intFromEnum(Op.neighbours);
+    var request: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&request);
+    try writer.writeInt(u32, @intFromEnum(operations.NeighbourKind.category), .little);
+    try writer.writeInt(u32, 5, .little);
+    try writer.writeInt(u64, chess, .little);
+    try writer.writeInt(u16, 0, .little);
+
+    _ = handle_neighbours(db, &response, op, request[0 .. writer.end - 1]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
+
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[5]);
+    var body = response[response_header_size..];
+    try std.testing.expectEqual(@as(u8, 1), body[0]);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, body[1..3], .little));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, body[3..5], .little));
+    try std.testing.expectEqual(other_chess, std.mem.readInt(u64, body[5..13], .little));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, body[13..17], .little));
+
+    std.mem.writeInt(u32, request[4..8], 0, .little);
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
+
+    const site = "example.com";
+    writer = .fixed(&request);
+    try writer.writeInt(u32, @intFromEnum(operations.NeighbourKind.site), .little);
+    try writer.writeInt(u32, 5, .little);
+    try writer.writeInt(u64, 0, .little);
+    try writer.writeInt(u16, site.len, .little);
+    try writer.writeAll(site);
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[5]);
+    body = response[response_header_size..];
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, body[1..3], .little));
+    try std.testing.expectEqualStrings("example.org", body[5..16]);
+
+    std.mem.writeInt(u32, request[0..4], @intFromEnum(operations.NeighbourKind.category), .little);
+    _ = handle_neighbours(db, &response, op, request[0..writer.end]);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
 }
 
 // One valid and one invalid record answer their codes; the stored religion then filters a query.

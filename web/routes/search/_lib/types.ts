@@ -11,6 +11,11 @@ export interface Relaxation extends Chip {
   links: number;
 }
 
+export interface Suggestion {
+  heading: string;
+  chips: Chip[];
+}
+
 export type LinkCounts = Pick<
   LinkQueryResult,
   "total" | "sites" | "hosts" | "domains"

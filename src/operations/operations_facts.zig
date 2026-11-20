@@ -16,6 +16,7 @@ const link_operations = @import("operations_link.zig");
 const category = @import("operations_category.zig");
 const search = @import("operations_search.zig");
 const scratch_memory = @import("../scratch.zig");
+const ScoredId = @import("../ranking.zig").ScoredId;
 
 const load_chunk: u32 = 512;
 pub const query_words_max: usize = 32;
@@ -94,6 +95,7 @@ const not_ready: LinkQueryResult = .{
         .sites = 0,
         .hosts = 0,
         .domains = 0,
+        .categories = 0,
         .groups = &.{},
         .page = &.{},
         .next_after_id = 0,
@@ -240,6 +242,97 @@ pub fn query_links(
     }
     assert(links.items.len <= answer.page.len);
     return .{ .ready = true, .answer = answer, .links = links.items };
+}
+
+pub const NeighbourKind = enum(u8) { site = 1, category = 2, entity = 3 };
+
+pub const NeighbourRequest = struct {
+    kind: NeighbourKind,
+    category_id: u64 = 0,
+    name: []const u8 = "",
+    limit: u32,
+};
+
+pub const NeighbourResult = struct {
+    ready: bool,
+    neighbours: []const facts_index.Neighbour,
+};
+
+// How many categories nearest in meaning are read before the page's own ancestors,
+// descendants and namesakes are dropped from them. A hub's nearest are mostly its own
+// descendants: at 32, regional/europe/ireland/business_and_economy kept none (92k store).
+const similar_categories_max: usize = 128;
+
+/// What sits close to a site, a category or an entity in the graph of facts: one walk per
+/// kind, each from the adjacency the facts index keeps.
+pub fn neighbours(
+    db: *Directory,
+    arena: std.mem.Allocator,
+    request: *const NeighbourRequest,
+) !NeighbourResult {
+    assert(request.limit <= facts_index.neighbours_max);
+    if (!db.facts.ready.load(.acquire)) return .{ .ready = false, .neighbours = &.{} };
+
+    const found = switch (request.kind) {
+        .site => try db.facts.sites_like(
+            db.io,
+            db.allocator,
+            arena,
+            .{ .suffix = request.name, .limit = request.limit },
+        ),
+        .entity => try db.facts.named_alongside(
+            db.io,
+            db.allocator,
+            arena,
+            .{ .name = request.name, .limit = request.limit },
+        ),
+        .category => try related_categories(db, arena, request),
+    };
+    assert(found.len <= request.limit);
+    return .{ .ready = true, .neighbours = found };
+}
+
+/// A category's namesakes first, then the categories nearest to it in meaning that are not
+/// on its own line of ancestors and descendants.
+fn related_categories(
+    db: *Directory,
+    arena: std.mem.Allocator,
+    request: *const NeighbourRequest,
+) ![]const facts_index.Neighbour {
+    assert(request.kind == .category);
+    const category_id = request.category_id;
+    var related = try std.ArrayListUnmanaged(facts_index.Neighbour).initCapacity(
+        arena,
+        request.limit,
+    );
+
+    const namesakes = try db.facts.namesakes(
+        db.io,
+        db.allocator,
+        arena,
+        .{ .category_id = category_id, .limit = request.limit },
+    );
+    for (namesakes) |id| related.appendAssumeCapacity(.{ .category_id = id, .shared = 1 });
+    if (!db.category_vector_index.ready.load(.acquire)) return related.items;
+
+    var nearest_buffer: [similar_categories_max]ScoredId = undefined;
+    const nearest = db.category_vector_index.nearest_to(db.io, category_id, &nearest_buffer);
+    var candidates: [similar_categories_max]u64 = undefined;
+    for (nearest, candidates[0..nearest.len]) |hit, *id| id.* = hit.id;
+
+    const similar = try db.facts.off_the_line(
+        db.io,
+        db.allocator,
+        arena,
+        .{ .category_id = category_id, .candidates = candidates[0..nearest.len] },
+    );
+    for (similar) |id| {
+        if (related.items.len == request.limit) break;
+        if (std.mem.findScalar(u64, namesakes, id) != null) continue;
+        related.appendAssumeCapacity(.{ .category_id = id, .shared = 0 });
+    }
+    assert(related.items.len <= request.limit);
+    return related.items;
 }
 
 pub const name_matches_max: usize = 32;

@@ -27,6 +27,18 @@ pub const subtree_roots_max: usize = 8;
 // a second, so a backfill writing 40 links a second pays that once every 100 seconds.
 pub const dirty_links_max: usize = 4096;
 
+pub const neighbours_max: usize = 50;
+
+// One walk reads at most this many of its source's links and passes over a category filed
+// with more links than the second bound: imdb.com has 10,832 links, and a category shared with
+// thousands of sites says little about any one of them.
+const neighbour_source_links_max: usize = 2048;
+const neighbour_category_links_max: usize = 512;
+
+// A name carried by more categories than this is a filing template ("Business and Economy"
+// sits under every region), not a subject, so its namesakes are not offered as related.
+const namesakes_max: usize = 24;
+
 const parents_that_file_things_by_name = std.StaticStringMap(void).initComptime(.{
     .{"Breeds"}, .{"Kitchen_and_Dining"}, .{"Poultry"},
 });
@@ -134,11 +146,34 @@ pub const PageRow = struct {
     religions: u16,
 };
 
+/// Something close to what was asked about: a site by its key, an entity by its name, or a
+/// category by its id. `shared` counts what ties the two: categories for sites, links for
+/// entities, and for categories 1 when the name is the same and 0 when only the meaning is.
+pub const Neighbour = struct {
+    label: []const u8 = "",
+    category_id: u64 = 0,
+    shared: u32,
+};
+
+const Affinity = struct { weight: f64 = 0, shared: u32 = 0 };
+const Affinities = std.AutoHashMapUnmanaged(StringId, Affinity);
+
+const RankedAffinity = struct {
+    key: StringId,
+    affinity: Affinity,
+
+    fn before(_: void, a: RankedAffinity, b: RankedAffinity) bool {
+        if (a.affinity.weight != b.affinity.weight) return a.affinity.weight > b.affinity.weight;
+        return a.key < b.key;
+    }
+};
+
 pub const Answer = struct {
     total: u64,
     sites: u64,
     hosts: u64,
     domains: u64,
+    categories: u64,
     groups: []const Group,
     page: []const PageRow,
     next_after_id: u64,
@@ -720,16 +755,8 @@ pub const FactsIndex = struct {
         arena: std.mem.Allocator,
         request: Query,
     ) !Answer {
-        self.lock.lockSharedUncancelable(io);
-        if (self.current()) {
-            defer self.lock.unlockShared(io);
-            return self.evaluate(arena, &request);
-        }
-        self.lock.unlockShared(io);
-
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
-        try self.refresh(gpa);
+        const held = try self.lock_current(io, gpa);
+        defer self.unlock_current(io, held);
         return self.evaluate(arena, &request);
     }
 
@@ -743,17 +770,215 @@ pub const FactsIndex = struct {
         roots: []const u64,
     ) ![]u64 {
         assert(roots.len <= subtree_roots_max);
-        self.lock.lockSharedUncancelable(io);
-        if (self.current()) {
-            defer self.lock.unlockShared(io);
-            return self.collect_subtree_link_ids(scratch, roots);
+        const held = try self.lock_current(io, gpa);
+        defer self.unlock_current(io, held);
+        return self.collect_subtree_link_ids(scratch, roots);
+    }
+
+    /// The sites filed in the same categories as the site at `suffix`, the most alike first.
+    /// A shared category counts for more the fewer links it holds.
+    pub fn sites_like(
+        self: *FactsIndex,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        request: struct { suffix: []const u8, limit: u32 },
+    ) ![]const Neighbour {
+        assert(request.limit <= neighbours_max);
+        assert(request.suffix.len > 0);
+        const held = try self.lock_current(io, gpa);
+        defer self.unlock_current(io, held);
+
+        const suffix = request.suffix;
+        const on_domain = self.domain_links(suffix) orelse return &.{};
+        const source = on_domain[0..@min(on_domain.len, neighbour_source_links_max)];
+
+        var affinities: Affinities = .empty;
+        var categories_seen: IdSet = .empty;
+        var sites_here: std.AutoHashMapUnmanaged(StringId, void) = .empty;
+        for (source) |id| {
+            const fact = self.clean_approved(id) orelse continue;
+            if (!url_facts.has_suffix(self.strings.get(fact.host), suffix)) continue;
+            if (try categories_seen.fetchPut(arena, fact.category_id, {}) != null) continue;
+
+            const filed = self.by_category.of(fact.category_id);
+            assert(filed.len > 0);
+            if (filed.len > neighbour_category_links_max) continue;
+            sites_here.clearRetainingCapacity();
+            const weight = 1.0 / @as(f64, @floatFromInt(filed.len));
+            for (filed) |other_id| {
+                const other = self.clean_approved(other_id) orelse continue;
+                if (url_facts.has_suffix(self.strings.get(other.host), suffix)) continue;
+                if (try sites_here.fetchPut(arena, other.site, {}) != null) continue;
+                const entry = try affinities.getOrPutValue(arena, other.site, .{});
+                entry.value_ptr.weight += weight;
+                entry.value_ptr.shared += 1;
+            }
         }
+        return self.strongest(arena, &affinities, request.limit);
+    }
+
+    /// The people and organisations named on the same links as `name`, by how many links.
+    pub fn named_alongside(
+        self: *FactsIndex,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        request: struct { name: []const u8, limit: u32 },
+    ) ![]const Neighbour {
+        assert(request.limit <= neighbours_max);
+        assert(request.name.len > 0);
+        const held = try self.lock_current(io, gpa);
+        defer self.unlock_current(io, held);
+
+        const own = self.name_id(request.name) orelse return &.{};
+        const naming = self.by_name.of(own);
+        const source = naming[0..@min(naming.len, neighbour_source_links_max)];
+
+        var affinities: Affinities = .empty;
+        for (source) |id| {
+            if (self.clean_approved(id) == null) continue;
+            const fact = self.entities.getPtr(id) orelse continue;
+            const names = fact.all_names();
+            for (names, 0..) |other, index| {
+                if (other == own) continue;
+                if (std.mem.findScalar(StringId, names[0..index], other) != null) continue;
+                const entry = try affinities.getOrPutValue(arena, other, .{});
+                entry.value_ptr.weight += 1;
+                entry.value_ptr.shared += 1;
+            }
+        }
+        return self.strongest(arena, &affinities, request.limit);
+    }
+
+    /// Of `candidates`, the categories that are known and sit neither above nor below
+    /// `category_id`: a page already shows its own ancestors and children.
+    pub fn off_the_line(
+        self: *FactsIndex,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        request: struct { category_id: u64, candidates: []const u64 },
+    ) ![]const u64 {
+        assert(request.category_id != 0);
+        const held = try self.lock_current(io, gpa);
+        defer self.unlock_current(io, held);
+
+        const own = self.category_views.get(request.category_id) orelse return &.{};
+        var kept = try std.ArrayListUnmanaged(u64).initCapacity(arena, request.candidates.len);
+        for (request.candidates) |candidate| {
+            const view = self.category_views.get(candidate) orelse continue;
+            if (own.contains(&view)) continue;
+            if (view.contains(&own)) continue;
+            kept.appendAssumeCapacity(candidate);
+        }
+        assert(kept.items.len <= request.candidates.len);
+        return kept.items;
+    }
+
+    /// The other categories that carry `category_id`'s name, the largest subtree first, and
+    /// none when the name is a filing template.
+    pub fn namesakes(
+        self: *FactsIndex,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        request: struct { category_id: u64, limit: u32 },
+    ) ![]const u64 {
+        assert(request.limit <= neighbours_max);
+        assert(request.category_id != 0);
+        const held = try self.lock_current(io, gpa);
+        defer self.unlock_current(io, held);
+
+        const own = self.categories.get(request.category_id) orelse return &.{};
+        const named = self.category_names.get(own.name) orelse return &.{};
+        if (named.items.len > namesakes_max + 1) return &.{};
+
+        const Sized = struct {
+            id: u64,
+            below: u32,
+
+            fn before(_: void, a: @This(), b: @This()) bool {
+                if (a.below != b.below) return a.below > b.below;
+                return a.id < b.id;
+            }
+        };
+        var sized = try std.ArrayListUnmanaged(Sized).initCapacity(arena, named.items.len);
+        for (named.items) |id| {
+            if (id == request.category_id) continue;
+            const view = self.category_views.get(id) orelse continue;
+            sized.appendAssumeCapacity(.{ .id = id, .below = view.last_descendant - view.order });
+        }
+        std.sort.pdq(Sized, sized.items, {}, Sized.before);
+
+        const out = try arena.alloc(u64, @min(request.limit, sized.items.len));
+        for (out, sized.items[0..out.len]) |*id, twin| id.* = twin.id;
+        assert(out.len <= namesakes_max);
+        return out;
+    }
+
+    /// A link the adjacency still describes and that readers may be shown. A dirty link is
+    /// left out: a neighbour list tolerates missing the last few thousand writes.
+    fn clean_approved(self: *const FactsIndex, id: u64) ?*const LinkFact {
+        assert(self.adjacency_built);
+        assert(id != 0);
+        if (self.dirty_links.contains(id)) return null;
+        const fact = self.links.getPtr(id).?;
+        if (fact.status != @intFromEnum(schema.LinkStatus.approved)) return null;
+        return fact;
+    }
+
+    fn strongest(
+        self: *const FactsIndex,
+        arena: std.mem.Allocator,
+        affinities: *const Affinities,
+        limit: u32,
+    ) ![]const Neighbour {
+        assert(limit <= neighbours_max);
+        const ranked = try arena.alloc(RankedAffinity, affinities.count());
+        var entries = affinities.iterator();
+        var filled: usize = 0;
+        while (entries.next()) |entry| : (filled += 1) {
+            assert(filled < ranked.len);
+            ranked[filled] = .{ .key = entry.key_ptr.*, .affinity = entry.value_ptr.* };
+        }
+        assert(filled == ranked.len);
+        std.sort.pdq(RankedAffinity, ranked, {}, RankedAffinity.before);
+
+        const out = try arena.alloc(Neighbour, @min(limit, ranked.len));
+        for (out, ranked[0..out.len]) |*neighbour, top| {
+            assert(top.affinity.shared > 0);
+            neighbour.* = .{
+                .label = try arena.dupe(u8, self.strings.get(top.key)),
+                .shared = top.affinity.shared,
+            };
+        }
+        assert(out.len <= limit);
+        return out;
+    }
+
+    const Held = enum { shared, exclusive };
+
+    /// Takes the lock a reader needs: shared when the views and the adjacency are current,
+    /// exclusive after bringing them up to date. `gpa` is the index's own allocator.
+    fn lock_current(self: *FactsIndex, io: std.Io, gpa: std.mem.Allocator) !Held {
+        self.lock.lockSharedUncancelable(io);
+        if (self.current()) return .shared;
         self.lock.unlockShared(io);
 
         self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
+        errdefer self.lock.unlock(io);
         try self.refresh(gpa);
-        return self.collect_subtree_link_ids(scratch, roots);
+        assert(self.current());
+        return .exclusive;
+    }
+
+    fn unlock_current(self: *FactsIndex, io: std.Io, held: Held) void {
+        assert(self.current());
+        switch (held) {
+            .shared => self.lock.unlockShared(io),
+            .exclusive => self.lock.unlock(io),
+        }
     }
 
     /// Whether a reader can answer under the shared lock: the views match the categories and
@@ -1411,6 +1636,7 @@ const Evaluator = struct {
     site_set: std.DynamicBitSetUnmanaged,
     host_set: std.DynamicBitSetUnmanaged,
     domain_set: std.DynamicBitSetUnmanaged,
+    category_set: IdSet = .empty,
     matches: std.ArrayListUnmanaged(u64) = .empty,
     tallies: std.AutoHashMapUnmanaged(u64, Tally) = .empty,
     group_sites: std.AutoHashMapUnmanaged(GroupSite, void) = .empty,
@@ -1445,6 +1671,7 @@ const Evaluator = struct {
             .sites = self.site_set.count(),
             .hosts = self.host_set.count(),
             .domains = self.domain_set.count(),
+            .categories = self.category_set.count(),
             .groups = try self.top_groups(),
             .page = paged.rows,
             .next_after_id = paged.next_after_id,
@@ -1541,6 +1768,7 @@ const Evaluator = struct {
         self.site_set.set(fact.site);
         self.host_set.set(fact.host);
         self.domain_set.set(fact.domain);
+        try self.category_set.put(self.arena, fact.category_id, {});
         try self.tally(id, fact, &ties);
     }
 
@@ -2038,6 +2266,154 @@ test "every driver answers what a scan of every link answers, through writes and
     try testing.expect(index.dirty_links.count() > dirty_links_max);
     try expect_drivers_agree_with_a_scan(&index, io, arena, &words);
     try testing.expectEqual(@as(usize, 0), index.dirty_links.count());
+}
+
+// Goal: a site's neighbours are the sites filed beside it, the one sharing more categories
+// first, and never the site itself, a pending link's site or a site in no shared category.
+// Method: three categories with overlapping sites, asked from one site, an unknown one and a
+// public suffix.
+test "sites_like ranks the sites filed in the same categories" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try build_tree(&index, io, allocator, &.{
+        test_category(.{ .id = 1, .parent_id = 0 }, "Top"),
+        test_category(.{ .id = 2, .parent_id = 1 }, "Films"),
+        test_category(.{ .id = 3, .parent_id = 1 }, "Reviews"),
+        test_category(.{ .id = 4, .parent_id = 1 }, "Gardening"),
+    });
+    const urls = [_][]const u8{
+        "http://www.imdb.example/a", "http://reviews.example/a", "http://stills.example/",
+        "http://www.imdb.example/b", "http://reviews.example/b", "http://roses.example/",
+        "http://waiting.example/",
+    };
+    for (urls, [_]u64{ 2, 2, 2, 3, 3, 4, 3 }, 1..) |url, category_id, id| {
+        var link = test_link(.{ .id = id, .category_id = category_id }, url);
+        if (id == 7) link.status = @intFromEnum(schema.LinkStatus.pending);
+        try index.observe(io, allocator, &inserted(link));
+    }
+
+    const like = try index.sites_like(
+        io,
+        allocator,
+        arena,
+        .{ .suffix = "imdb.example", .limit = 10 },
+    );
+    try testing.expectEqual(@as(usize, 2), like.len);
+    try testing.expectEqualStrings("reviews.example", like[0].label);
+    try testing.expectEqual(@as(u32, 2), like[0].shared);
+    try testing.expectEqualStrings("stills.example", like[1].label);
+    try testing.expectEqual(@as(u32, 1), like[1].shared);
+
+    const fewer = [_]struct { suffix: []const u8, limit: u32, expected: u32 }{
+        .{ .suffix = "imdb.example", .limit = 1, .expected = 1 },
+        .{ .suffix = "no.example", .limit = 5, .expected = 0 },
+        .{ .suffix = "example", .limit = 5, .expected = 0 },
+    };
+    for (fewer) |case| {
+        const found = try index.sites_like(
+            io,
+            allocator,
+            arena,
+            .{ .suffix = case.suffix, .limit = case.limit },
+        );
+        try testing.expectEqual(@as(usize, case.expected), found.len);
+    }
+}
+
+// Goal: an entity's neighbours are the names that share its links, by how many links, with a
+// name given as both person and organisation counted once. Method: three links naming
+// overlapping people and organisations.
+test "named_alongside counts the links two names share" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try build_tree(&index, io, allocator, &.{test_category(.{ .id = 1, .parent_id = 0 }, "Top")});
+    for (1..4) |id| {
+        const link = test_link(.{ .id = id, .category_id = 1 }, "http://a.example/");
+        try index.observe(io, allocator, &inserted(link));
+    }
+    var buffer: [256]u8 = undefined;
+    const amnesty = [_][]const u8{"Amnesty International"};
+    const both = [_][]const u8{ "Amnesty International", "United Nations" };
+    const watch = [_][]const u8{"Human Rights Watch"};
+    const named = [_]struct { people: []const []const u8, orgs: []const []const u8 }{
+        .{ .people = &watch, .orgs = &both },
+        .{ .people = &.{}, .orgs = &both },
+        .{ .people = &amnesty, .orgs = &amnesty },
+    };
+    for (named, 1..) |names, id| {
+        const blob = try entity_blob(&buffer, &.{}, &.{}, names.people, names.orgs);
+        try put_entities(&index, io, allocator, id, blob);
+    }
+
+    const alongside = try index.named_alongside(
+        io,
+        allocator,
+        arena,
+        .{ .name = "amnesty international", .limit = 10 },
+    );
+    try testing.expectEqual(@as(usize, 2), alongside.len);
+    try testing.expectEqualStrings("United Nations", alongside[0].label);
+    try testing.expectEqual(@as(u32, 2), alongside[0].shared);
+    try testing.expectEqualStrings("Human Rights Watch", alongside[1].label);
+    try testing.expectEqual(@as(u32, 1), alongside[1].shared);
+
+    const nobody = try index.named_alongside(
+        io,
+        allocator,
+        arena,
+        .{ .name = "nobody", .limit = 5 },
+    );
+    try testing.expectEqual(@as(usize, 0), nobody.len);
+}
+
+// Goal: a category's namesakes are the other categories with its name, larger subtree first,
+// and candidates on its own line of ancestors and descendants are dropped. Method: two Chess
+// categories, one with a child, plus an unrelated category.
+test "namesakes lists same-named categories and off_the_line drops a category's own line" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try build_tree(&index, io, allocator, &.{
+        test_category(.{ .id = 1, .parent_id = 0 }, "Top"),
+        test_category(.{ .id = 2, .parent_id = 1 }, "Games"),
+        test_category(.{ .id = 3, .parent_id = 2 }, "Chess"),
+        test_category(.{ .id = 4, .parent_id = 3 }, "Openings"),
+        test_category(.{ .id = 5, .parent_id = 1 }, "Computers"),
+        test_category(.{ .id = 6, .parent_id = 5 }, "Chess"),
+        test_category(.{ .id = 7, .parent_id = 1 }, "Chess"),
+        test_category(.{ .id = 8, .parent_id = 7 }, "Clubs"),
+        test_category(.{ .id = 9, .parent_id = 8 }, "Europe"),
+    });
+
+    const twins = try index.namesakes(io, allocator, arena, .{ .category_id = 6, .limit = 10 });
+    try testing.expectEqualSlices(u64, &.{ 7, 3 }, twins);
+    const none = try index.namesakes(io, allocator, arena, .{ .category_id = 5, .limit = 10 });
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    const kept = try index.off_the_line(
+        io,
+        allocator,
+        arena,
+        .{ .category_id = 3, .candidates = &.{ 2, 4, 6, 1, 99, 3, 9 } },
+    );
+    try testing.expectEqualSlices(u64, &.{ 6, 9 }, kept);
 }
 
 // Goal: a snapshot round trip reproduces the index. Method: load links on two hosts, write the

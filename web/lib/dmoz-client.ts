@@ -113,6 +113,28 @@ export interface NameMatch {
   namesSomeone: boolean;
 }
 
+export type NeighbourKind = "site" | "category" | "entity";
+
+export interface Neighbour {
+  label: string;
+  categoryId: number;
+  shared: number;
+}
+
+export interface NeighbourOf {
+  categoryId?: number;
+  name?: string;
+  limit?: number;
+}
+
+const NEIGHBOUR_KIND_CODE: Record<NeighbourKind, number> = {
+  site: 1,
+  category: 2,
+  entity: 3,
+};
+export const NEIGHBOURS_MAX = 50;
+const NEIGHBOURS_DEFAULT = 8;
+
 export type LinkQueryGroupBy =
   | "none"
   | "domain"
@@ -169,6 +191,7 @@ export interface LinkQueryResult {
   sites: number;
   hosts: number;
   domains: number;
+  categories: number;
   groups: LinkQueryGroup[];
   links: QueriedLink[];
   nextAfterId: number;
@@ -1265,16 +1288,42 @@ export class DmozClient {
         religions,
       });
     }
+
+    const nextAfterId = r.u64();
+    const hasCategories = resp.payload.length - r.offset >= 8;
     return {
       ready,
       total,
       sites,
       hosts,
       domains,
+      categories: hasCategories ? r.u64() : 0,
       groups,
       links,
-      nextAfterId: r.u64(),
+      nextAfterId,
     };
+  }
+
+  async neighbours(
+    kind: NeighbourKind,
+    of: NeighbourOf,
+  ): Promise<Neighbour[] | null> {
+    const w = new BufferWriter()
+      .u32(NEIGHBOUR_KIND_CODE[kind])
+      .u32(of.limit ?? NEIGHBOURS_DEFAULT)
+      .u64(of.categoryId ?? 0)
+      .str(of.name ?? "");
+    const resp = await this.request(Op.Neighbours, w.build());
+    this.assertOk(resp);
+
+    const r = new BufferReader(resp.payload);
+    const ready = r.u8() === 1;
+    const neighbours = Array.from({ length: r.u16() }, () => ({
+      label: r.str(),
+      categoryId: r.u64(),
+      shared: r.u32(),
+    }));
+    return ready ? neighbours : null;
   }
 
   async putLinkEntities(

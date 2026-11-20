@@ -43,6 +43,7 @@ export const enum Op {
   PutLinkEntities = 39,
   MatchNames = 40,
   PutCategoryVectors = 41,
+  Neighbours = 42,
   Ping = 255,
 }
 
@@ -84,6 +85,7 @@ export const OP_NAME: Record<number, string> = {
   39: "put link entities",
   40: "match names",
   41: "put category vectors",
+  42: "neighbours",
   255: "ping",
 };
 
