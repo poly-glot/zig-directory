@@ -27,6 +27,7 @@ import {
 import {
   canonicalQuery,
   constraintsOf,
+  isOnlyAGuessedRole,
   linkQueryFor,
   namePhrases,
   neighbourAsks,
@@ -333,14 +334,18 @@ export const handler = define.handlers<Data>({
             after,
             watch,
           );
-          logSearch({
-            query: q,
-            path: "targeted",
-            links: data.filtered?.links.length ?? 0,
-            categories: 0,
-            watch,
-          });
-          return timed(data, watch);
+          const nothingFiledAsRole = data.filtered?.counts.total === 0 &&
+            isOnlyAGuessedRole(q, understanding.targets);
+          if (!nothingFiledAsRole) {
+            logSearch({
+              query: q,
+              path: "targeted",
+              links: data.filtered?.links.length ?? 0,
+              categories: 0,
+              watch,
+            });
+            return timed(data, watch);
+          }
         }
       }
 

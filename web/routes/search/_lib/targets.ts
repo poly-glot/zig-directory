@@ -8,9 +8,16 @@ import {
 import type { Religion } from "../../../lib/dmoz-protocol.gen.ts";
 import type { QueryVocabulary } from "../../../lib/entities.ts";
 import { searchHref } from "./queryParams.ts";
+import { ROLE_CUES, roleCategories, roleOf } from "./roles.ts";
 import type { Chip } from "./types.ts";
 
-type TargetKind = "site" | "country" | "category" | "religion" | "name";
+type TargetKind =
+  | "site"
+  | "country"
+  | "category"
+  | "religion"
+  | "name"
+  | "role";
 
 export interface Target {
   kind: TargetKind;
@@ -51,6 +58,7 @@ interface KindRule {
   noun: string;
   example: string;
   neighbours?: NeighbourRule;
+  cues?: ReadonlySet<string>;
   normalise(raw: string, vocabulary: QueryVocabulary): string | undefined;
   label(target: Target, categoryLabel: string): string;
 }
@@ -76,6 +84,7 @@ const NEIGHBOUR_CUES = new Set(
   "alternative alternatives like named organisation organisations organization organizations people related similar"
     .split(" "),
 );
+const PERSON_CUES = new Set([...NEIGHBOUR_CUES, ...ROLE_CUES]);
 const CUE_BEFORE = new Set(["in", "under", "within", "inside", "into"]);
 const CUE_AFTER = new Set(["category", "categories", "section"]);
 
@@ -97,6 +106,7 @@ const KINDS: Record<TargetKind, KindRule> = {
     noun: "domain",
     example: "site:tripod.com",
     neighbours: { heading: "Similar sites", kind: "site" },
+    cues: NEIGHBOUR_CUES,
     normalise: (raw) => {
       const site = raw.toLowerCase().replace(EDGE_DOTS, "");
       return isHostSuffix(site) ? site : undefined;
@@ -118,6 +128,7 @@ const KINDS: Record<TargetKind, KindRule> = {
     noun: "category path",
     example: "in:arts/literature",
     neighbours: { heading: "Related categories", kind: "category" },
+    cues: NEIGHBOUR_CUES,
     normalise: (raw) =>
       raw.toLowerCase().replace(EDGE_SLASHES, "") || undefined,
     label: (_, categoryLabel) => `In ${categoryLabel}`,
@@ -136,8 +147,17 @@ const KINDS: Record<TargetKind, KindRule> = {
     noun: "person or organisation",
     example: 'name:"moniza alvi"',
     neighbours: { heading: "Named alongside", kind: "entity" },
+    cues: PERSON_CUES,
     normalise: (raw) => raw.trim() || undefined,
     label: (target) => `Naming ${capitalised(target.value)}`,
+  },
+  role: {
+    operator: "role",
+    single: true,
+    noun: "kind of person",
+    example: "role:politicians",
+    normalise: (raw) => roleOf(raw),
+    label: (target) => `People filed as ${capitalised(target.value)}`,
   },
 };
 
@@ -311,11 +331,25 @@ export function recognise(
     start += found.length;
   }
 
-  const asksForNeighbours = targets.some((t) => KINDS[t.kind].neighbours);
-  const kept = rest.filter((word) =>
-    isContentWord(word) && !(asksForNeighbours && NEIGHBOUR_CUES.has(word))
-  );
+  const cues = new Set(targets.flatMap((t) => [...(KINDS[t.kind].cues ?? [])]));
+  const kept = rest.filter((word) => isContentWord(word) && !cues.has(word));
+
+  const role = taken.has("role")
+    ? undefined
+    : roleOf(kept.filter((word) => !ROLE_CUES.has(word)).join(" "));
+  if (role) {
+    return { targets: [...targets, { kind: "role", value: role }], words: [] };
+  }
+
   return { targets, words: [...new Set(kept)] };
+}
+
+export function isOnlyAGuessedRole(
+  query: string,
+  targets: readonly Target[],
+): boolean {
+  const typed = new RegExp(`(^|\\s)${KINDS.role.operator}:`, "i").test(query);
+  return !typed && targets.length === 1 && targets[0].kind === "role";
 }
 
 export function neighbourAsks(targets: readonly Target[]): NeighbourAsk[] {
@@ -372,6 +406,7 @@ export function linkQueryFor(
     religions: targets.filter((target) => target.kind === "religion")
       .map((target) => target.value as Religion),
     entity: valueOf("name"),
+    categoryNames: roleCategories(valueOf("role")),
     words: words.join(" "),
     allWords: true,
   };

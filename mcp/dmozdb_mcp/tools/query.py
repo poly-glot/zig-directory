@@ -71,7 +71,8 @@ def _summarize(found: JSON, group_by: str) -> list[str]:
         "site), the countries tied to a link by its country-code domain, by a "
         "category named for the country or by places and nationalities named "
         "in its text, the religions it is about, the people and organisations "
-        "it names, its category subtree, and optional keywords. Use it for "
+        "it names, its category subtree, every category of a given name, and "
+        "optional keywords. Use it for "
         "how many, which domains, which countries, which religions, or links "
         "naming someone; use search_directory to find sites by meaning. "
         "Category paths come from browse_category or search_directory. Pass "
@@ -146,6 +147,19 @@ async def query_links(
             )
         ),
     ] = "",
+    category_names: Annotated[
+        tuple[str, ...],
+        Field(
+            max_length=16,
+            description=(
+                "Only links under a category that carries one of these names, "
+                "wherever it sits in the tree and in singular or plural: "
+                '["politicians", "presidents", "prime ministers"] collects the '
+                "people filed under every such category. Combines with "
+                "category_path. Empty for no name filter."
+            ),
+        ),
+    ] = (),
     hosted_only: Annotated[
         bool,
         Field(
@@ -224,6 +238,7 @@ async def query_links(
         religion=",".join(religions),
         entity=entity,
         category=category_path,
+        named=",".join(category_names),
         hosted="1" if hosted_only else "",
         subdomain="1" if subdomain_sites_only else "",
         words=words,
@@ -242,6 +257,7 @@ async def query_links(
         "religions": list(religions),
         "entity": entity,
         "category_path": category_path,
+        "category_names": list(category_names),
         "hosted_only": hosted_only,
         "subdomain_sites_only": subdomain_sites_only,
         "words": words,

@@ -1,0 +1,24 @@
+.row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 24px;
+}
+
+.chip {
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--ink);
+  font-size: 13px;
+  padding: 4px 12px;
+  text-decoration: none;
+}
+
+.chip:hover {
+  border-color: var(--ink);
+}
+
+.count {
+  color: var(--muted);
+}

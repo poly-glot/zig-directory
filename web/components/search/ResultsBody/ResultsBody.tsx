@@ -6,6 +6,7 @@ import type { Facets, Sort } from "../../../routes/search/_lib/types.ts";
 import SortControl from "../SortControl/SortControl.tsx";
 import ResultArticle from "../ResultArticle/ResultArticle.tsx";
 import { EmptyPrompt, NoResults } from "../EmptyStates/EmptyStates.tsx";
+import CountryFacets from "../../../islands/CountryFacets.tsx";
 
 interface Props {
   query: string;
@@ -114,6 +115,7 @@ function ListingsSection(
             year={activeYear}
           />
         </div>
+        <CountryFacets words={tokens} />
         {filteredLinks.length === 0
           ? (
             <div class="banner">

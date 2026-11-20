@@ -105,6 +105,8 @@ export interface SearchResult {
 }
 
 export const QUERY_LINKS_MAX_ROWS = 50;
+export const CATEGORY_NAMES_MAX = 16;
+export const CATEGORY_NAME_MAX_BYTES = 128;
 export const MATCH_NAMES_MAX = 32;
 export const MATCH_NAME_MAX_BYTES = 128;
 
@@ -154,6 +156,8 @@ export const COUNTRY_EDGES: readonly CountryEdge[] = [
 
 export interface LinkQuery {
   categoryId?: number;
+  categoryNames?: readonly string[];
+  wordsWithinBudget?: boolean;
   domain?: string;
   country?: string;
   via?: readonly CountryEdge[];
@@ -272,6 +276,7 @@ function linkQueryOptions(q: LinkQuery): bigint {
     [q.limit ?? 20, 8],
     [religionMask(q.religions ?? []), 16],
     [q.subdomainOnly ? 1 : 0, 1],
+    [q.wordsWithinBudget ? 1 : 0, 1],
   ];
   let packed = 0n;
   let shift = 0n;
@@ -1250,6 +1255,13 @@ export class DmozClient {
       .str(q.words ?? "")
       .str(q.entity ?? "")
       .u64(q.afterId ?? 0);
+
+    const names = q.categoryNames ?? [];
+    if (names.length > 0) {
+      w.u8(names.length);
+      for (const name of names) w.str(name);
+    }
+
     const resp = await this.request(Op.QueryLinks, w.build());
     this.assertOk(resp);
 

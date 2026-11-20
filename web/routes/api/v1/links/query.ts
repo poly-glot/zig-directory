@@ -1,5 +1,7 @@
 import { define } from "../../../../utils.ts";
 import {
+  CATEGORY_NAME_MAX_BYTES,
+  CATEGORY_NAMES_MAX,
   COUNTRY_EDGES,
   type CountryEdge,
   getClient,
@@ -52,6 +54,18 @@ function listOf<T extends string>(
   return known.every((value) => value !== undefined) ? known as T[] : undefined;
 }
 
+function categoryNames(raw: string | null): string[] | undefined {
+  if (raw === null || raw.trim() === "") return [];
+
+  const encoder = new TextEncoder();
+  const names = raw.split(",").map((name) => name.trim()).filter(Boolean);
+  const fits = names.length <= CATEGORY_NAMES_MAX &&
+    names.every((name) =>
+      encoder.encode(name).length <= CATEGORY_NAME_MAX_BYTES
+    );
+  return fits ? names : undefined;
+}
+
 function rows(raw: string | null, fallback: number): number | undefined {
   if (raw === null || raw === "") return fallback;
   const n = Number(raw);
@@ -76,6 +90,8 @@ export const handler = define.handlers({
     const religions = listOf<Religion>(params.get("religion"), RELIGIONS, []);
     const entity = (params.get("entity") ?? "").trim();
     const match = oneOf(params.get("match"), WORD_MATCHES, "any");
+    const named = categoryNames(params.get("named"));
+    const withinBudget = ["1", "true"].includes(params.get("budget") ?? "");
     const groupLimit = rows(params.get("groups"), DEFAULT_GROUPS);
     const limit = rows(params.get("limit"), DEFAULT_LIMIT);
 
@@ -93,6 +109,14 @@ export const handler = define.handlers({
       );
     }
     if (!match) return badRequest(`match must be one of ${WORD_MATCHES}`);
+    if (!named) {
+      return badRequest(
+        `named lists at most ${CATEGORY_NAMES_MAX} category names of up to ${CATEGORY_NAME_MAX_BYTES} bytes`,
+      );
+    }
+    if (withinBudget && match !== "all") {
+      return badRequest("budget needs match=all");
+    }
     if (groupLimit === undefined || limit === undefined) {
       return badRequest(
         `groups and limit must be 0 to ${QUERY_LINKS_MAX_ROWS}`,
@@ -111,6 +135,8 @@ export const handler = define.handlers({
 
       const result = await client.queryLinks({
         categoryId,
+        categoryNames: named,
+        wordsWithinBudget: withinBudget,
         domain: (params.get("domain") ?? "").trim(),
         country: country.toUpperCase(),
         via,
