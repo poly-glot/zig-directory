@@ -691,10 +691,13 @@ pub const FactsIndex = struct {
         return self.name_id(phrase) != null;
     }
 
+    /// `gpa` is the allocator the index itself was built with: the first reader after a
+    /// category write rebuilds `category_views`, which outlives the request. A request's
+    /// scratch slab here let the next large request overwrite the views (2026-11-19).
     pub fn query(
         self: *FactsIndex,
         io: std.Io,
-        allocator: std.mem.Allocator,
+        gpa: std.mem.Allocator,
         arena: std.mem.Allocator,
         request: Query,
     ) !Answer {
@@ -707,30 +710,33 @@ pub const FactsIndex = struct {
 
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
-        if (self.views_stale) try self.rebuild_category_views(allocator);
+        if (self.views_stale) try self.rebuild_category_views(gpa);
         assert(!self.views_stale);
         return self.evaluate(arena, &request);
     }
 
+    /// The ids come from `scratch` and are the caller's to free; `gpa` is for the views, as
+    /// in `query`.
     pub fn subtree_link_ids(
         self: *FactsIndex,
         io: std.Io,
-        allocator: std.mem.Allocator,
+        gpa: std.mem.Allocator,
+        scratch: std.mem.Allocator,
         roots: []const u64,
     ) ![]u64 {
         assert(roots.len <= subtree_roots_max);
         self.lock.lockSharedUncancelable(io);
         if (!self.views_stale) {
             defer self.lock.unlockShared(io);
-            return self.collect_subtree_link_ids(allocator, roots);
+            return self.collect_subtree_link_ids(scratch, roots);
         }
         self.lock.unlockShared(io);
 
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
-        if (self.views_stale) try self.rebuild_category_views(allocator);
+        if (self.views_stale) try self.rebuild_category_views(gpa);
         assert(!self.views_stale);
-        return self.collect_subtree_link_ids(allocator, roots);
+        return self.collect_subtree_link_ids(scratch, roots);
     }
 
     fn collect_subtree_link_ids(
@@ -1021,15 +1027,15 @@ pub const FactsIndex = struct {
         assert(std.mem.findScalar(u64, ids.items, id) == null);
     }
 
-    fn rebuild_category_views(self: *FactsIndex, allocator: std.mem.Allocator) !void {
+    fn rebuild_category_views(self: *FactsIndex, gpa: std.mem.Allocator) !void {
         var children: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(u64)) = .empty;
         defer {
             var lists = children.valueIterator();
-            while (lists.next()) |list| list.deinit(allocator);
-            children.deinit(allocator);
+            while (lists.next()) |list| list.deinit(gpa);
+            children.deinit(gpa);
         }
         var roots: std.ArrayListUnmanaged(u64) = .empty;
-        defer roots.deinit(allocator);
+        defer roots.deinit(gpa);
 
         const categories_total = self.categories.count();
         var categories = self.categories.iterator();
@@ -1038,23 +1044,23 @@ pub const FactsIndex = struct {
             assert(visited < categories_total);
             const parent_id = entry.value_ptr.parent_id;
             if (parent_id == 0 or !self.categories.contains(parent_id)) {
-                try roots.append(allocator, entry.key_ptr.*);
+                try roots.append(gpa, entry.key_ptr.*);
                 continue;
             }
-            const siblings = try children.getOrPut(allocator, parent_id);
+            const siblings = try children.getOrPut(gpa, parent_id);
             if (!siblings.found_existing) siblings.value_ptr.* = .empty;
-            try siblings.value_ptr.append(allocator, entry.key_ptr.*);
+            try siblings.value_ptr.append(gpa, entry.key_ptr.*);
         }
 
         self.category_views.clearRetainingCapacity();
-        try self.category_views.ensureTotalCapacity(allocator, categories_total);
+        try self.category_views.ensureTotalCapacity(gpa, categories_total);
 
         var stack: std.ArrayListUnmanaged(Visit) = .empty;
-        defer stack.deinit(allocator);
+        defer stack.deinit(gpa);
         var clock: u32 = 0;
         var steps: usize = 0;
         for (roots.items) |root| {
-            try stack.append(allocator, .{ .id = root });
+            try stack.append(gpa, .{ .id = root });
             while (stack.items.len > 0) : (steps += 1) {
                 assert(steps < 2 * categories_total);
                 assert(stack.items.len <= categories_total);
@@ -1071,7 +1077,7 @@ pub const FactsIndex = struct {
                 if (visit.next_child < kids.len) {
                     const child = kids[visit.next_child];
                     visit.next_child += 1;
-                    try stack.append(allocator, .{ .id = child });
+                    try stack.append(gpa, .{ .id = child });
                     continue;
                 }
                 self.category_views.getPtr(visit.id).?.last_descendant = clock - 1;
@@ -1572,11 +1578,11 @@ test "subtree_link_ids collects the links under known roots and nothing for unkn
         &inserted(test_link(.{ .id = 11, .category_id = 4 }, "http://science.example/")),
     );
 
-    const under_arts = try index.subtree_link_ids(io, allocator, &.{2});
+    const under_arts = try index.subtree_link_ids(io, allocator, allocator, &.{2});
     defer allocator.free(under_arts);
     try testing.expectEqualSlices(u64, &.{10}, under_arts);
 
-    const none = try index.subtree_link_ids(io, allocator, &.{ 999, 998 });
+    const none = try index.subtree_link_ids(io, allocator, allocator, &.{ 999, 998 });
     defer allocator.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
 }
