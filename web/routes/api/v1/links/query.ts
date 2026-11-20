@@ -144,6 +144,7 @@ export const handler = define.handlers({
         sites: result.sites,
         hosts: result.hosts,
         domains: result.domains,
+        categories: result.categories,
         groups: result.groups.map((g) => ({
           key: g.categoryId > 0 ? pathOf(g.categoryId) : g.label,
           links: g.links,

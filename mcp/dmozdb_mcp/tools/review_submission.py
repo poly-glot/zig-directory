@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
-from dmozdb_mcp import client
+from dmozdb_mcp import client, formatting
 from dmozdb_mcp.app import mcp_app
 from dmozdb_mcp.auth import roles
 
@@ -16,7 +16,9 @@ _admin_token = roles.protect("review_submission", role="admin")
     description=(
         "Approve or reject a pending link submission. The caller's role "
         "comes from their MCP sign-in, not from an argument — only an "
-        "admin account can call this."
+        "admin account can call this. Before ruling, query_links(domain=...) "
+        "shows how many links and categories the submission's domain already "
+        "holds; the reply here repeats that standing after the change."
     ),
     annotations=ToolAnnotations(
         title="Review a submission",
@@ -54,7 +56,8 @@ async def review_submission(
         decision: Whether to publish or hide it.
 
     Returns:
-        A line naming the link and the status it now holds.
+        A line naming the link and the status it now holds, then how many
+        approved links and categories its domain holds in the directory.
 
     Raises:
         ToolError: If the caller is not signed in, does not hold the admin
@@ -68,4 +71,12 @@ async def review_submission(
         token=token,
         json_body={"status": status},
     )
-    return f"{link['title']} — {link['url']} is now {status}."
+    ruling = f"{link['title']} — {link['url']} is now {status}."
+    domain = formatting.domain_of(link["url"])
+    if not domain:
+        return ruling
+
+    standing = await client.fetch("/api/v1/links/query", domain=domain, limit=0)
+    links = formatting.counted(standing["total"], "approved link", "approved links")
+    categories = formatting.counted(standing["categories"], "category", "categories")
+    return f"{ruling}\n{domain} holds {links} in {categories}."

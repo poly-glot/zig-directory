@@ -40,7 +40,8 @@ def _headline(found: JSON) -> str:
     sites = formatting.counted(found["sites"], "site", "sites")
     hosts = formatting.counted(found["hosts"], "host", "hosts")
     domains = formatting.counted(found["domains"], "domain", "domains")
-    return f"{links} on {sites} ({hosts}, {domains})"
+    categories = formatting.counted(found["categories"], "category", "categories")
+    return f"{links} on {sites} ({hosts}, {domains}) in {categories}"
 
 
 def _group_line(group: JSON) -> str:

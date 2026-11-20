@@ -1,7 +1,7 @@
 """The text summaries every tool returns, and the paging bounds they honour.
 
 These strings are the tool layer's machine-readable contract, not decoration.
-Three of four tools return ``ToolResult``, which FastMCP cannot infer an
+Most tools return ``ToolResult``, which FastMCP cannot infer an
 output schema from, and ``structuredContent`` carries the MCP Apps payload
 rather than data — so this text is the only channel every client receives.
 The tokens a caller needs in order to make the next call (``path "x/y"``,

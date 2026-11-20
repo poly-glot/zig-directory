@@ -10,8 +10,9 @@ speaks the binary protocol or touches Deno KV.
 | `browse_category` | none | breadcrumb, child categories, subtree counts |
 | `list_links` | none | approved links from a category and everything beneath it, cursor-paged |
 | `search_directory` | none | matching categories and links, each link with its category path |
-| `query_links` | none | counts, distinct sites and groupings of links by domain, hosting, country, category and keywords, with a cursor-paged page of links |
-| `review_submission` | admin | approves or rejects a link; the updated link |
+| `query_links` | none | counts, distinct sites, distinct categories and groupings of links by domain, hosting, country, category and keywords, with a cursor-paged page of links |
+| `find_related` | none | the neighbours of a site (sites filed in the same categories), a category (same name, then similar subject) or a named person or organisation (names on the same links) |
+| `review_submission` | admin | approves or rejects a link; the updated link, then how many approved links and categories its domain holds |
 
 Categories are addressed by slug path only, the same `path` the website uses.
 `list_links` resolves that path itself, so no numeric ids cross the tool
@@ -84,7 +85,7 @@ holds only configuration and the tests. Each tool is its own module under
 | `dmozdb_mcp/formatting.py` | text-summary helpers and the paging constants |
 | `dmozdb_mcp/views.py` | Prefab cards and `build_view`/`result` |
 | `dmozdb_mcp/tools/*.py` | one `@mcp_app.tool` each |
-| `dmozdb_mcp/tools/__init__.py` | imports the four above, registering them on import |
+| `dmozdb_mcp/tools/__init__.py` | imports each tool module, registering them on import |
 | `dmozdb_mcp/server.py` | imports `auth`/`tools` and serves the app behind `auth.OpportunisticAuth` |
 | `test_invariants.py` | the pytest cases that keep auth registration and tool schemas honest |
 
@@ -278,8 +279,8 @@ redirect past naive matching.
    "
    ```
 6. Confirm the reads are open and the write is *visible* —
-   `fastmcp list http://127.0.0.1:8765/mcp` with no `--auth` lists all 5
-   tools and `browse_category` returns data. The count is 5 for every
+   `fastmcp list http://127.0.0.1:8765/mcp` with no `--auth` lists all 6
+   tools and `browse_category` returns data. The count is 6 for every
    caller — anonymous, `role=user` and `role=admin` alike — and a
    `role=user` token must still be refused by `review_submission` itself.
 7. Confirm the write asks for a sign-in rather than failing. Posting a

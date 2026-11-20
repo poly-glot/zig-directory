@@ -287,3 +287,35 @@ test.describe('Deno App - Static pages (redesign)', () => {
     expect(await rows.count()).toBeGreaterThanOrEqual(1);
   });
 });
+
+test.describe('Deno App - Graph neighbours', () => {
+  test('a site search offers similar sites that lead to their own site search', async ({ page }) => {
+    await page.goto('/search?q=' + encodeURIComponent('sites like imdb.com'), {
+      waitUntil: 'networkidle',
+    });
+
+    const similar = page.locator('[data-suggestion="Similar sites"] a');
+    await expect(similar.first()).toBeVisible();
+    expect(await similar.count()).toBeGreaterThanOrEqual(3);
+
+    const href = await similar.first().getAttribute('href');
+    expect(decodeURIComponent(href ?? '')).toMatch(/^\/search\?q=site:[a-z0-9.-]+$/);
+
+    await similar.first().click();
+    await expect(page.locator('[aria-label^="Remove On "]')).toBeVisible();
+  });
+
+  test('a category page lists related categories that are not its own children', async ({ page }) => {
+    const path = '/category/science/math/number_theory';
+    await page.goto(path, { waitUntil: 'networkidle' });
+
+    const related = page.locator('[data-related-categories] li.list-row a[href^="/category/"]');
+    await expect(related.first()).toBeVisible();
+
+    const hrefs = await related.evaluateAll((links) =>
+      links.map((link) => link.getAttribute('href') ?? '')
+    );
+    expect(hrefs.length).toBeGreaterThanOrEqual(1);
+    for (const href of hrefs) expect(href.startsWith(path + '/')).toBe(false);
+  });
+});
