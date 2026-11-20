@@ -29,6 +29,10 @@ pub const dirty_links_max: usize = 4096;
 
 pub const neighbours_max: usize = 50;
 
+// A query may be confined to the categories carrying any of this many names: a role such as
+// "politicians" spans Politicians, Presidents, Prime Ministers and a dozen more.
+pub const scope_names_max: usize = 16;
+
 // One walk reads at most this many of its source's links and passes over a category filed
 // with more links than the second bound: imdb.com has 10,832 links, and a category shared with
 // thousands of sites says little about any one of them.
@@ -115,6 +119,7 @@ pub const GroupBy = enum(u8) {
 
 pub const Query = struct {
     category_id: u64 = 0,
+    category_names: []const []const u8 = &.{},
     domain_suffix: []const u8 = "",
     country: ?countries.Code = null,
     via: u8 = Via.all,
@@ -1166,8 +1171,7 @@ pub const FactsIndex = struct {
         request: *const Query,
     ) !Answer {
         assert(self.current());
-        var scope: ?CategoryView = null;
-        if (request.category_id != 0) scope = self.category_views.get(request.category_id);
+        const scopes = try self.scopes_for(arena, request);
         var name: ?StringId = null;
         if (request.entity_name.len > 0) name = self.name_id(request.entity_name);
 
@@ -1176,7 +1180,7 @@ pub const FactsIndex = struct {
             .index = self,
             .arena = arena,
             .query = request,
-            .scope = scope,
+            .scopes = scopes,
             .name = name,
             .site_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
             .host_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
@@ -1186,6 +1190,66 @@ pub const FactsIndex = struct {
         assert(answer.page.len <= request.page_limit);
         assert(answer.groups.len <= request.group_limit);
         return answer;
+    }
+
+    /// The category subtrees a query is confined to, disjoint and in DFS order: the category
+    /// asked for by id, every category carrying one of the names asked for, or where both are
+    /// given, the part they share. Null when the query names no category; empty when what it
+    /// names is not in the tree.
+    fn scopes_for(
+        self: *const FactsIndex,
+        arena: std.mem.Allocator,
+        request: *const Query,
+    ) !?[]const CategoryView {
+        assert(!self.views_stale);
+        assert(request.category_names.len <= scope_names_max);
+        if (request.category_id == 0 and request.category_names.len == 0) return null;
+
+        var views: std.ArrayListUnmanaged(CategoryView) = .empty;
+        if (request.category_names.len == 0) {
+            if (self.category_views.get(request.category_id)) |view| try views.append(arena, view);
+            return views.items;
+        }
+        for (request.category_names) |name| try self.append_named_views(arena, &views, name);
+        const named = disjoint_in_order(views.items);
+        if (request.category_id == 0) return named;
+
+        const within = self.category_views.get(request.category_id) orelse return named[0..0];
+        assert(within.order <= within.last_descendant);
+        var kept: usize = 0;
+        for (named) |view| {
+            if (view.contains(&within)) {
+                named[0] = within;
+                return named[0..1];
+            }
+            if (!within.contains(&view)) continue;
+            named[kept] = view;
+            kept += 1;
+        }
+        assert(kept <= named.len);
+        return named[0..kept];
+    }
+
+    fn append_named_views(
+        self: *const FactsIndex,
+        arena: std.mem.Allocator,
+        views: *std.ArrayListUnmanaged(CategoryView),
+        name: []const u8,
+    ) !void {
+        var folded_buffer: [folded_name_len_max]u8 = undefined;
+        if (name.len > folded_buffer.len) return;
+        const folded = fold_name(name, &folded_buffer);
+        if (folded.len == 0) return;
+
+        const folded_id = self.strings.ids.get(folded) orelse return;
+        const named = self.category_names.get(folded_id) orelse return;
+        assert(named.items.len <= self.categories.count());
+        for (named.items) |id| {
+            assert(self.categories.contains(id));
+            const view = self.category_views.get(id) orelse continue;
+            assert(view.order <= view.last_descendant);
+            try views.append(arena, view);
+        }
     }
 
     fn write_link(
@@ -1624,14 +1688,48 @@ const Driver = union(enum) {
     none,
     ids: []const u64,
     words: *const IdSet,
-    subtree: CategoryView,
+    subtrees: []const CategoryView,
 };
+
+/// Sorts `views` into DFS order and drops any that sits inside an earlier one, so every
+/// category belongs to at most one of what remains.
+fn disjoint_in_order(views: []CategoryView) []CategoryView {
+    const by_order = struct {
+        fn before(_: void, a: CategoryView, b: CategoryView) bool {
+            return a.order < b.order;
+        }
+    }.before;
+    std.sort.pdq(CategoryView, views, {}, by_order);
+
+    var kept: usize = 0;
+    for (views) |view| {
+        if (kept > 0 and views[kept - 1].contains(&view)) continue;
+        if (kept > 0) assert(views[kept - 1].last_descendant < view.order);
+        views[kept] = view;
+        kept += 1;
+    }
+    assert(kept <= views.len);
+    return views[0..kept];
+}
+
+/// Whether `view` sits inside one of `scopes`, which are disjoint and in DFS order.
+fn within_scopes(scopes: []const CategoryView, view: *const CategoryView) bool {
+    assert(view.order <= view.last_descendant);
+    const after = std.sort.upperBound(CategoryView, scopes, view.order, order_of_view);
+    assert(after <= scopes.len);
+    if (after == 0) return false;
+    return scopes[after - 1].contains(view);
+}
+
+fn order_of_view(order: u32, view: CategoryView) std.math.Order {
+    return std.math.order(order, view.order);
+}
 
 const Evaluator = struct {
     index: *const FactsIndex,
     arena: std.mem.Allocator,
     query: *const Query,
-    scope: ?CategoryView,
+    scopes: ?[]const CategoryView,
     name: ?StringId,
     site_set: std.DynamicBitSetUnmanaged,
     host_set: std.DynamicBitSetUnmanaged,
@@ -1650,10 +1748,8 @@ const Evaluator = struct {
                 try self.visit_clean(ids);
                 try self.visit_dirty();
             },
-            .subtree => |scope| {
-                const index = self.index;
-                const below = index.categories_by_order[scope.order .. scope.last_descendant + 1];
-                for (below) |category_id| try self.visit_clean(index.by_category.of(category_id));
+            .subtrees => |scopes| {
+                for (scopes) |*scope| try self.visit_subtree(scope);
                 try self.visit_dirty();
             },
         }
@@ -1684,7 +1780,9 @@ const Evaluator = struct {
     fn driver(self: *const Evaluator) Driver {
         const query = self.query;
         assert(self.index.adjacency_built);
-        if (query.category_id != 0 and self.scope == null) return .none;
+        if (self.scopes) |scopes| {
+            if (scopes.len == 0) return .none;
+        }
         if (query.entity_name.len > 0 and self.name == null) return .none;
 
         var narrowest: Driver = .all;
@@ -1709,10 +1807,20 @@ const Evaluator = struct {
         // reads the links in memory order: measured at 3.04M links and 632k categories, a
         // subtree of half the tree ties with the scan and the whole tree takes 1.6 times as
         // long. Below that the walk wins by one to two orders of magnitude.
-        const scope = self.scope orelse return .all;
-        const below: usize = scope.last_descendant - scope.order + 1;
+        const scopes = self.scopes orelse return .all;
+        var below: usize = 0;
+        for (scopes) |scope| below += scope.last_descendant - scope.order + 1;
+        assert(below <= self.index.categories_by_order.len);
         if (below * 2 > self.index.categories_by_order.len) return .all;
-        return .{ .subtree = scope };
+        return .{ .subtrees = scopes };
+    }
+
+    fn visit_subtree(self: *Evaluator, scope: *const CategoryView) !void {
+        const index = self.index;
+        assert(scope.order <= scope.last_descendant);
+        assert(scope.last_descendant < index.categories_by_order.len);
+        const below = index.categories_by_order[scope.order .. scope.last_descendant + 1];
+        for (below) |category_id| try self.visit_clean(index.by_category.of(category_id));
     }
 
     fn visit_every_link(self: *Evaluator) !void {
@@ -1801,10 +1909,9 @@ const Evaluator = struct {
         }
 
         const category_view = self.index.category_views.get(fact.category_id);
-        if (query.category_id != 0) {
-            const scope = self.scope orelse return null;
+        if (self.scopes) |scopes| {
             const link_view = category_view orelse return null;
-            if (!scope.contains(&link_view)) return null;
+            if (!within_scopes(scopes, &link_view)) return null;
         }
 
         var category_country = countries.none;
@@ -2149,7 +2256,7 @@ fn scanned(index: *const FactsIndex, arena: std.mem.Allocator, request: *const Q
         .index = index,
         .arena = arena,
         .query = request,
-        .scope = index.category_views.get(request.category_id),
+        .scopes = try index.scopes_for(arena, request),
         .name = if (request.entity_name.len > 0) index.name_id(request.entity_name) else null,
         .site_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
         .host_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
@@ -2183,6 +2290,8 @@ fn expect_drivers_agree_with_a_scan(
         .{ .status = any, .category_id = 4, .entity_name = "Jamia Farooqia" },
         .{ .status = any, .allowed_ids = words },
         .{ .status = any, .allowed_ids = words, .domain_suffix = "tripod.com" },
+        .{ .status = any, .category_names = &.{ "music", "society" } },
+        .{ .status = any, .category_names = &.{"arts"}, .domain_suffix = "tripod.com" },
         .{ .status = any, .country = "PK".* },
         .{ .status = any },
     };
@@ -2266,6 +2375,76 @@ test "every driver answers what a scan of every link answers, through writes and
     try testing.expect(index.dirty_links.count() > dirty_links_max);
     try expect_drivers_agree_with_a_scan(&index, io, arena, &words);
     try testing.expectEqual(@as(usize, 0), index.dirty_links.count());
+}
+
+// Goal: a query confined by category names answers from every category carrying one of
+// them, wherever it sits, once each even when one named category is inside another, and
+// combines with a category id by keeping the part both cover. Method: Presidents under
+// Society and again inside a regional Politicians, asked by one name, by two (one given in
+// the singular), by a name under a category id each way round, and by an unknown name.
+test "category names confine a query to every category that carries one of them" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try build_tree(&index, io, allocator, &.{
+        test_category(.{ .id = 1, .parent_id = 0 }, "Top"),
+        test_category(.{ .id = 2, .parent_id = 1 }, "Society"),
+        test_category(.{ .id = 3, .parent_id = 2 }, "Politics"),
+        test_category(.{ .id = 4, .parent_id = 3 }, "Presidents"),
+        test_category(.{ .id = 5, .parent_id = 4 }, "Lincoln,_Abraham"),
+        test_category(.{ .id = 6, .parent_id = 1 }, "Regional"),
+        test_category(.{ .id = 7, .parent_id = 6 }, "Europe"),
+        test_category(.{ .id = 8, .parent_id = 7 }, "Politicians"),
+        test_category(.{ .id = 9, .parent_id = 6 }, "Asia"),
+        test_category(.{ .id = 10, .parent_id = 9 }, "Politicians"),
+        test_category(.{ .id = 11, .parent_id = 10 }, "Presidents"),
+    });
+    for ([_]u64{ 5, 8, 10, 11, 3, 2 }, 1..) |category_id, id| {
+        const link = test_link(.{ .id = id, .category_id = category_id }, "http://a.example/");
+        try index.observe(io, allocator, &inserted(link));
+    }
+
+    const any: ?u8 = null;
+    const cases = [_]struct { request: Query, expected: []const u64 }{
+        .{
+            .request = .{ .status = any, .category_names = &.{"politicians"} },
+            .expected = &.{ 2, 3, 4 },
+        },
+        .{
+            .request = .{ .status = any, .category_names = &.{ "Politician", "presidents" } },
+            .expected = &.{ 1, 2, 3, 4 },
+        },
+        .{
+            .request = .{ .status = any, .category_id = 6, .category_names = &.{"presidents"} },
+            .expected = &.{4},
+        },
+        .{
+            .request = .{ .status = any, .category_id = 11, .category_names = &.{"politicians"} },
+            .expected = &.{4},
+        },
+        .{
+            .request = .{ .status = any, .category_id = 2, .category_names = &.{"politicians"} },
+            .expected = &.{},
+        },
+        .{
+            .request = .{ .status = any, .category_names = &.{"astronauts"} },
+            .expected = &.{},
+        },
+    };
+    for (cases) |case| {
+        const answer = try index.query(io, allocator, arena, case.request);
+        try testing.expectEqual(case.expected.len, answer.page.len);
+        try testing.expectEqual(@as(u64, case.expected.len), answer.total);
+        for (case.expected, answer.page) |id, row| try testing.expectEqual(id, row.link_id);
+
+        const scanned_ids = try scanned(&index, arena, &case.request);
+        try testing.expectEqualSlices(u64, case.expected, scanned_ids);
+    }
 }
 
 // Goal: a site's neighbours are the sites filed beside it, the one sharing more categories

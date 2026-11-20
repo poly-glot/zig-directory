@@ -1269,7 +1269,8 @@ const QueryLinksOptions = packed struct(u64) {
     limit: u8 = 0,
     religions: u16 = 0,
     subdomain_only: bool = false,
-    _unused: u13 = 0,
+    words_within_budget: bool = false,
+    _unused: u12 = 0,
 };
 
 const query_links_fields = &[_]struct { []const u8, type }{
@@ -1286,7 +1287,10 @@ fn handle_query_links(db: *Directory, response: []u8, op_byte: u8, payload: []co
     const parsed = parsePayload(query_links_fields, payload) orelse
         return write_error_response(response, op_byte, .invalid);
     var domain_buffer: [url_facts.host_len_max]u8 = undefined;
-    const request = link_query_from(&parsed.result, &domain_buffer) orelse
+    var request = link_query_from(&parsed.result, &domain_buffer) orelse
+        return write_error_response(response, op_byte, .invalid);
+    var names_buffer: [facts_index.scope_names_max][]const u8 = undefined;
+    request.facts.category_names = category_names_from(parsed.rest, &names_buffer) orelse
         return write_error_response(response, op_byte, .invalid);
 
     var arena = std.heap.ArenaAllocator.init(db.scratch());
@@ -1312,6 +1316,33 @@ fn handle_query_links(db: *Directory, response: []u8, op_byte: u8, payload: []co
     return len;
 }
 
+// The optional tail of a query: `[u8 count]` and that many length-prefixed category names,
+// confining the answer to every category that carries one of them. No tail at all is what a
+// client that predates the names sends.
+fn category_names_from(
+    tail: []const u8,
+    out: *[facts_index.scope_names_max][]const u8,
+) ?[]const []const u8 {
+    if (tail.len == 0) return out[0..0];
+    const count = tail[0];
+    if (count > out.len) return null;
+
+    var offset: usize = 1;
+    for (out[0..count]) |*name| {
+        if (offset + 2 > tail.len) return null;
+        const len = std.mem.readInt(u16, tail[offset..][0..2], .little);
+        offset += 2;
+        if (len == 0) return null;
+        if (len > facts_index.folded_name_len_max) return null;
+        if (offset + len > tail.len) return null;
+        name.* = tail[offset..][0..len];
+        offset += len;
+    }
+    if (offset != tail.len) return null;
+    assert(count <= facts_index.scope_names_max);
+    return out[0..count];
+}
+
 fn link_query_from(
     parsed: anytype,
     domain_buffer: *[url_facts.host_len_max]u8,
@@ -1328,6 +1359,7 @@ fn link_query_from(
     if (options.via > facts_index.Via.all) return null;
     if (options.religions & ~entities.religion_mask != 0) return null;
     if (parsed.entity.len > entities.name_len_max) return null;
+    if (options.words_within_budget and !options.all_words) return null;
 
     const group_by = std.enums.fromInt(facts_index.GroupBy, options.group_by) orelse return null;
     const country: ?countries.Code = switch (parsed.country.len) {
@@ -1359,10 +1391,18 @@ fn link_query_from(
             .after_id = parsed.after_id,
         },
         .words = parsed.words,
-        .words_match = if (options.all_words) .all else .any,
+        .words_match = words_match_of(options),
     };
     assert(query.facts.page_limit <= query_links_rows_max);
     return query;
+}
+
+// The budget only means something when every word must hold: any one of several words has no
+// rarest list to drive from.
+fn words_match_of(options: QueryLinksOptions) operations.WordsMatch {
+    if (options.words_within_budget) assert(options.all_words);
+    if (!options.all_words) return .any;
+    return if (options.words_within_budget) .all_within_budget else .all;
 }
 
 fn write_query_links_body(
@@ -4065,6 +4105,31 @@ fn query_links_request(
     try writer.writeInt(u64, 0, .little);
     assert(writer.end <= buffer.len);
     return buffer[0..writer.end];
+}
+
+// Goal: the optional names tail of a query is read whole or refused. Method: no tail, two
+// names, then a tail cut short, one with bytes left over, an empty name and too many names.
+test "query_links (op=38) reads an optional tail of category names" {
+    var out: [facts_index.scope_names_max][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), category_names_from("", &out).?.len);
+
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writer.writeByte(2);
+    for ([_][]const u8{ "politicians", "prime ministers" }) |name| {
+        try writer.writeInt(u16, @intCast(name.len), .little);
+        try writer.writeAll(name);
+    }
+    const tail = buffer[0..writer.end];
+    const names = category_names_from(tail, &out).?;
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("politicians", names[0]);
+    try std.testing.expectEqualStrings("prime ministers", names[1]);
+
+    try std.testing.expect(category_names_from(tail[0 .. tail.len - 1], &out) == null);
+    try std.testing.expect(category_names_from(buffer[0 .. tail.len + 1], &out) == null);
+    try std.testing.expect(category_names_from(&.{ 1, 0, 0 }, &out) == null);
+    try std.testing.expect(category_names_from(&.{facts_index.scope_names_max + 1}, &out) == null);
 }
 
 // Unready answers a zero byte; ready answers totals, groups and rows; bad options are refused.

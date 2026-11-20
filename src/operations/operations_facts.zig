@@ -69,7 +69,9 @@ fn check_entity_write(db: *Directory, write: *const EntityWrite) !EntityWriteRes
     return .ok;
 }
 
-pub const WordsMatch = enum(u8) { any = 0, all = 1 };
+/// `all_within_budget` asks for every word like `all`, but never reads a word's postings
+/// past the cap ranked search uses, so it is safe to run beside every search.
+pub const WordsMatch = enum(u8) { any = 0, all = 1, all_within_budget = 2 };
 
 pub const LinkQuery = struct {
     facts: facts_index.Query = .{},
@@ -374,6 +376,14 @@ fn links_with_words(
     const tokens = try distinct_tokens(words, arena);
     assert(tokens.len <= query_words_max);
     if (tokens.len == 0) return error.NoSearchableWords;
+    if (match == .all_within_budget) {
+        return links_with_all_words_within_budget(
+            db,
+            tokens,
+            arena,
+            search.postings_per_token_max,
+        );
+    }
 
     var allowed: facts_index.IdSet = .empty;
     for (tokens, 0..) |token, i| {
@@ -395,6 +405,70 @@ fn links_with_words(
         allowed = kept;
     }
     return allowed;
+}
+
+/// The links holding every token, reading no token's postings past `postings_cap`. The
+/// rarest token's links are the candidates; a token too common to read is checked link by
+/// link with a point lookup. When every token is that common the answer is empty: the words
+/// are too broad to count within the budget.
+fn links_with_all_words_within_budget(
+    db: *Directory,
+    tokens: []const []const u8,
+    arena: std.mem.Allocator,
+    postings_cap: usize,
+) !facts_index.IdSet {
+    assert(tokens.len > 0);
+    assert(postings_cap > 0);
+    assert(tokens.len <= query_words_max);
+    var lists: [query_words_max]?[]const u64 = @splat(null);
+    var rarest: ?usize = null;
+    for (tokens, 0..) |token, index| {
+        lists[index] = search.postings_for_token(
+            db.links_index_tree(),
+            token,
+            arena,
+            postings_cap,
+        ) catch |err| switch (err) {
+            error.PostingsCapExceeded => null,
+            else => return err,
+        };
+        const list = lists[index] orelse continue;
+        if (rarest == null or list.len < lists[rarest.?].?.len) rarest = index;
+    }
+
+    var allowed: facts_index.IdSet = .empty;
+    const driver = rarest orelse return allowed;
+    for (lists[driver].?) |id| {
+        var held = true;
+        for (tokens, 0..) |token, index| {
+            if (index == driver) continue;
+            if (try link_has_token(db, lists[index], token, id)) continue;
+            held = false;
+            break;
+        }
+        if (held) try allowed.put(arena, id, {});
+    }
+    assert(allowed.count() <= lists[driver].?.len);
+    return allowed;
+}
+
+/// Whether link `id` is listed under `token`: by the token's postings when they were read,
+/// otherwise by its key in the inverted index, which is the token followed by the id.
+fn link_has_token(db: *Directory, postings: ?[]const u64, token: []const u8, id: u64) !bool {
+    assert(token.len >= inverted.MIN_TOKEN_LEN);
+    assert(token.len <= inverted.MAX_TOKEN_LEN);
+    if (postings) |ids| return std.sort.binarySearch(u64, ids, id, order_u64) != null;
+
+    var key_buffer: [inverted.MAX_TOKEN_LEN + 8]u8 = undefined;
+    @memcpy(key_buffer[0..token.len], token);
+    key_buffer[token.len..][0..8].* = codec.encodeU64(id);
+    var no_value: [0]u8 = .{};
+    const found = try db.links_index_tree().search(key_buffer[0 .. token.len + 8], &no_value);
+    return found != null;
+}
+
+fn order_u64(context: u64, item: u64) std.math.Order {
+    return std.math.order(context, item);
 }
 
 fn distinct_tokens(words: []const u8, arena: std.mem.Allocator) ![]const []const u8 {
@@ -494,6 +568,62 @@ test "category views rebuilt inside a request survive that request's scratch sla
     const second = answer_for(db, arena, under_arts);
     scratch_memory.end();
     try testing.expectEqual(@as(u64, 1), (try second).total);
+}
+
+// Goal: the budgeted word filter answers what the unbounded one does while a word is too
+// common to read, and nothing once every word is. Method: five links share "common", two of
+// them also say "rare"; ask with a cap above every list, with a cap of two (so "common" is
+// checked by point lookup) and with a cap of one (so both are over).
+test "words within a budget match every word, by point lookup when a word is too common" {
+    var temporary_directory = testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    const db = try Directory.open_test_instance(testing.allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+    try load_facts_index(db);
+
+    const top = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const titles = [_][]const u8{
+        "common rare one", "common two", "common rare three", "common four", "common five",
+    };
+    var both: [2]u64 = undefined;
+    var both_count: usize = 0;
+    var url_buffer: [64]u8 = undefined;
+    for (titles, 0..) |title, index| {
+        const url = try std.fmt.bufPrint(&url_buffer, "http://site{d}.example/", .{index});
+        const id = try link_operations.create_link(
+            db,
+            top,
+            .{ .url = url, .title = title, .description = "" },
+        );
+        if (std.mem.indexOf(u8, title, "rare") == null) continue;
+        both[both_count] = id;
+        both_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), both_count);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tokens = [_][]const u8{ "common", "rare" };
+
+    for ([_]usize{ 100, 2 }) |cap| {
+        const allowed = try links_with_all_words_within_budget(db, &tokens, arena, cap);
+        try testing.expectEqual(@as(u32, 2), allowed.count());
+        for (both) |id| try testing.expect(allowed.contains(id));
+    }
+    const too_broad = try links_with_all_words_within_budget(db, &tokens, arena, 1);
+    try testing.expectEqual(@as(u32, 0), too_broad.count());
+
+    const through_query = try answer_for(db, arena, .{
+        .facts = .{ .status = null },
+        .words = "rare common",
+        .words_match = .all_within_budget,
+    });
+    try testing.expectEqual(@as(u64, 2), through_query.total);
 }
 
 // Goal: the live facts index follows creates, moves, edits, deletes and status changes, and a
