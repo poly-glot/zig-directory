@@ -1041,13 +1041,17 @@ pub const FactsIndex = struct {
         assert(filled == rows.len);
     }
 
+    /// Lists every name against the links that carry it. An entity record whose link the index
+    /// does not hold is left out, so every id in the list is a key of `links`: nothing else
+    /// makes that so, because entity facts and link facts arrive as separate writes.
     fn rebuild_by_name(self: *FactsIndex, gpa: std.mem.Allocator) !void {
         var names_total: usize = 0;
-        var counted = self.entities.valueIterator();
+        var counted = self.entities.iterator();
         var entities_counted: usize = 0;
-        while (counted.next()) |fact| : (entities_counted += 1) {
+        while (counted.next()) |entry| : (entities_counted += 1) {
             assert(entities_counted < self.entities.count());
-            names_total += fact.all_names().len;
+            if (!self.links.contains(entry.key_ptr.*)) continue;
+            names_total += entry.value_ptr.all_names().len;
         }
         assert(names_total <= self.entities.count() * 2 * entities.names_max);
 
@@ -1059,6 +1063,7 @@ pub const FactsIndex = struct {
         var entities_filled: usize = 0;
         while (named.next()) |entry| : (entities_filled += 1) {
             assert(entities_filled < self.entities.count());
+            if (!self.links.contains(entry.key_ptr.*)) continue;
             for (entry.value_ptr.all_names()) |name| {
                 rows[filled] = .{ .key = name, .link_id = entry.key_ptr.* };
                 filled += 1;
@@ -2555,6 +2560,49 @@ test "named_alongside counts the links two names share" {
         .{ .name = "nobody", .limit = 5 },
     );
     try testing.expectEqual(@as(usize, 0), nobody.len);
+}
+
+// Goal: entity facts for a link the index does not hold never reach a query: the name list
+// leaves them out, so asking by that name answers nothing instead of dereferencing a missing
+// link. Method: put facts for one real link and for one id with no link, then ask by name
+// through the query and through the neighbours walk, before and after the link arrives.
+test "entity facts without a link stay out of the name list" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try build_tree(&index, io, allocator, &.{test_category(.{ .id = 1, .parent_id = 0 }, "Top")});
+    const real = test_link(.{ .id = 1, .category_id = 1 }, "http://a.example/");
+    try index.observe(io, allocator, &inserted(real));
+
+    var buffer: [256]u8 = undefined;
+    const orgs = [_][]const u8{ "Orphan Society", "Real Society" };
+    const blob = try entity_blob(&buffer, &.{}, &.{}, &.{}, &orgs);
+    try put_entities(&index, io, allocator, 1, blob);
+    try put_entities(&index, io, allocator, 99, blob);
+
+    const any: ?u8 = null;
+    const by_name: Query = .{ .status = any, .entity_name = "orphan society" };
+    const before = try index.query(io, allocator, arena, by_name);
+    try testing.expectEqual(@as(u64, 1), before.total);
+    try testing.expectEqual(@as(u64, 1), before.page[0].link_id);
+    const alongside = try index.named_alongside(
+        io,
+        allocator,
+        arena,
+        .{ .name = "orphan society", .limit = 5 },
+    );
+    try testing.expectEqual(@as(usize, 1), alongside.len);
+    try testing.expectEqual(@as(u32, 1), alongside[0].shared);
+
+    const late = test_link(.{ .id = 99, .category_id = 1 }, "http://b.example/");
+    try index.observe(io, allocator, &inserted(late));
+    const after = try index.query(io, allocator, arena, by_name);
+    try testing.expectEqual(@as(u64, 2), after.total);
 }
 
 // Goal: a category's namesakes are the other categories with its name, larger subtree first,
