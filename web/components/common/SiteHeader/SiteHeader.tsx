@@ -63,16 +63,19 @@ const GITHUB_MARK = (
 );
 
 function NavLink(
-  { href, label, id, active }: {
+  { href, label, id, active, wideOnly = false }: {
     href: string;
     label: string;
     id: ActiveNav;
     active: ActiveNav;
+    wideOnly?: boolean;
   },
 ) {
-  const cls = id === active
-    ? `${styles.navLink} ${styles.active}`
-    : styles.navLink;
+  const cls = [
+    styles.navLink,
+    id === active && styles.active,
+    wideOnly && styles.wideOnly,
+  ].filter(Boolean).join(" ");
   return <a class={cls} href={href}>{label}</a>;
 }
 
@@ -115,6 +118,7 @@ export default function SiteHeader({ user, activeNav, invert = false }: Props) {
               label="About"
               id="about"
               active={activeNav}
+              wideOnly
             />
             {
               /* Admin link is reachable via the UserMenu dropdown for
@@ -131,8 +135,15 @@ export default function SiteHeader({ user, activeNav, invert = false }: Props) {
                   active={activeNav}
                 />
               )}
-            <a class={styles.submitBtn} href="/submit">
-              Submit a link {ARROW}
+            <a
+              class={styles.submitBtn}
+              href="/submit"
+              aria-label="Submit a link"
+            >
+              <span>
+                Submit<span class={styles.wideOnly}>&nbsp;a link</span>
+              </span>
+              {ARROW}
             </a>
             <a
               class={styles.github}

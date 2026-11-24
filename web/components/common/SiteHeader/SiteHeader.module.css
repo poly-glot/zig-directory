@@ -55,6 +55,7 @@
   padding: 0 16px;
   height: 40px;
   max-width: 560px;
+  min-width: 0;
   width: 100%;
   justify-self: center;
   background: var(--paper);
@@ -75,6 +76,7 @@
   font-size: 13px;
   background: transparent;
   color: var(--ink);
+  min-width: 0;
   padding: 0;
 }
 .searchInput::placeholder {
@@ -146,6 +148,7 @@
   color: var(--paper);
   text-decoration: none;
   transition: background 0.18s ease;
+  white-space: nowrap;
 }
 .submitBtn:hover {
   background: var(--hover);
@@ -189,5 +192,12 @@
   .navLink {
     font-size: 11px;
     letter-spacing: 0.12em;
+  }
+  .wideOnly {
+    display: none;
+  }
+  .submitBtn {
+    gap: 8px;
+    padding: 9px 14px;
   }
 }
