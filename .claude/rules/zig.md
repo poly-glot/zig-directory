@@ -105,7 +105,7 @@ any host in a second. Everything a parser cannot decide is enforced in review ag
   dependency's comptime interface dictates (`FieldTable.tsType` for zigstore's `tsgen`); `tidy`
   lists those explicitly.
 - DO: **Big-endian names.** Most significant word first, units and qualifiers last:
-  `subtree_offset_max`, `latency_ms_p99`, `verifier_interval_s`. They sort and line up.
+  `subtree_offset_max`, `repair_worker_interval_ms`, `verifier_interval_s`. They sort and line up.
 - NEVER: **Abbreviate.** `buffer` not `buf`, `response` not `resp`, `request` not `req`,
   `category` not `cat`, `change_set` not `cs`, `iterator` not `iter`, `index` not `idx`,
   `current` not `cur`, `directory` not `dir`, `memtable` not `mt`. Zig's own `len`, `io`,
@@ -113,7 +113,7 @@ any host in a second. Everything a parser cannot decide is enforced in review ag
   arguments.
 - DO: **Same length for related names** (`source`/`target`, `old_path`/`new_path`) so the
   calculations that use them line up.
-- DO: **Name a helper after its caller** (`read_sector` / `read_sector_callback`); callbacks go
+- DO: **Name a helper after its caller** (`run_once` / `run_once_totals`); callbacks go
   last in the parameter list.
 - DO: **Infuse names with meaning.** `gpa` and `arena` tell the reader whether `deinit` is
   owed; `allocator` does not.
@@ -133,7 +133,7 @@ any host in a second. Everything a parser cannot decide is enforced in review ag
   pointer instead of returning them by value.
 - DO: **Simplest return type that works.** `void` over `bool`, `bool` over `u64`, `u64` over
   `?u64`, `?u64` over `!u64`; every extra dimension is a branch at every call site.
-- DO: **Show division intent.** `@divExact`, `@divFloor`, `@divTrunc` or a `div_ceil` helper
+- DO: **Show division intent.** `@divExact`, `@divFloor`, `@divTrunc` or `std.math.divCeil`
   on integers, never bare `/`.
 - DO: **100 columns, hard limit** (`tidy`). To wrap a call, signature or literal, add a trailing
   comma and let `zig fmt` do the rest. Four-space indentation; `zig fmt` clean (the hook runs
@@ -171,7 +171,7 @@ instruction for `.zig` files.
 
 ## Verify
 
-- `zig build test` (Docker gate on this Mac, see the memory notes) runs the suite and `tidy`.
+- `zig build test` runs the suite and `tidy`.
 - `zig test src/tidy.zig` runs the style checks alone on any host with Zig 0.16.
 - `zig build test -Dtarget=aarch64-linux-musl` cross-compiles the whole test binary on macOS
   in about ten seconds; the only acceptable failure is the "unable to execute" run step.

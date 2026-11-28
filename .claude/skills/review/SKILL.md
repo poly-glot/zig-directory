@@ -28,11 +28,18 @@ Agent({ subagent_type: "code-reviewer", description: "<branch> review",
   prompt: "Review the current branch <branch> against <base> (read-only). Apply the .claude/rules sweep, the rewrite parity check, and the five-axis lens per your agent definition." })
 ```
 
-Run it in the foreground; the user is waiting on the verdict.
+When any `.zig` file changed in range, spawn `zig-reviewer` in the same message so the two run together. `code-reviewer` walks the rules against the diff; `zig-reviewer` builds the tree in its own scratch copy and tries to break it, and reports only what it reproduced:
+
+```
+Agent({ subagent_type: "zig-reviewer", description: "<branch> zig review",
+  prompt: "Verify that <base>..<branch> may land. Tree: <repo path> at <commit>. Area: the .zig files in that range and their callers. Lenses: all three. Scratch: <a new directory outside the repo>. Start no server on a port in use." })
+```
+
+Run them in the foreground; the user is waiting on the verdict.
 
 ## Step 4: Relay
 
-The agent's report is the source of truth. Lead with the verdict, then the findings by severity. Don't invent findings here. If the agent missed something obvious, update `.claude/rules/` so the next run catches it, rather than patch it inline.
+The agents' reports are the source of truth; the stricter verdict wins. Lead with the verdict, then the findings by severity. Don't invent findings here. If the agent missed something obvious, update `.claude/rules/` so the next run catches it, rather than patch it inline.
 
 ## Why a skill and an agent
 

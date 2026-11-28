@@ -12,7 +12,9 @@ Apple silicon for MLX.
 ```bash
 cp ../../data/store.dat ../../data/wal.bin data/
 docker run -d --name dmozdb-eval -p 127.0.0.1:18080:8080 -v "$PWD/data":/d \
-  -e DMOZDB_DATA_DIR=/d -e ZIGSTORE_TRUSTED=0.0.0.0/0 zigdev:0.16.0 /d/bin/bin/dmozdb
+  -v "$PWD/../../models/vector_model.bin":/m/vector_model.bin:ro \
+  -e DMOZDB_DATA_DIR=/d -e DMOZDB_VECTOR_MODEL=/m/vector_model.bin -e ZIGSTORE_TRUSTED=0.0.0.0/0 \
+  zigdev:0.16.0 /d/bin/bin/dmozdb
 
 (cd ../../web && deno run -A --config deno.json ../eval/graphrag/export.ts)
 uv run python build_index.py
@@ -234,6 +236,6 @@ handful of hand-typed probes.
   the production design against alternatives offline (needs the MLX venv;
   caches embeddings under `out/`). Writes `out/shape_queries.json`.
 - `live_shapes.py [n]` — replays `n` of those queries per shape against a
-  running app (`BASE=http://localhost:8000`, default prod) and reports
+  running app (set `BASE=http://localhost:8000`; unset, it targets prod at `https://directory.junaid.guru`) and reports
   hit@10, so an offline delta is checked against the real pipeline before
   and after a change.

@@ -5,7 +5,8 @@ Multi-workload benchmark client emitting **JSON Lines** with p50 / p95 / p99 / p
 ## Quick start
 
 ```bash
-# 1. Build the server plus the tools (bench is always compiled ReleaseFast)
+# 1. Build the server plus the tools (bench is always compiled ReleaseFast; dmoz_import follows
+#    -Doptimize and defaults to ReleaseSafe)
 zig build -Dtools=true
 
 # 2. Start dmozdb with a fresh data dir
@@ -62,9 +63,9 @@ Parsed by every subcommand before its own flags:
 --workers W                                  Concurrent client connections, 1 to 256 (default: 4)
 --ops-per-worker N                           Ops each worker performs (default: 10000)
 --warmup-ops N                               Discard first N ops from percentile recording (default: 1000)
---connect-host HOST                          Server host (default: 127.0.0.1)
+--connect-host HOST                          Server IPv4 address (default: 127.0.0.1)
 --port P                                     Server port (default: 8080)
---rss-sample-ms MS                           Sample server RSS every MS ms (default: 200, 0 to disable)
+--rss-sample-ms MS                           Sample server RSS every MS ms when bench spawns the server (seed --server-cmd, cold); default 200, 0 to disable
 --git-rev REV                                Override auto-detected git rev
 ```
 
@@ -184,6 +185,8 @@ Every workload appends one record like:
 ```
 
 `params` is workload-specific (different keys per `workload`). `rss_bytes.note` is `"rss_unavailable"` when the bench can't read `/proc/<pid>/status` (e.g., bench didn't spawn the server).
+
+A run in which any connection failed, or no op completed, writes no record and exits non-zero (`error.ConnectFailed`, `error.NoOpsCompleted`), so a dead server never lands a zero row in a baseline file.
 
 ## Comparing two runs
 

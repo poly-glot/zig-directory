@@ -16,6 +16,15 @@ This repo's Zig follows [TigerStyle](https://tigerstyle.dev); the binding rule f
 - **Naming**: `snake_case` functions, variables, files and constants with the qualifier last (`latency_ms_max`); `PascalCase` types; no abbreviations; options struct when two parameters share a primitive type.
 - **Comments say why**, as sentences; tests say how. Never restate the code.
 - **Zero dependencies** beyond zigstore (this project's own engine); tooling in Zig.
+- **Operating error against programmer error**: bytes from the network, the WAL, the disk, the environment and the config end in an error or a protocol status; only a value this code computed is asserted.
+- **Two allocators, named for what they owe**: request memory comes from `db.scratch()`; state that outlives a request takes `gpa`. A function that does both takes both.
+- **Crash-only after the WAL append**: errors before it, a panic after it, so recovery replays the record whole.
+
+## Before you call it done
+
+1. `zig test src/tidy.zig`, then `zig build test` in a Linux container with the Zig from `build.zig.zon` (the server needs `O_DIRECT` and epoll).
+2. Run the new binary against a store of real size, not only the unit fixtures.
+3. Hand the change to the `zig-reviewer` agent (`.claude/agents/zig-reviewer.md`) with the tree, the area and a scratch directory. It reports only what it can reproduce; fix what it finds before the change lands.
 
 ## Language Reference (Zig 0.16)
 

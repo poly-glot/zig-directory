@@ -41,3 +41,6 @@ mcp/.venv/
 __pycache__/
 zig-pkg/
 .zig-cache-host/
+
+# Per-machine Claude Code permissions
+.claude/settings.local.json
