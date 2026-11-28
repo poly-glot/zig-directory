@@ -26,6 +26,7 @@ pub fn create_category(db: *Directory, parent_id: u64, text: shared.CategoryText
     if (text.name.len > name_len_max) return OperationError.FieldTooLong;
     if (text.slug.len > slug_len_max) return OperationError.FieldTooLong;
     if (text.description.len > category_description_len_max) return OperationError.FieldTooLong;
+    try slug_operations.validate_slug(text.slug);
 
     if (parent_id != 0) {
         const parent = (try get_category(db, parent_id)) orelse
@@ -51,7 +52,6 @@ pub fn create_category(db: *Directory, parent_id: u64, text: shared.CategoryText
         .link_count = 0,
         .child_count = 0,
         .sort_order = 0,
-        ._pad0 = 0,
         .created_at = now,
         .updated_at = now,
     };
@@ -83,7 +83,7 @@ pub fn get_category(db: *Directory, id: u64) !?schema.Category {
     };
     if (value.len != @sizeOf(schema.Category)) return OperationError.DatabaseCorrupted;
     const category = std.mem.bytesToValue(schema.Category, value[0..@sizeOf(schema.Category)]);
-    assert(category.id == id);
+    if (category.id != id) return OperationError.DatabaseCorrupted;
     return category;
 }
 
@@ -132,6 +132,7 @@ pub fn update_category(
         return;
     }
 
+    try slug_operations.validate_slug(slug.?);
     try slug_operations.ensure_slug_path_free(
         db,
         .{ .parent_id = old_category.parent_id, .own_id = id },
@@ -327,23 +328,45 @@ pub fn walk_ancestors(
     return buffer[0..count];
 }
 
-const SubtreeAggregate = struct { link_subtree: u64, child_subtree: u32 };
+const SubtreeAggregate = struct {
+    link_subtree: u64,
+    child_subtree: u32,
+    statuses: schema.SubtreeStatusCounts,
+};
 
 pub const ExpectedCounts = struct {
     link_count: u32,
     child_count: u32,
     link_count_subtree: u64,
     child_count_subtree: u32,
+    link_count_subtree_approved: u32,
+    link_count_subtree_pending: u32,
+
+    pub fn of_record(category: *const schema.Category) ExpectedCounts {
+        return .{
+            .link_count = category.link_count,
+            .child_count = category.child_count,
+            .link_count_subtree = category.link_count_subtree,
+            .child_count_subtree = category.child_count_subtree,
+            .link_count_subtree_approved = category.link_count_subtree_approved,
+            .link_count_subtree_pending = category.link_count_subtree_pending,
+        };
+    }
 };
 
+/// Direct link counts come from the link_by_category rows, as `link_count` always has; the
+/// per-status counts need each link's status, which only the link record holds, so they come
+/// from links_by_id. On a consistent store both name the same links.
 pub const CategoryCounts = struct {
     allocator: std.mem.Allocator,
     direct_links: std.AutoHashMap(u64, u32),
+    direct_statuses: std.AutoHashMap(u64, schema.SubtreeStatusCounts),
     children_of: std.AutoHashMap(u64, std.ArrayListUnmanaged(u64)),
     subtree: std.AutoHashMap(u64, SubtreeAggregate),
 
     pub fn deinit(self: *CategoryCounts) void {
         self.direct_links.deinit();
+        self.direct_statuses.deinit();
         var children = self.children_of.valueIterator();
         while (children.next()) |list| list.deinit(self.allocator);
         self.children_of.deinit();
@@ -356,19 +379,23 @@ pub const CategoryCounts = struct {
             @intCast(children.items.len)
         else
             0;
-        const aggregate = self.subtree.get(category_id) orelse return .{
-            .link_count = link_count,
-            .child_count = child_count,
-            .link_count_subtree = link_count,
-            .child_count_subtree = 0,
+        const direct_statuses = self.direct_statuses.get(category_id) orelse
+            schema.SubtreeStatusCounts{};
+        const aggregate = self.subtree.get(category_id) orelse SubtreeAggregate{
+            .link_subtree = link_count,
+            .child_subtree = 0,
+            .statuses = direct_statuses,
         };
         assert(aggregate.link_subtree >= link_count);
         assert(aggregate.child_subtree >= child_count);
+        assert(aggregate.statuses.approved >= direct_statuses.approved);
         return .{
             .link_count = link_count,
             .child_count = child_count,
             .link_count_subtree = aggregate.link_subtree,
             .child_count_subtree = aggregate.child_subtree,
+            .link_count_subtree_approved = aggregate.statuses.approved,
+            .link_count_subtree_pending = aggregate.statuses.pending,
         };
     }
 };
@@ -379,10 +406,12 @@ pub fn compute_category_counts(db: *Directory) !CategoryCounts {
     try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
     try db.drain_one_memtable(db.memtable_cat_by_parent(), db.cat_by_parent());
     try db.drain_one_memtable(db.memtable_link_by_category(), db.link_by_category());
+    try db.drain_one_memtable(db.memtable_links_by_id(), db.links_by_id());
 
     var counts = CategoryCounts{
         .allocator = allocator,
         .direct_links = std.AutoHashMap(u64, u32).init(allocator),
+        .direct_statuses = std.AutoHashMap(u64, schema.SubtreeStatusCounts).init(allocator),
         .children_of = std.AutoHashMap(u64, std.ArrayListUnmanaged(u64)).init(allocator),
         .subtree = std.AutoHashMap(u64, SubtreeAggregate).init(allocator),
     };
@@ -392,6 +421,7 @@ pub fn compute_category_counts(db: *Directory) !CategoryCounts {
     defer all_ids.deinit(allocator);
 
     try compute_category_counts_scan(db, &counts, &all_ids);
+    try compute_category_counts_statuses(db, &counts);
 
     var stack: std.ArrayListUnmanaged(SubtreeFrame) = .empty;
     defer stack.deinit(allocator);
@@ -458,6 +488,48 @@ fn compute_category_counts_scan(
     }
 }
 
+// A pass over every link holds links_by_id's shared lock one chunk at a time, as the
+// verifier's scans do, so a queued memtable drain, and every get_link queued behind it, waits
+// for one chunk rather than for the whole pass over millions of records.
+const status_scan_chunk_links: u32 = 1024;
+const status_scan_chunks_max: u64 = 1 << 32;
+
+fn compute_category_counts_statuses(db: *Directory, counts: *CategoryCounts) !void {
+    assert(counts.direct_statuses.count() == 0);
+    var next_id: u64 = 0;
+    for (0..status_scan_chunks_max) |_| {
+        const scanned = try compute_category_counts_statuses_chunk(db, counts, &next_id);
+        assert(scanned <= status_scan_chunk_links);
+        if (scanned < status_scan_chunk_links) return;
+    }
+    return error.ScanTooLong;
+}
+
+fn compute_category_counts_statuses_chunk(
+    db: *Directory,
+    counts: *CategoryCounts,
+    next_id: *u64,
+) !u32 {
+    const start_id = next_id.*;
+    const start_key = codec.encodeU64(start_id);
+    var iterator = try db.links_by_id().rangeScan(&start_key, null);
+    defer iterator.deinit();
+
+    var scanned: u32 = 0;
+    while (scanned < status_scan_chunk_links) : (scanned += 1) {
+        const entry = (try iterator.next()) orelse break;
+        if (entry.key.len != @sizeOf(u64)) return OperationError.DatabaseCorrupted;
+        next_id.* = codec.decodeU64(entry.key[0..8]) +| 1;
+        if (entry.value.len != @sizeOf(schema.Link)) continue;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
+        const slot = try counts.direct_statuses.getOrPut(link.category_id);
+        if (!slot.found_existing) slot.value_ptr.* = .{};
+        slot.value_ptr.add(schema.SubtreeStatusCounts.of_link(link.status));
+    }
+    if (scanned > 0) assert(next_id.* > start_id);
+    return scanned;
+}
+
 const SubtreeFrame = struct { id: u64, expanded: bool };
 
 // An explicit stack replaces recursion; `on_path` breaks a cycle in corrupt parent data and
@@ -506,65 +578,117 @@ fn compute_category_counts_aggregate(counts: *const CategoryCounts, id: u64) Sub
     const direct: u64 = counts.direct_links.get(id) orelse 0;
     var links_subtree: u64 = direct;
     var children_subtree: u32 = 0;
+    var statuses = counts.direct_statuses.get(id) orelse schema.SubtreeStatusCounts{};
     if (counts.children_of.get(id)) |children| {
         for (children.items) |child| {
             const child_aggregate = counts.subtree.get(child) orelse SubtreeAggregate{
                 .link_subtree = 0,
                 .child_subtree = 0,
+                .statuses = .{},
             };
             links_subtree +%= child_aggregate.link_subtree;
             children_subtree +|= 1 +| child_aggregate.child_subtree;
+            statuses.add(child_aggregate.statuses);
         }
         assert(children_subtree >= children.items.len);
     }
     assert(links_subtree >= direct);
-    return .{ .link_subtree = links_subtree, .child_subtree = children_subtree };
+    return .{
+        .link_subtree = links_subtree,
+        .child_subtree = children_subtree,
+        .statuses = statuses,
+    };
 }
+
+// The recount reads categories a chunk at a time and drains each chunk's corrections into the
+// tree before reading on. Format 10's upgrade corrects nearly every category with links (some
+// 740k records, 1 GB, on the production store), which the memtable would otherwise hold whole;
+// and once the last chunk is drained, any page write after the recount carries every
+// correction, so a checkpoint cannot record the recount as done while part of it sits only in
+// memory.
+const recompute_chunk_categories: u32 = 256;
 
 pub fn recompute_category_counts(db: *Directory) !void {
     var counts = try compute_category_counts(db);
     defer counts.deinit();
 
+    const rewrites = try db.allocator.alloc(schema.Category, recompute_chunk_categories);
+    defer db.allocator.free(rewrites);
+
+    var tally: RecomputeTally = .{};
+    var next_id: u64 = 0;
+    for (0..status_scan_chunks_max) |_| {
+        const scanned = try recompute_category_counts_chunk(db, &counts, &next_id, rewrites);
+        assert(scanned.rewritten.len <= scanned.read);
+        tally.scanned += scanned.read;
+        tally.rewritten += scanned.rewritten.len;
+        for (scanned.rewritten) |*category| {
+            const id_key = codec.encodeU64(category.id);
+            try db.memtable_categories_by_id().put(&id_key, std.mem.asBytes(category));
+        }
+        try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
+        // The cache is no-steal and its pressure valve only fires when half of all frames are
+        // dirty, so a small cache can run one shard out of clean frames first (CacheFull at
+        // 16 MB on the 92k-link store, which then cannot boot). Writing each chunk's pages out
+        // keeps the dirty set at one chunk; the stale mark is still set, so a crash repeats
+        // the recount.
+        try db.store.flushPages();
+        if (scanned.read < recompute_chunk_categories) break;
+    } else return error.ScanTooLong;
+    assert(tally.rewritten <= tally.scanned);
+
+    if (tally.rewritten > 0) {
+        std.log.scoped(.recover).info(
+            "recompute_category_counts: corrected {d} categor{s}",
+            .{ tally.rewritten, if (tally.rewritten == 1) "y" else "ies" },
+        );
+    }
+}
+
+const RecomputeTally = struct { scanned: u64 = 0, rewritten: u64 = 0 };
+
+const RecomputeChunk = struct { read: u32, rewritten: []const schema.Category };
+
+fn recompute_category_counts_chunk(
+    db: *Directory,
+    counts: *const CategoryCounts,
+    next_id: *u64,
+    rewrites: []schema.Category,
+) !RecomputeChunk {
+    assert(rewrites.len == recompute_chunk_categories);
     const now = db.now_seconds();
-    var scanned: u64 = 0;
-    var rewritten: u64 = 0;
-    const min_key = codec.encodeU64(0);
-    var iterator = try db.categories_by_id().rangeScan(&min_key, null);
+    const start_key = codec.encodeU64(next_id.*);
+    var iterator = try db.categories_by_id().rangeScan(&start_key, null);
     defer iterator.deinit();
-    while (try iterator.next()) |entry| {
+
+    var read: u32 = 0;
+    var rewritten: u32 = 0;
+    while (read < recompute_chunk_categories) : (read += 1) {
+        const entry = (try iterator.next()) orelse break;
+        if (entry.key.len != @sizeOf(u64)) return OperationError.DatabaseCorrupted;
+        next_id.* = codec.decodeU64(entry.key[0..8]) +| 1;
         if (entry.value.len < @sizeOf(schema.Category)) continue;
-        scanned += 1;
         var category = std.mem.bytesToValue(
             schema.Category,
             entry.value[0..@sizeOf(schema.Category)],
         );
         const want = counts.expected_for(category.id);
         assert(want.link_count_subtree >= want.link_count);
-        const have = ExpectedCounts{
-            .link_count = category.link_count,
-            .child_count = category.child_count,
-            .link_count_subtree = category.link_count_subtree,
-            .child_count_subtree = category.child_count_subtree,
-        };
-        if (std.meta.eql(have, want)) continue;
+        if (std.meta.eql(ExpectedCounts.of_record(&category), want)) continue;
 
         category.link_count = want.link_count;
         category.child_count = want.child_count;
         category.link_count_subtree = want.link_count_subtree;
         category.child_count_subtree = want.child_count_subtree;
+        category.link_count_subtree_approved = want.link_count_subtree_approved;
+        category.link_count_subtree_pending = want.link_count_subtree_pending;
+        assert(std.meta.eql(ExpectedCounts.of_record(&category), want));
         category.updated_at = now;
-        const id_key = codec.encodeU64(category.id);
-        try db.memtable_categories_by_id().put(&id_key, std.mem.asBytes(&category));
+        rewrites[rewritten] = category;
         rewritten += 1;
     }
-    assert(rewritten <= scanned);
-
-    if (rewritten > 0) {
-        std.log.scoped(.recover).info(
-            "recompute_category_counts: corrected {d} categor{s}",
-            .{ rewritten, if (rewritten == 1) "y" else "ies" },
-        );
-    }
+    assert(rewritten <= read);
+    return .{ .read = read, .rewritten = rewrites[0..rewritten] };
 }
 
 // Goal: the rebuild overwrites stored counts with what the indexes say. Method: tamper every
@@ -1175,7 +1299,7 @@ test "moving a category under a parent that already has its slug is refused" {
 }
 
 // Goal: a move that would exceed `depth_max` fails with `PathTooDeep` instead of walking an
-// unbounded chain. Method: build a chain of `depth_max` levels, then move under its end.
+// unbounded chain. Method: build a chain of `depth_max` categories, then move under its end.
 test "move_category refuses a new parent whose chain is already depth_max deep" {
     const allocator = std.testing.allocator;
     var temporary_directory = std.testing.tmpDir(.{});
@@ -1192,7 +1316,7 @@ test "move_category refuses a new parent whose chain is already depth_max deep" 
 
     var deepest_id = top_id;
     var i: usize = 1;
-    while (i <= shared.depth_max) : (i += 1) {
+    while (i < shared.depth_max) : (i += 1) {
         var slug_buffer: [16]u8 = undefined;
         const slug = std.fmt.bufPrint(&slug_buffer, "d{d}", .{i}) catch unreachable;
         deepest_id = try create_category(
@@ -1206,4 +1330,58 @@ test "move_category refuses a new parent whose chain is already depth_max deep" 
         OperationError.PathTooDeep,
         move_category(db, .{ .id = mover_id, .new_parent_id = deepest_id }),
     );
+}
+
+// Goal: a slug that is not one path segment never reaches the WAL, while the punctuation and
+// UTF-8 of imported slugs still pass. Method: create and rename with each refused shape, then
+// with two slugs taken from the shipped data.
+test "create_category and update_category refuse a slug that is not one path segment" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top = try create_category(db, 0, .{ .name = "Top", .slug = "top", .description = "" });
+    const refused = [_][]const u8{ "", ".", "..", "x/y", "../..", "x\x00y", "tab\there", "\x7f" };
+    for (refused) |slug| {
+        try std.testing.expectError(
+            OperationError.InvalidSlug,
+            create_category(db, top, .{ .name = "x", .slug = slug, .description = "" }),
+        );
+        try std.testing.expectError(
+            OperationError.InvalidSlug,
+            create_category(db, 0, .{ .name = "x", .slug = slug, .description = "" }),
+        );
+        try std.testing.expectError(
+            OperationError.InvalidSlug,
+            update_category(db, top, null, slug, null),
+        );
+    }
+    const kids = try create_category(
+        db,
+        top,
+        .{ .name = "Kids", .slug = "children's", .description = "" },
+    );
+    try update_category(db, kids, null, "pok\xc3\xa9mon", null);
+    const resolved = try slug_operations.resolve_slug_path(db, "top/pok\xc3\xa9mon");
+    try std.testing.expectEqual(kids, resolved.?);
+}
+
+// Goal: a category record stored under another id fails the read with DatabaseCorrupted
+// instead of aborting the server. Method: plant a record with a different id, then read it.
+test "get_category answers a record under the wrong key with DatabaseCorrupted" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try create_category(db, 0, .{ .name = "Top", .slug = "top", .description = "" });
+    try db.drain_all_memtables();
+    var record = (try get_category(db, top_id)).?;
+    record.id = top_id + 100;
+    const id_key = codec.encodeU64(top_id);
+    try db.categories_by_id().insert(&id_key, std.mem.asBytes(&record));
+    try std.testing.expectError(OperationError.DatabaseCorrupted, get_category(db, top_id));
 }

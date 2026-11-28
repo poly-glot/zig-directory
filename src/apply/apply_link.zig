@@ -84,6 +84,7 @@ pub fn apply_link_inserted(db: *Directory, effect: *const changeset.LinkInsertEf
         effect.link.category_id,
         .link_count,
         true,
+        schema.SubtreeStatusCounts.of_link(effect.link.status),
     );
 
     try db.memtable_links_by_id().put(&id_key, std.mem.asBytes(&effect.link));
@@ -173,6 +174,7 @@ pub fn apply_link_deleted(db: *Directory, effect: *const changeset.LinkDeleteEff
         effect.link.category_id,
         .link_count,
         false,
+        schema.SubtreeStatusCounts.of_link(effect.link.status),
     );
 
     decrement_link_status(db, effect.link.status);
@@ -211,6 +213,10 @@ pub fn apply_link_text_updated(
     if (effect.old_link.status != effect.new_link.status) {
         decrement_link_status(db, effect.old_link.status);
         increment_link_status(db, effect.new_link.status);
+        try apply.cascade_status_change(db, effect.new_link.category_id, .{
+            .removed = schema.SubtreeStatusCounts.of_link(effect.old_link.status),
+            .added = schema.SubtreeStatusCounts.of_link(effect.new_link.status),
+        });
     }
 
     db.subtree_cache.invalidate_all();
@@ -245,6 +251,7 @@ pub fn apply_link_recategorized(db: *Directory, effect: *const changeset.LinkRec
         effect.old_category_id,
         .link_count,
         false,
+        schema.SubtreeStatusCounts.of_link(effect.link.status),
     );
 
     try apply.cascade_ancestor_counts(
@@ -253,6 +260,7 @@ pub fn apply_link_recategorized(db: *Directory, effect: *const changeset.LinkRec
         effect.link.category_id,
         .link_count,
         true,
+        schema.SubtreeStatusCounts.of_link(effect.link.status),
     );
 
     db.subtree_cache.invalidate_all();

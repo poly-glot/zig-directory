@@ -797,12 +797,17 @@ pub const Run = struct {
         };
     }
 
+    // A run in which a connection failed or nothing completed measured nothing comparable, so
+    // it fails the process instead of appending a zero row to the baseline file and exiting 0.
     pub fn emit(
         self: *const Run,
         workload: []const u8,
         params: WorkloadParams,
         ops_total: u64,
     ) !void {
+        if (self.connect_failed.load(.monotonic) > 0) return error.ConnectFailed;
+        if (ops_total == 0) return error.NoOpsCompleted;
+        assert(ops_total > 0);
         const bench_record = self.record(workload, params, ops_total);
         try append_json_line(self.env, self.options.output_path, &bench_record);
     }
@@ -944,4 +949,29 @@ test "append_json_line: appends one JSONL line per record" {
     const contents = try read_file_alloc(std.testing.io, std.testing.allocator, file);
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "\n"));
+}
+
+// Goal: a run that measured nothing fails and writes no row. Method: emit once with a failed
+// connection and once with zero ops into an output file, and expect both errors and no file.
+test "Run.emit: a failed connection or zero ops is an error and appends nothing" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+    const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/runs.jsonl", .{path});
+    defer std.testing.allocator.free(file);
+
+    const params = WorkloadParams{
+        .get_link = .{ .workers = 2, .ops_per_worker = 10, .seed_path = "seed.json" },
+    };
+    var failed = Run.init(test_env, .{ .output_path = file });
+    failed.connect_failed.store(2, .monotonic);
+    try std.testing.expectError(error.ConnectFailed, failed.emit("get_link", params, 20));
+
+    const idle = Run.init(test_env, .{ .output_path = file });
+    try std.testing.expectError(error.NoOpsCompleted, idle.emit("get_link", params, 0));
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.access(std.testing.io, "runs.jsonl", .{}),
+    );
 }

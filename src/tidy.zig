@@ -14,6 +14,7 @@ const line_length_max: u32 = 100;
 const function_line_count_max: u32 = 70;
 const file_size_max: u32 = 4 * 1024 * 1024;
 const functions_per_file_max: u32 = 512;
+const tree_entries_max: u32 = 4096;
 const assertion_density_min: f64 = 2.0;
 const assertion_density_functions_min: u32 = 5;
 const source_roots = [_][]const u8{ "src", "bench" };
@@ -55,7 +56,9 @@ const Function = struct {
     body_end: u32,
     line_first: u32,
     line_last: u32,
-    innermost: bool,
+    // Lines of the body less the lines of functions nested in it, so a function that holds a
+    // local struct with methods is measured too, without charging it for those methods.
+    line_count_own: u32,
     assert_count: u32,
 };
 
@@ -68,6 +71,22 @@ const Functions = struct {
         const result = functions.items[0..functions.count];
         assert(result.len == functions.count);
         return result;
+    }
+
+    fn enclosing_other(functions: *Functions, inner_index: usize) ?u32 {
+        assert(inner_index < functions.count);
+        const inner = functions.items[inner_index];
+        var best: ?u32 = null;
+        for (functions.slice(), 0..) |outer, index| {
+            if (outer.body_start >= inner.body_start) continue;
+            if (outer.body_end <= inner.body_end) continue;
+            if (best) |best_index| {
+                if (outer.body_start < functions.items[best_index].body_start) continue;
+            }
+            best = @intCast(index);
+        }
+        if (best) |index| assert(index != inner_index);
+        return best;
     }
 
     fn enclosing(functions: *Functions, offset: u32) ?u32 {
@@ -95,6 +114,8 @@ const Report = struct {
     file_count: u32,
     function_count: u32,
     assert_count: u32,
+    // The self-tests count violations without printing them.
+    quiet: bool,
 
     fn violation(
         report: *Report,
@@ -106,6 +127,7 @@ const Report = struct {
         assert(line < file.line_starts.len);
         assert(file.path.len > 0);
         report.violation_count += 1;
+        if (report.quiet) return;
         std.debug.print("{s}:{d}: " ++ format ++ "\n", .{ file.path, line + 1 } ++ arguments);
     }
 };
@@ -121,6 +143,7 @@ test "tidy: every Zig file follows the mechanical TigerStyle rules" {
         .file_count = 0,
         .function_count = 0,
         .assert_count = 0,
+        .quiet = false,
     };
     for (source_roots) |root| try tidy_tree(io, gpa, root, &report);
     for (source_files_extra) |path| try tidy_file(io, gpa, std.Io.Dir.cwd(), path, path, &report);
@@ -152,7 +175,7 @@ fn tidy_tree(io: std.Io, gpa: std.mem.Allocator, root: []const u8, report: *Repo
 
     var entries: u32 = 0;
     while (try walker.next(io)) |entry| : (entries += 1) {
-        assert(entries < 4096);
+        if (entries >= tree_entries_max) return error.TidyTreeTooLarge;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
 
@@ -184,6 +207,16 @@ fn tidy_file(
     );
     defer gpa.free(text);
 
+    try tidy_source(gpa, display_path, text, report);
+}
+
+fn tidy_source(
+    gpa: std.mem.Allocator,
+    display_path: []const u8,
+    text: [:0]const u8,
+    report: *Report,
+) !void {
+    assert(display_path.len > 0);
     const line_starts = try line_starts_of(gpa, text);
     defer gpa.free(line_starts);
 
@@ -202,11 +235,12 @@ fn tidy_file(
     }
 
     var functions = Functions{ .items = undefined, .count = 0 };
-    collect_functions(file, &tree, &functions);
+    collect_functions(file, &tree, &functions, report);
     check_functions(file, &tree, &functions, report);
     check_calls(file, &tree, &functions, report);
     check_loops(file, &tree, report);
     check_declarations(file, &tree, report);
+    check_usize_aliases(file, &tree, report);
 
     report.function_count += functions.count;
     for (functions.slice()) |function| report.assert_count += function.assert_count;
@@ -396,10 +430,21 @@ fn check_banned(file: SourceFile, report: *Report) void {
     }
 }
 
-fn collect_functions(file: SourceFile, tree: *const Ast, functions: *Functions) void {
+fn collect_functions(
+    file: SourceFile,
+    tree: *const Ast,
+    functions: *Functions,
+    report: *Report,
+) void {
     for (0..tree.nodes.len) |index| {
         const node: Ast.Node.Index = @enumFromInt(index);
         if (tree.nodeTag(node) != .fn_decl) continue;
+        if (functions.count == functions_per_file_max) {
+            report.violation(file, 0, "more than {d} functions in one file", .{
+                functions_per_file_max,
+            });
+            break;
+        }
 
         const proto_node, const body_node = tree.nodeData(node).node_and_node;
         var buffer: [1]Ast.Node.Index = undefined;
@@ -408,27 +453,33 @@ fn collect_functions(file: SourceFile, tree: *const Ast, functions: *Functions) 
         const body_end = tree.tokenStart(tree.lastToken(body_node));
         assert(body_start <= body_end);
         assert(functions.count < functions_per_file_max);
+        const line_first = file.line_of(body_start);
+        const line_last = file.line_of(body_end);
 
         functions.items[functions.count] = .{
             .name = tree.tokenSlice(proto.name_token.?),
             .proto_node = proto_node,
             .body_start = body_start,
             .body_end = body_end,
-            .line_first = file.line_of(body_start),
-            .line_last = file.line_of(body_end),
-            .innermost = true,
+            .line_first = line_first,
+            .line_last = line_last,
+            .line_count_own = line_last - line_first,
             .assert_count = 0,
         };
         functions.count += 1;
     }
     assert(functions.count <= functions_per_file_max);
+    subtract_nested_lines(functions);
+}
 
-    for (functions.slice()) |*outer| {
-        for (functions.slice()) |inner| {
-            if (inner.body_start <= outer.body_start) continue;
-            if (inner.body_end >= outer.body_end) continue;
-            outer.innermost = false;
-        }
+// Each nested function's lines come off the function that most closely encloses it.
+fn subtract_nested_lines(functions: *Functions) void {
+    for (functions.slice(), 0..) |inner, inner_index| {
+        const parent_index = functions.enclosing_other(inner_index) orelse continue;
+        const parent = &functions.items[parent_index];
+        assert(parent.body_start < inner.body_start);
+        const nested_lines = inner.line_last - inner.line_first + 1;
+        parent.line_count_own -|= nested_lines;
     }
 }
 
@@ -441,11 +492,11 @@ fn check_functions(
     for (functions.slice()) |function| {
         assert(function.body_start <= function.body_end);
         assert(function.line_first <= function.line_last);
-        const line_count = function.line_last - function.line_first;
-        if (function.innermost and line_count > function_line_count_max) {
+        assert(function.line_count_own <= function.line_last - function.line_first);
+        if (function.line_count_own > function_line_count_max) {
             report.violation(file, function.line_first, "`{s}` is {d} lines; the limit is {d}", .{
                 function.name,
-                line_count,
+                function.line_count_own,
                 function_line_count_max,
             });
         }
@@ -455,9 +506,11 @@ fn check_functions(
 }
 
 /// Names that a dependency's comptime interface dictates: zigstore's tsgen reads
-/// `FieldTable.tsType`, and std.json looks its hooks up by these exact names.
+/// `FieldTable.tsType`, std.json looks its hooks up by these exact names, and a stand-in for a
+/// zigstore tree must answer `rangeScan` as `BPlusTree` does.
 const interface_names = [_][]const u8{
     "tsType",
+    "rangeScan",
     "jsonStringify",
     "jsonParse",
     "jsonParseFromValue",
@@ -571,13 +624,30 @@ fn check_function_parameters(
 }
 
 /// `std.sort` dictates a comparator's shape (`fn (context, a: T, b: T) bool` or `Order`), so
-/// its two same-typed parameters are not a dimensionality smell.
+/// its two same-typed parameters are not a dimensionality smell. A `bool` function with more
+/// same-typed parameters than that (`in_range(low, high, value)`) is not a comparator.
 fn is_comparator(tree: *const Ast, proto: Ast.full.FnProto) bool {
     const return_node = proto.ast.return_type.unwrap() orelse return false;
     const return_source = tree.getNodeSource(return_node);
     assert(return_source.len > 0);
-    if (std.mem.eql(u8, return_source, "bool")) return true;
-    return std.mem.endsWith(u8, return_source, "Order");
+    const returns_order = std.mem.endsWith(u8, return_source, "Order");
+    if (!returns_order and !std.mem.eql(u8, return_source, "bool")) return false;
+
+    var types: [3][]const u8 = undefined;
+    var count: u32 = 0;
+    var parameters = proto.iterate(tree);
+    while (parameters.next()) |parameter| : (count += 1) {
+        if (count == types.len) return false;
+        const type_node = parameter.type_expr orelse return false;
+        types[count] = tree.getNodeSource(type_node);
+    }
+    assert(count <= types.len);
+    if (count < 2) return false;
+    const a = types[count - 2];
+    const b = types[count - 1];
+    if (!std.mem.eql(u8, a, b)) return false;
+    if (count == 3) return !std.mem.eql(u8, types[0], a);
+    return true;
 }
 
 fn check_calls(file: SourceFile, tree: *const Ast, functions: *Functions, report: *Report) void {
@@ -593,7 +663,9 @@ fn check_calls(file: SourceFile, tree: *const Ast, functions: *Functions, report
         assert(caller_index < functions.count);
         const caller = &functions.items[caller_index];
 
-        if (std.mem.eql(u8, callee.name, "assert")) caller.assert_count += 1;
+        if (std.mem.eql(u8, callee.name, "assert") and !asserts_literal(tree, node)) {
+            caller.assert_count += 1;
+        }
         if (std.mem.eql(u8, callee.name, caller.name) and calls_own_type(tree, caller.*, callee)) {
             report.violation(
                 file,
@@ -602,7 +674,13 @@ fn check_calls(file: SourceFile, tree: *const Ast, functions: *Functions, report
                 .{caller.name},
             );
         }
-        if (callee.receiver != null) continue;
+        // A method call through the caller's first parameter (`self.pong()` inside `ping`) is
+        // an edge like a plain call; a call on any other receiver (`list.deinit()`,
+        // `Store.init()`) names another type's function and is not.
+        if (callee.receiver) |receiver| {
+            const first = first_parameter_name(tree, caller.*) orelse continue;
+            if (!std.mem.eql(u8, receiver, first)) continue;
+        }
         for (functions.slice(), 0..) |candidate, candidate_index| {
             if (std.mem.eql(u8, candidate.name, callee.name)) {
                 reach[caller_index].set(candidate_index);
@@ -614,6 +692,18 @@ fn check_calls(file: SourceFile, tree: *const Ast, functions: *Functions, report
 }
 
 const Callee = struct { name: []const u8, receiver: ?[]const u8 };
+
+// `assert(true)` states nothing, so it does not pay toward the assertion density.
+fn asserts_literal(tree: *const Ast, node: Ast.Node.Index) bool {
+    var buffer: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, node).?;
+    if (call.ast.params.len != 1) return false;
+    const argument = call.ast.params[0];
+    if (tree.nodeTag(argument) != .identifier) return false;
+    const name = tree.tokenSlice(tree.nodeMainToken(argument));
+    assert(name.len > 0);
+    return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false");
+}
 
 fn callee_name(tree: *const Ast, node: Ast.Node.Index) ?Callee {
     switch (tree.nodeTag(node)) {
@@ -649,12 +739,19 @@ fn calls_own_type(tree: *const Ast, caller: Function, callee: Callee) bool {
     assert(caller.name.len > 0);
     assert(std.mem.eql(u8, caller.name, callee.name));
     const receiver = callee.receiver orelse return true;
+    const first = first_parameter_name(tree, caller) orelse return false;
+    return std.mem.eql(u8, first, receiver);
+}
+
+fn first_parameter_name(tree: *const Ast, function: Function) ?[]const u8 {
     var buffer: [1]Ast.Node.Index = undefined;
-    const proto = tree.fullFnProto(&buffer, caller.proto_node).?;
+    const proto = tree.fullFnProto(&buffer, function.proto_node).?;
     var parameters = proto.iterate(tree);
-    const first = parameters.next() orelse return false;
-    const name_token = first.name_token orelse return false;
-    return std.mem.eql(u8, tree.tokenSlice(name_token), receiver);
+    const first = parameters.next() orelse return null;
+    const name_token = first.name_token orelse return null;
+    const name = tree.tokenSlice(name_token);
+    assert(name.len > 0);
+    return name;
 }
 
 fn check_call_cycles(
@@ -695,14 +792,79 @@ fn check_call_cycles(
 fn check_loops(file: SourceFile, tree: *const Ast, report: *Report) void {
     for (0..tree.nodes.len) |index| {
         const node: Ast.Node.Index = @enumFromInt(index);
-        const loop = tree.fullWhile(node) orelse continue;
-        const condition = loop.ast.cond_expr;
-        if (tree.nodeTag(condition) != .identifier) continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(condition)), "true")) continue;
-        assert(loop.ast.while_token < tree.tokens.len);
-        const offset = tree.tokenStart(loop.ast.while_token);
-        assert(offset < file.text.len);
-        report.violation(file, file.line_of(offset), "`while (true)` has no bound", .{});
+        if (tree.fullWhile(node)) |loop| {
+            if (!condition_is_constant(tree, loop.ast.cond_expr)) continue;
+            assert(loop.ast.while_token < tree.tokens.len);
+            const offset = tree.tokenStart(loop.ast.while_token);
+            assert(offset < file.text.len);
+            report.violation(file, file.line_of(offset), "`while` on a constant has no bound", .{});
+        } else if (tree.nodeTag(node) == .for_range) {
+            const range_end = tree.nodeData(node).node_and_opt_node[1].unwrap() orelse continue;
+            const end_source = tree.getNodeSource(range_end);
+            if (std.mem.indexOf(u8, end_source, "maxInt(") == null) continue;
+            const offset = tree.tokenStart(tree.firstToken(node));
+            report.violation(file, file.line_of(offset), "`for` up to maxInt has no bound", .{});
+        }
+    }
+}
+
+// `true`, or a comparison of two number literals such as `1 == 1`: a condition that can never
+// change, so the loop is bounded by nothing.
+fn condition_is_constant(tree: *const Ast, condition: Ast.Node.Index) bool {
+    switch (tree.nodeTag(condition)) {
+        .identifier => {
+            const name = tree.tokenSlice(tree.nodeMainToken(condition));
+            assert(name.len > 0);
+            return std.mem.eql(u8, name, "true");
+        },
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .greater_than,
+        .less_or_equal,
+        .greater_or_equal,
+        => {
+            const left, const right = tree.nodeData(condition).node_and_node;
+            if (tree.nodeTag(left) != .number_literal) return false;
+            return tree.nodeTag(right) == .number_literal;
+        },
+        else => return false,
+    }
+}
+
+const usize_aliases_max: u32 = 16;
+
+// `const Index = usize;` and then `index: Index` is still a usize field, so the names a file
+// gives to usize are collected first and its fields checked against them.
+fn check_usize_aliases(file: SourceFile, tree: *const Ast, report: *Report) void {
+    var aliases: [usize_aliases_max][]const u8 = undefined;
+    var alias_count: u32 = 0;
+    for (0..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const declaration = tree.fullVarDecl(node) orelse continue;
+        const init_node = declaration.ast.init_node.unwrap() orelse continue;
+        if (!std.mem.eql(u8, tree.getNodeSource(init_node), "usize")) continue;
+        if (alias_count == usize_aliases_max) break;
+        aliases[alias_count] = tree.tokenSlice(declaration.ast.mut_token + 1);
+        alias_count += 1;
+    }
+    assert(alias_count <= usize_aliases_max);
+    if (alias_count == 0) return;
+
+    for (0..tree.nodes.len) |index| {
+        const node: Ast.Node.Index = @enumFromInt(index);
+        const field = tree.fullContainerField(node) orelse continue;
+        const type_node = field.ast.type_expr.unwrap() orelse continue;
+        const type_source = tree.getNodeSource(type_node);
+        for (aliases[0..alias_count]) |alias| {
+            if (!std.mem.eql(u8, type_source, alias)) continue;
+            report.violation(
+                file,
+                file.line_of(tree.tokenStart(field.ast.main_token)),
+                "field `{s}` is usize through `{s}`: use an explicitly sized integer",
+                .{ tree.tokenSlice(field.ast.main_token), alias },
+            );
+        }
     }
 }
 
@@ -739,4 +901,202 @@ fn check_declarations(file: SourceFile, tree: *const Ast, report: *Report) void 
             else => {},
         }
     }
+}
+
+fn violations_in(text: [:0]const u8) !u32 {
+    var report = Report{
+        .violation_count = 0,
+        .file_count = 0,
+        .function_count = 0,
+        .assert_count = 0,
+        .quiet = true,
+    };
+    try tidy_source(std.testing.allocator, "fixture.zig", text, &report);
+    assert(report.file_count == 0);
+    return report.violation_count;
+}
+
+const Fixture = struct { name: []const u8, text: [:0]const u8, violations: u32 };
+
+const fixture_long_body = "    _ = 0;\n" ** (function_line_count_max + 4);
+
+const fixtures = [_]Fixture{
+    .{ .name = "clean", .violations = 0, .text =
+    \\fn add(left: u32, right: i64) u32 {
+    \\    _ = right;
+    \\    return left;
+    \\}
+    \\
+    },
+    .{ .name = "direct recursion", .violations = 2, .text =
+    \\fn walk(depth: u32) void {
+    \\    if (depth > 0) walk(depth - 1);
+    \\}
+    \\
+    },
+    .{ .name = "recursion through the receiver", .violations = 2, .text =
+    \\const Node = struct {
+    \\    fn ping(node: *Node, depth: u32) void {
+    \\        if (depth > 0) node.pong(depth - 1);
+    \\    }
+    \\    fn pong(node: *Node, depth: u32) void {
+    \\        if (depth > 0) node.ping(depth - 1);
+    \\    }
+    \\};
+    \\
+    },
+    .{ .name = "a call on another receiver is not recursion", .violations = 0, .text =
+    \\const List = struct {
+    \\    fn deinit(list: *List, other: *List) void {
+    \\        other.deinit(list);
+    \\    }
+    \\};
+    \\
+    },
+    .{ .name = "while true", .violations = 1, .text =
+    \\fn spin() void {
+    \\    while (true) {}
+    \\}
+    \\
+    },
+    .{ .name = "while on a literal comparison", .violations = 1, .text =
+    \\fn spin() void {
+    \\    while (1 == 1) {}
+    \\}
+    \\
+    },
+    .{ .name = "for up to maxInt", .violations = 1, .text =
+    \\const std = @import("std");
+    \\fn spin() void {
+    \\    for (0..std.math.maxInt(u64)) |_| {}
+    \\}
+    \\
+    },
+    .{
+        .name = "long function",
+        .violations = 1,
+        .text = "fn long() void {\n" ++ fixture_long_body ++ "}\n",
+    },
+    .{
+        .name = "long function holding a nested function",
+        .violations = 1,
+        .text = "fn long() void {\n" ++ fixture_long_body ++
+            "    const Local = struct {\n        fn tiny() void {}\n    };\n" ++
+            "    _ = Local;\n}\n",
+    },
+    .{ .name = "same-typed integers", .violations = 1, .text =
+    \\fn span(low: u32, high: u32) void {
+    \\    _ = low;
+    \\    _ = high;
+    \\}
+    \\
+    },
+    .{ .name = "same-typed integers returning bool", .violations = 1, .text =
+    \\fn in_range(low: u32, high: u32, value: u32) bool {
+    \\    return low <= value and value <= high;
+    \\}
+    \\
+    },
+    .{ .name = "comparator", .violations = 0, .text =
+    \\fn less_than(context: void, left: u32, right: u32) bool {
+    \\    _ = context;
+    \\    return left < right;
+    \\}
+    \\
+    },
+    .{ .name = "three strings", .violations = 1, .text =
+    \\fn join(first: []const u8, second: []const u8, third: []const u8) void {
+    \\    _ = .{ first, second, third };
+    \\}
+    \\
+    },
+    .{ .name = "usize field", .violations = 1, .text =
+    \\const Slot = struct { index: usize };
+    \\
+    },
+    .{ .name = "usize field through an alias", .violations = 1, .text =
+    \\const Index = usize;
+    \\const Slot = struct { index: Index };
+    \\
+    },
+    .{ .name = "function name", .violations = 1, .text =
+    \\fn doThing() void {}
+    \\
+    },
+    .{ .name = "type function name", .violations = 1, .text =
+    \\fn Make() type {
+    \\    return u8;
+    \\}
+    \\
+    },
+    .{ .name = "screaming constant", .violations = 1, .text =
+    \\const SIZE_MAX = 4;
+    \\
+    },
+    .{ .name = "lowercase comment", .violations = 1, .text =
+    \\// lower case start.
+    \\const size_max = 4;
+    \\
+    },
+    .{ .name = "comment without a space", .violations = 1, .text =
+    \\//No space.
+    \\const size_max = 4;
+    \\
+    },
+    .{ .name = "comment without a full stop", .violations = 1, .text =
+    \\// No full stop
+    \\const size_max = 4;
+    \\
+    },
+    .{
+        .name = "banned word",
+        .violations = 1,
+        .text = "// " ++ "TO" ++ "DO: later.\nconst size_max = 4;\n",
+    },
+    .{ .name = "tab", .violations = 1, .text = "const size_max =\t4;\n" },
+    .{
+        .name = "long line",
+        .violations = 1,
+        .text = "const name = \"" ++ "x" ** line_length_max ++ "\";\n",
+    },
+    .{ .name = "does not parse", .violations = 1, .text = "const = ;\n" },
+    .{
+        .name = "assert(true) does not count toward density",
+        .violations = 1,
+        .text = "fn one() void {\n    assert(true);\n    assert(true);\n}\n" ** 5,
+    },
+};
+
+// Goal: every mechanical rule demonstrably fires, so a regression in one is caught here rather
+// than by a clean run over a tree that happens not to break it. Method: one small source per
+// rule, checked through the same path as a file on disk, against its expected violation count.
+test "tidy: each rule fires on a fixture that breaks it" {
+    var failures: u32 = 0;
+    for (fixtures) |fixture| {
+        const found = try violations_in(fixture.text);
+        if (found == fixture.violations) continue;
+        failures += 1;
+        std.debug.print("tidy fixture `{s}`: {d} violations, expected {d}\n", .{
+            fixture.name,
+            found,
+            fixture.violations,
+        });
+    }
+    try std.testing.expectEqual(@as(u32, 0), failures);
+}
+
+// Goal: a file with more functions than the checker holds is a violation, not a crash. Method:
+// generate one function past the maximum and check it.
+test "tidy: too many functions in one file is reported, not asserted" {
+    const gpa = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..functions_per_file_max + 1) |index| {
+        try text.print(gpa, "fn function_{d}() void {{}}\n", .{index});
+    }
+    const source = try text.toOwnedSliceSentinel(gpa, 0);
+    defer gpa.free(source);
+
+    // The functions also carry no assertions, which is the second violation.
+    try std.testing.expectEqual(@as(u32, 2), try violations_in(source));
 }

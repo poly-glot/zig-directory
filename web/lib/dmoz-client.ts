@@ -43,13 +43,6 @@ export const GET_CATEGORIES_BY_IDS_MAX = 200;
 /** Server cap on a single breadcrumbs_by_ids request. */
 export const BREADCRUMBS_BY_IDS_MAX = 200;
 
-/** Bit 0 of Category.flags: category was reattached after orphan recovery. */
-export const FLAG_ORPHAN_RECOVERED = 0x01;
-
-export function isOrphanRecovered(c: Category): boolean {
-  return (c.flags & FLAG_ORPHAN_RECOVERED) !== 0;
-}
-
 export interface DbStats {
   categoryCount: number;
   linkCount: number;

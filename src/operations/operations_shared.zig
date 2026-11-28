@@ -5,7 +5,8 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const codec = @import("zigstore").codec;
+const zigstore = @import("zigstore");
+const codec = zigstore.codec;
 const schema = @import("../schema.zig");
 
 pub const log = std.log.scoped(.operations);
@@ -21,11 +22,19 @@ pub const OperationError = error{
     CategoryHasChildren,
     CategoryTooLarge,
     PathTooDeep,
+    PathTooLong,
     FieldTooLong,
+    InvalidSlug,
     DatabaseCorrupted,
 };
 
 pub const depth_max: usize = 64;
+// A slug path is a key of `categories_by_slug_path`, and the engine refuses a key longer than
+// `MAX_KEY_LEN`. The WAL record is opaque to the engine, so a longer path that reached apply
+// would fail after the append and then fail every replay: the limit must be checked before the
+// commit, and it is the engine's own. The test "categories_by_slug_path splits pages full of
+// slug_path_len_max keys" holds the relation on a real tree.
+pub const slug_path_len_max: usize = zigstore.MAX_KEY_LEN;
 pub const name_len_max: usize = 64;
 pub const slug_len_max: usize = 128;
 pub const category_description_len_max: usize = 1024;
@@ -34,6 +43,9 @@ pub const title_len_max: usize = 128;
 pub const link_description_len_max: usize = 256;
 
 comptime {
+    assert(slug_path_len_max == zigstore.MAX_KEY_LEN);
+    // A path is at least one whole slug, so the key limit must hold the longest slug.
+    assert(slug_len_max < slug_path_len_max);
     assert(codec.FixedString(name_len_max) == @FieldType(schema.Category, "name"));
     assert(codec.FixedString(slug_len_max) == @FieldType(schema.Category, "slug"));
     assert(codec.FixedString(category_description_len_max) ==

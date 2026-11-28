@@ -49,6 +49,8 @@ pub const SubStatus = enum(u8) {
     already_in_progress = 9,
     duplicate_slug = 10,
     embedding_model_mismatch = 11,
+    /// The question reads more postings, facts or groups than one request may: narrow it.
+    too_broad = 12,
 };
 
 pub const StatusPair = struct {
@@ -66,9 +68,15 @@ pub fn map_error_with_sub_status(err: anyerror) StatusPair {
         error.CategoryHasChildren => .{ .status = .has_children, .sub_status = .none },
         error.CircularHierarchy => .{ .status = .circular, .sub_status = .none },
         error.FieldTooLong => .{ .status = .invalid, .sub_status = .field_too_long },
+        error.PathTooLong => .{ .status = .invalid, .sub_status = .field_too_long },
         error.PathTooDeep => .{ .status = .invalid, .sub_status = .path_too_deep },
+        error.InvalidSlug => .{ .status = .invalid, .sub_status = .invalid_slug },
         error.UnsupportedOrder => .{ .status = .invalid, .sub_status = .unsupported_order },
         error.OffsetTooLarge => .{ .status = .invalid, .sub_status = .offset_too_large },
+        error.TooBroad, error.PostingsCapExceeded => .{
+            .status = .invalid,
+            .sub_status = .too_broad,
+        },
         error.SnapshotInProgress => .{ .status = .err, .sub_status = .already_in_progress },
         error.EmbeddingModelMismatch => .{
             .status = .invalid,
@@ -155,6 +163,9 @@ const id_result_bytes: usize = @sizeOf(u64) + 1;
 const bulk_items_max: u16 = 200;
 
 const subtree_offset_max: u32 = 5000;
+// Link lists skip their offset row by row, so it is capped as the subtree's is; a deeper page
+// is reached with the cursor.
+const list_links_offset_max: u32 = subtree_offset_max;
 const subtree_limit_max: u32 = 100;
 const subtree_limit_default: u32 = 50;
 const subtree_fetch_max: u32 = 10_000;
@@ -560,7 +571,9 @@ fn handle_get_categories_by_ids(
     for (0..want) |i| {
         const id_offset: usize = 2 + i * 8;
         const id = std.mem.readInt(u64, payload[id_offset..][0..8], .little);
-        const category = operations.get_category(db, id) catch null;
+        // A missing id is skipped; an id whose row cannot be read is an error, not a miss.
+        const category = operations.get_category(db, id) catch |err|
+            return write_mapped_error(response, op_byte, err);
         if (category) |*row| {
             offset = append_row(response, offset, row);
             found += 1;
@@ -609,10 +622,13 @@ fn handle_breadcrumbs_by_ids(
     for (0..want) |i| {
         const id = std.mem.readInt(u64, payload[2 + i * 8 ..][0..8], .little);
 
+        // An unknown id is a zero-crumb group; a row that cannot be read, or a parent chain
+        // that loops, fails the request rather than pass for an unknown id or a root.
+        const category = operations.get_category(db, id) catch |err|
+            return write_mapped_error(response, op_byte, err);
         var ancestors_buffer: [ancestor_depth_max]schema.Category = undefined;
-        const ancestors = operations.walk_ancestors(db, id, &ancestors_buffer) catch
-            ancestors_buffer[0..0];
-        const category = operations.get_category(db, id) catch null;
+        const ancestors = operations.walk_ancestors(db, id, &ancestors_buffer) catch |err|
+            return write_mapped_error(response, op_byte, err);
         const crumbs: usize = if (category != null) ancestors.len + 1 else 0;
         assert(crumbs <= ancestor_depth_max + 1);
         if (category == null) assert(crumbs == 0);
@@ -741,6 +757,9 @@ fn ListLinksHandlerType(comptime page_key: PageKey, comptime list: anytype) type
         fn handle(db: *Directory, response: []u8, op_byte: u8, payload: []const u8) usize {
             const window = parse_list_window(page_key, payload) orelse
                 return write_error_response(response, op_byte, .invalid);
+            if (window.offset > list_links_offset_max) {
+                return write_mapped_error(response, op_byte, error.OffsetTooLarge);
+            }
             const extras = read_optional_list_extras(payload, window.fixed_len) orelse
                 return write_error_response(response, op_byte, .invalid);
             var buffer: [default_list_buffer_len(schema.Link)]schema.Link = undefined;
@@ -756,7 +775,6 @@ fn ListLinksHandlerType(comptime page_key: PageKey, comptime list: anytype) type
                 list(db, page_options, &buffer);
             const page = listed catch |err| return write_mapped_error(response, op_byte, err);
             assert(page.items.len <= page_options.limit);
-            if (page.items.len < page_options.limit) assert(page.next_after_id == 0);
             return write_link_page(response, op_byte, &page);
         }
     };
@@ -768,10 +786,12 @@ fn handle_browse_path(db: *Directory, response: []u8, op_byte: u8, payload: []co
     if (2 + path_len > payload.len) return write_error_response(response, op_byte, .invalid);
     const path = payload[2..][0..path_len];
 
-    const category_id = (operations.resolve_slug_path(db, path) catch null) orelse
-        return write_error_response(response, op_byte, .not_found);
-    const category = (operations.get_category(db, category_id) catch null) orelse
-        return write_error_response(response, op_byte, .not_found);
+    const resolved = operations.resolve_slug_path(db, path) catch |err|
+        return write_mapped_error(response, op_byte, err);
+    const category_id = resolved orelse return write_error_response(response, op_byte, .not_found);
+    const found = operations.get_category(db, category_id) catch |err|
+        return write_mapped_error(response, op_byte, err);
+    const category = found orelse return write_error_response(response, op_byte, .not_found);
 
     db.drain_one_memtable(
         db.memtable_cat_by_parent(),
@@ -868,53 +888,35 @@ const SubtreePageResult = struct { offset: u32, written: u32, total: u64, next_a
 fn write_subtree_link_rows(
     db: *Directory,
     response: []u8,
-    link_ids: []const u64,
-    unfiltered_total: u64,
+    rows: []const subtree.SubtreeLinkRow,
+    total: u64,
     spec: *const SubtreePageSpec,
-) SubtreePageResult {
-    assert(link_ids.len <= subtree_fetch_max);
+) !SubtreePageResult {
+    assert(rows.len <= subtree_fetch_max);
     assert(spec.limit <= subtree_limit_max);
-    const cursor_mode = spec.cursor_mode();
+    assert(!spec.needs_full_scan());
     var offset = subtree_rows_offset;
     var written: u32 = 0;
-    var total: u64 = if (spec.status_filter == null) unfiltered_total else 0;
-    var skipped: u32 = 0;
-    var passed_cursor = !cursor_mode;
     var next_after_id: u64 = 0;
     var last_written_id: u64 = 0;
 
-    for (link_ids) |link_id| {
-        const link = (operations.get_link(db, link_id) catch null) orelse continue;
-        if (spec.status_filter) |status| {
-            if (link.status != status) continue;
-            total += 1;
-        }
-        if (!passed_cursor) {
-            if (link.id == spec.after_id) passed_cursor = true;
-            continue;
-        }
-        if (!cursor_mode and spec.status_filter != null and skipped < spec.offset) {
-            skipped += 1;
-            continue;
-        }
-        // A filtered page keeps walking after it is full because the filtered total is counted
-        // on the way; a plain page already knows its total and stops.
+    for (rows) |row| {
+        // The same rules as the filtered walk: a row that cannot be read fails the page, and a
+        // row left by a move under the category the link has left is skipped.
+        const link = (try operations.get_link(db, row.link_id)) orelse continue;
+        if (link.category_id != row.category_id) continue;
         if (written >= spec.limit) {
             next_after_id = last_written_id;
-            if (spec.status_filter == null) break else continue;
+            break;
         }
-        if (offset + @sizeOf(schema.Link) + subtree_trailer_bytes > response.len) {
-            if (spec.status_filter == null) break else continue;
-        }
+        if (offset + @sizeOf(schema.Link) + subtree_trailer_bytes > response.len) break;
         offset = append_row(response, offset, &link);
         last_written_id = link.id;
         written += 1;
     }
-    if (!cursor_mode) assert(passed_cursor);
     assert(written <= spec.limit);
     assert(offset == subtree_rows_offset + @as(usize, written) * @sizeOf(schema.Link));
     assert(offset + subtree_trailer_bytes <= response.len);
-    if (spec.status_filter == null) assert(total == unfiltered_total);
 
     return .{
         .offset = @intCast(offset),
@@ -924,36 +926,149 @@ fn write_subtree_link_rows(
     };
 }
 
-fn fetch_subtree_link_ids(
+fn fetch_subtree_link_rows(
     db: *Directory,
-    category_id: u64,
     descendants: []const u64,
     spec: *const SubtreePageSpec,
-) !subtree.SubtreeLinkPage {
-    if (spec.needs_full_scan()) {
-        const page = try subtree.list_subtree_link_ids_scan(
-            db.link_by_category(),
-            descendants,
-            .{ .limit = subtree_fetch_max },
-            db.scratch(),
-        );
-        assert(page.link_ids.len <= subtree_fetch_max);
-        return page;
-    }
+) ![]subtree.SubtreeLinkRow {
+    assert(descendants.len >= 1);
+    assert(!spec.needs_full_scan());
     const page_limit = spec.limit *| subtree_overprovision_factor;
     assert(page_limit <= subtree_fetch_max);
-    const link_ids = try subtree.list_subtree_link_ids(
+    const rows = try subtree.list_subtree_link_rows(
         db.link_by_category(),
         descendants,
         .{ .offset = spec.offset, .limit = page_limit },
         db.scratch(),
     );
-    errdefer db.scratch().free(link_ids);
-    assert(link_ids.len <= page_limit);
+    assert(rows.len <= page_limit);
+    return rows;
+}
 
-    const category = try operations.get_category(db, category_id);
-    const total: u64 = if (category) |found| found.link_count_subtree else 0;
-    return .{ .link_ids = link_ids, .total = total };
+// A filtered or cursor page walks the subtree's links category by category in descendant order,
+// which is link_by_category's key order, starting at the cursor's own key, and stops once the
+// page is full and one more match shows a next page: the work follows offset + limit, not the
+// size of the subtree or the index. A rare status could still mean a long walk, so a page reads
+// at most subtree_fetch_max rows and then ends early with a cursor at the last row read; an
+// offset the budget cannot reach is refused, since an offset cannot resume from a cursor.
+const SubtreeWalk = struct {
+    spec: *const SubtreePageSpec,
+    response: []u8,
+    offset: u32 = subtree_rows_offset,
+    written: u32 = 0,
+    skipped: u32 = 0,
+    examined: u32 = 0,
+    last_examined_id: u64 = 0,
+    last_written_id: u64 = 0,
+
+    /// The total is the subtree's links with the page's status, read from the root's counters,
+    /// so it is exact whatever share of the subtree the walk reached before its budget ran out.
+    fn result(
+        walk: *const SubtreeWalk,
+        root: *const schema.Category,
+        next: u64,
+    ) SubtreePageResult {
+        assert(walk.written <= walk.spec.limit);
+        assert(walk.offset == subtree_rows_offset + walk.written * @sizeOf(schema.Link));
+        return .{
+            .offset = walk.offset,
+            .written = walk.written,
+            .total = subtree_total(root, walk.spec.status_filter),
+            .next_after_id = next,
+        };
+    }
+
+    /// Walks one category's links from `start.first_link` on; null while the page still wants
+    /// rows, otherwise the cursor the page ends with.
+    fn category(
+        walk: *SubtreeWalk,
+        db: *Directory,
+        start: struct { category_id: u64, first_link: u64 },
+    ) !?u64 {
+        assert(walk.written <= walk.spec.limit);
+        const category_id = start.category_id;
+        const start_key = schema.CategoryLinkKey.encode(.{ category_id, start.first_link });
+        var iterator = try db.link_by_category().rangeScan(&start_key, null);
+        defer iterator.deinit();
+        while (try iterator.next()) |entry| {
+            if (entry.key.len < 16) return error.Corrupted;
+            if (zigstore.codec.decodeU64(entry.key[0..8]) != category_id) break;
+            if (walk.examined == subtree_fetch_max) {
+                if (!walk.spec.cursor_mode() and walk.skipped < walk.spec.offset) {
+                    return error.OffsetTooLarge;
+                }
+                return walk.last_examined_id;
+            }
+            walk.examined += 1;
+            walk.last_examined_id = zigstore.codec.decodeU64(entry.key[8..16]);
+            const link = (try operations.get_link(db, walk.last_examined_id)) orelse continue;
+            // The scan reads the tree as drained when the listing began, but the record comes
+            // from the memtable first, so a link moved since then still has a row here.
+            if (link.category_id != category_id) continue;
+            if (walk.spec.status_filter) |status| if (link.status != status) continue;
+            if (!walk.spec.cursor_mode() and walk.skipped < walk.spec.offset) {
+                walk.skipped += 1;
+                continue;
+            }
+            if (walk.written == walk.spec.limit) return walk.last_written_id;
+            const row_end = walk.offset + @sizeOf(schema.Link) + subtree_trailer_bytes;
+            if (row_end > walk.response.len) return walk.last_written_id;
+            walk.offset = @intCast(append_row(walk.response, walk.offset, &link));
+            walk.written += 1;
+            walk.last_written_id = link.id;
+        }
+        return null;
+    }
+};
+
+fn subtree_total(root: *const schema.Category, status_filter: ?u8) u64 {
+    const status = status_filter orelse return root.link_count_subtree;
+    assert(is_known_link_status(status));
+    return schema.link_count_subtree_with_status(root, @enumFromInt(status));
+}
+
+fn order_u64(context: u64, item: u64) std.math.Order {
+    return std.math.order(context, item);
+}
+
+fn plain_subtree_page(
+    db: *Directory,
+    response: []u8,
+    root: *const schema.Category,
+    descendants: []const u64,
+    spec: *const SubtreePageSpec,
+) !SubtreePageResult {
+    const rows = try fetch_subtree_link_rows(db, descendants, spec);
+    defer db.scratch().free(rows);
+    return try write_subtree_link_rows(db, response, rows, root.link_count_subtree, spec);
+}
+
+fn walk_subtree_page(
+    db: *Directory,
+    response: []u8,
+    root: *const schema.Category,
+    descendants: []const u64,
+    spec: *const SubtreePageSpec,
+) !SubtreePageResult {
+    assert(spec.needs_full_scan());
+    assert(response.len >= subtree_frame_bytes_min);
+    var walk: SubtreeWalk = .{ .spec = spec, .response = response };
+    var start_index: usize = 0;
+    var first_link: u64 = 0;
+    if (spec.cursor_mode()) {
+        const found = try operations.get_link(db, spec.after_id);
+        const cursor = found orelse return walk.result(root, 0);
+        start_index = std.sort.lowerBound(u64, descendants, cursor.category_id, order_u64);
+        if (start_index == descendants.len) return walk.result(root, 0);
+        if (descendants[start_index] != cursor.category_id) return walk.result(root, 0);
+        first_link = spec.after_id +| 1;
+    }
+    for (descendants[start_index..], start_index..) |category_id, index| {
+        const from: u64 = if (index == start_index) first_link else 0;
+        const ended = try walk.category(db, .{ .category_id = category_id, .first_link = from });
+        if (ended) |next| return walk.result(root, next);
+    }
+    return walk.result(root, 0);
 }
 
 fn handle_list_subtree_links(
@@ -977,6 +1092,7 @@ fn handle_list_subtree_links(
         .after_id = extras.after_id,
     };
 
+    const generation = db.subtree_cache.generation_now();
     db.drain_one_memtable(
         db.memtable_cat_by_parent(),
         db.cat_by_parent(),
@@ -990,11 +1106,16 @@ fn handle_list_subtree_links(
         db.links_by_id(),
     ) catch |err| log.warn("drain skipped before read: {}", .{err});
 
+    // An unknown root answers not_found before it is walked, so it is never cached.
+    const found = operations.get_category(db, request.category_id) catch |err|
+        return write_mapped_error(response, op_byte, err);
+    const root = found orelse return write_error_response(response, op_byte, .not_found);
     const descendants = subtree.collect_descendants_cached(
         db.cat_by_parent(),
-        request.category_id,
+        root.id,
         &db.subtree_cache,
         db.scratch(),
+        generation,
     ) catch |err| return write_mapped_error(response, op_byte, err);
     defer db.scratch().free(descendants);
 
@@ -1004,17 +1125,12 @@ fn handle_list_subtree_links(
         return write_error_response(response, op_byte, .err);
     }
 
-    const fetched = fetch_subtree_link_ids(
-        db,
-        request.category_id,
-        descendants,
-        &spec,
-    ) catch |err| {
-        return write_mapped_error(response, op_byte, err);
-    };
-    defer db.scratch().free(fetched.link_ids);
-
-    const page = write_subtree_link_rows(db, response, fetched.link_ids, fetched.total, &spec);
+    const page = if (spec.needs_full_scan())
+        walk_subtree_page(db, response, &root, descendants, &spec) catch |err|
+            return write_mapped_error(response, op_byte, err)
+    else
+        plain_subtree_page(db, response, &root, descendants, &spec) catch |err|
+            return write_mapped_error(response, op_byte, err);
     assert(page.written <= spec.limit);
     std.mem.writeInt(u32, response[response_header_size..][0..4], page.written, .little);
     const offset = write_u64s(response, page.offset, &.{ page.total, page.next_after_id });
@@ -1031,6 +1147,10 @@ const hybrid_query_bytes: usize = 8 + embedding_bytes;
 const vector_write_bytes: usize = 8 + 8 + embedding_bytes;
 const category_vector_write_bytes: usize = 8 + embedding_bytes;
 
+// A search query is a few words and the search reads at most 32 distinct tokens of it, so a
+// query over a kilobyte is refused rather than tokenised in full on the reactor thread.
+pub const search_query_bytes_max: usize = 1024;
+
 const MatchField = enum(u8) { title = 0, url = 1, description = 2, semantic = 3 };
 
 const SearchRequest = struct {
@@ -1045,6 +1165,7 @@ const SearchRequest = struct {
         if (payload.len < 6) return null;
         const query_len: usize = std.mem.readInt(u16, payload[0..2], .little);
         if (query_len < 2) return null;
+        if (query_len > search_query_bytes_max) return null;
         if (2 + query_len + 4 > payload.len) return null;
         const query = payload[2..][0..query_len];
         const limit = std.mem.readInt(u32, payload[2 + query_len ..][0..4], .little);
@@ -1080,6 +1201,7 @@ const SearchRequest = struct {
             .cap_per_site = cap_byte == 1,
         };
         assert(request.query.len >= 2);
+        assert(request.query.len <= search_query_bytes_max);
         if (request.mode != .hybrid) assert(request.query_vector.len == 0);
         if (request.mode == .hybrid) assert(request.query_vector.len == hybrid_query_bytes);
         if (request.cap_per_site) assert(request.mode != .all_terms);
@@ -1087,13 +1209,14 @@ const SearchRequest = struct {
     }
 };
 
-fn link_match_field(link: *const schema.Link, query: []const u8) MatchField {
-    assert(query.len > 0);
-    var token_buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    var tokens = inverted.TokenIterator.init(query);
-    var seen: u32 = 0;
-    while (tokens.next(&token_buffer)) |token| : (seen += 1) {
-        assert(seen < query.len);
+// The label reads the same distinct tokens the search ranked by, at most query_tokens_max, so
+// a long query costs each row a bounded number of scans: a row matched only by a token past
+// them is labelled semantic, as the ranking treated it.
+fn link_match_field(link: *const schema.Link, tokens: *const operations.QueryTokens) MatchField {
+    assert(tokens.count <= operations.query_tokens_max);
+    for (0..tokens.count) |i| {
+        const token = tokens.get(i);
+        assert(token.len >= inverted.MIN_TOKEN_LEN);
         if (std.ascii.findIgnoreCase(link.title.slice(), token) != null) return .title;
         if (std.ascii.findIgnoreCase(link.url.slice(), token) != null) return .url;
         if (std.ascii.findIgnoreCase(link.description.slice(), token) != null) return .description;
@@ -1191,7 +1314,7 @@ fn write_counted_link_rows(
     start: usize,
     links: []const schema.Link,
     row_sites: ?[]const operations.RowSite,
-    query: []const u8,
+    tokens: *const operations.QueryTokens,
 ) usize {
     assert(start + 2 <= response.len);
     if (row_sites) |rows| assert(rows.len == links.len);
@@ -1201,7 +1324,7 @@ fn write_counted_link_rows(
         const site_bytes: usize = if (row_sites) |rows| 4 + @as(usize, rows[i].key_len) else 0;
         if (offset + @sizeOf(schema.Link) + 1 + site_bytes > response.len) break;
         offset = append_row(response, offset, link);
-        response[offset] = @intFromEnum(link_match_field(link, query));
+        response[offset] = @intFromEnum(link_match_field(link, tokens));
         offset += 1;
         if (row_sites) |rows| offset = write_row_site(response, offset, &rows[i]);
         written += 1;
@@ -1225,8 +1348,10 @@ fn handle_search(db: *Directory, response: []u8, op_byte: u8, payload: []const u
     const categories = if (request.scope == .links_only)
         categories_buffer[0..0]
     else
-        search_categories_in_mode(db, &request, limit, &categories_buffer) catch
-            &[0]schema.Category{};
+        search_categories_in_mode(db, &request, limit, &categories_buffer) catch |err| {
+            log.warn("search: category search failed: {}", .{err});
+            return write_mapped_error(response, op_byte, err);
+        };
     assert(categories.len <= limit);
     var offset = write_counted_category_rows(response, response_header_size, categories, 2);
 
@@ -1237,13 +1362,17 @@ fn handle_search(db: *Directory, response: []u8, op_byte: u8, payload: []const u
     const found = if (request.scope == .categories_only)
         none
     else
-        search_links_in_mode(db, &request, limit, &links_buffer, site_rows) catch none;
+        search_links_in_mode(db, &request, limit, &links_buffer, site_rows) catch |err| {
+            log.warn("search: link search failed: {}", .{err});
+            return write_mapped_error(response, op_byte, err);
+        };
     assert(found.links.len <= limit);
     const found_sites: ?[]const operations.RowSite = if (request.cap_per_site)
         row_sites[0..found.links.len]
     else
         null;
-    offset = write_counted_link_rows(response, offset, found.links, found_sites, request.query);
+    const tokens = operations.QueryTokens.init(request.query);
+    offset = write_counted_link_rows(response, offset, found.links, found_sites, &tokens);
 
     if (request.mode == .hybrid) {
         if (offset + 1 > response.len) return write_error_response(response, op_byte, .err);
@@ -1792,9 +1921,12 @@ fn handle_index_health(db: *Directory, response: []u8, op_byte: u8) usize {
     return offset;
 }
 
+// A pass that failed or was discarded published nothing, so answering with the health frame
+// would present the previous pass, or the never-run zero, as the one just requested.
 fn handle_run_verifier(db: *Directory, response: []u8, op_byte: u8) usize {
     @import("verifier.zig").run_once(db, &db.verifier_state) catch |err| {
         log.warn("run_verifier failed: {}", .{err});
+        return write_mapped_error(response, op_byte, err);
     };
     const written = handle_index_health(db, response, op_byte);
     assert(written >= response_header_size);
@@ -2295,13 +2427,70 @@ test "index_health response carries slug_path_repair_queue fields" {
     try std.testing.expectEqual(@as(u64, 1), queue_depth);
 }
 
+// Goal: op 19 never answers ok for a pass that published nothing. Method: a writer thread
+// creates links while op 19 runs, each time on a fresh verifier state; an ok reply must carry a
+// published pass (last_run_at above zero), and at least one pass must be discarded for writes.
+test "run_verifier (19): a pass discarded for writes is not reported as completed" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_text: operations.CategoryText = .{ .name = "Top", .slug = "top", .description = "" };
+    const top = try operations.create_category(db, 0, top_text);
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, RunVerifierProbeWriter.run, .{ db, top, &stop });
+
+    var discarded: u32 = 0;
+    var unpublished_ok: u32 = 0;
+    for (0..1000) |_| {
+        db.verifier_state = .{};
+        var response: [4096]u8 = undefined;
+        _ = handle_run_verifier(db, &response, @intFromEnum(Op.run_verifier));
+        if (response[5] == @intFromEnum(Status.ok)) {
+            if (db.verifier_state.last_run_at == 0) {
+                unpublished_ok += 1;
+                break;
+            }
+        } else {
+            discarded += 1;
+            break;
+        }
+    }
+    stop.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(@as(u32, 0), unpublished_ok);
+    try std.testing.expect(discarded > 0);
+}
+
+const RunVerifierProbeWriter = struct {
+    fn run(directory: *Directory, parent: u64, stop: *std.atomic.Value(bool)) void {
+        assert(parent != 0);
+        var url_buffer: [64]u8 = undefined;
+        for (0..100_000) |index| {
+            if (stop.load(.acquire)) return;
+            const url = std.fmt.bufPrint(&url_buffer, "https://v{d}.example", .{index}) catch
+                unreachable;
+            assert(url.len > 0);
+            const text: operations.LinkText = .{ .url = url, .title = "x", .description = "" };
+            _ = operations.create_link(directory, parent, text) catch {};
+        }
+    }
+};
+
 // Every operation error maps to the (status, sub_status) pair the client is written to expect.
 test "map_error_with_sub_status: maps each known error to its pair" {
     const cases = [_]struct { err: anyerror, status: Status, sub: SubStatus }{
         .{ .err = error.FieldTooLong, .status = .invalid, .sub = .field_too_long },
+        .{ .err = error.PathTooLong, .status = .invalid, .sub = .field_too_long },
         .{ .err = error.PathTooDeep, .status = .invalid, .sub = .path_too_deep },
+        .{ .err = error.InvalidSlug, .status = .invalid, .sub = .invalid_slug },
         .{ .err = error.UnsupportedOrder, .status = .invalid, .sub = .unsupported_order },
         .{ .err = error.OffsetTooLarge, .status = .invalid, .sub = .offset_too_large },
+        .{ .err = error.TooBroad, .status = .invalid, .sub = .too_broad },
+        .{ .err = error.PostingsCapExceeded, .status = .invalid, .sub = .too_broad },
         .{ .err = error.ParentNotFound, .status = .category_not_found, .sub = .parent_not_found },
         .{ .err = error.DuplicateUrl, .status = .duplicate, .sub = .duplicate_url },
         .{ .err = error.DuplicateSlug, .status = .duplicate, .sub = .duplicate_slug },
@@ -2480,9 +2669,10 @@ test "list_subtree_links: a plain page stops when full and reports the cached to
         top_id,
         &db.subtree_cache,
         allocator,
+        db.subtree_cache.generation_now(),
     );
     defer allocator.free(descendants);
-    const walked = try subtree.list_subtree_link_ids(
+    const walked = try subtree.list_subtree_link_rows(
         db.link_by_category(),
         descendants,
         .{ .offset = 1, .limit = 2 },
@@ -2490,6 +2680,62 @@ test "list_subtree_links: a plain page stops when full and reports the cached to
     );
     defer allocator.free(walked);
     try std.testing.expectEqual(@as(usize, 2), walked.len);
+}
+
+// Goal: neither subtree page lists a link under a subtree it has moved out of. Method: drain
+// link_by_category, move the link out of `a`, then page `a`'s subtree plainly and filtered
+// without the handler's drain, so the scan still meets the row the move left in the tree.
+test "list_subtree_links: a link moved out of the subtree is not listed" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const a_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "A", .slug = "a", .description = "" },
+    );
+    const b_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "B", .slug = "b", .description = "" },
+    );
+    const link_id = try operations.create_link(
+        db,
+        a_id,
+        .{ .url = "http://moved.example/", .title = "Moved", .description = "" },
+    );
+    const status = (try operations.get_link(db, link_id)).?.status;
+    try db.drain_one_memtable(db.memtable_link_by_category(), db.link_by_category());
+    try operations.move_link(db, .{ .id = link_id, .new_parent_id = b_id });
+
+    const root = (try operations.get_category(db, a_id)).?;
+    const descendants = [_]u64{a_id};
+    var response: [16 * 1024]u8 = undefined;
+    const plain_spec: SubtreePageSpec = .{
+        .limit = 4,
+        .offset = 0,
+        .status_filter = null,
+        .after_id = 0,
+    };
+    const plain = try plain_subtree_page(db, &response, &root, &descendants, &plain_spec);
+    try std.testing.expectEqual(@as(u32, 0), plain.written);
+
+    const filtered_spec: SubtreePageSpec = .{
+        .limit = 4,
+        .offset = 0,
+        .status_filter = status,
+        .after_id = 0,
+    };
+    const filtered = try walk_subtree_page(db, &response, &root, &descendants, &filtered_spec);
+    try std.testing.expectEqual(@as(u32, 0), filtered.written);
 }
 
 // An offset past subtree_offset_max is refused with the offset_too_large sub-status.
@@ -2759,6 +3005,47 @@ test "a dispatched create_link frame is durable when acknowledged" {
 }
 
 const response_status_offset: usize = 5;
+
+// Goal: a search that outgrows its scratch slab answers err, not an ok that reads as "no
+// results". Method: open a request on a minimum-size slab, use all of it, then search.
+test "search (op=14): running out of scratch answers err instead of an empty ok" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const category_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Arts", .slug = "arts", .description = "" },
+    );
+    _ = try operations.create_link(
+        db,
+        category_id,
+        .{ .url = "https://artistic.example", .title = "artistic", .description = "" },
+    );
+
+    const query = "artistic";
+    var payload: [2 + query.len + 4]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], query.len, .little);
+    @memcpy(payload[2..][0..query.len], query);
+    std.mem.writeInt(u32, payload[2 + query.len ..][0..4], 10, .little);
+
+    var pool = try scratch_memory.Pool.init(.{
+        .count = 1,
+        .slab_bytes = scratch_memory.slab_bytes_min,
+    });
+    defer pool.deinit();
+    scratch_memory.begin(&pool);
+    defer scratch_memory.end();
+    _ = try db.scratch().alloc(u8, scratch_memory.slab_bytes_min);
+
+    var response: [16384]u8 = undefined;
+    const written = handle_search(db, &response, @intFromEnum(Op.search), &payload);
+    try std.testing.expectEqual(response_header_size, written);
+    try std.testing.expectEqual(@intFromEnum(Status.err), response[response_status_offset]);
+}
 
 // The read path runs inside the thread's scratch slab: a search dispatched through
 // Directory.dispatch claims exactly one slab, answers ok, and leaves no request open.
@@ -3320,7 +3607,7 @@ test "list_links_by_submitter (op=27) with trailing status byte filters for one 
     }
 }
 
-// Pending links in two children are returned together and the total counts only them.
+// Pending links in two children are returned together.
 test "list_subtree_links (op=17): the status byte filters the whole subtree" {
     const allocator = std.testing.allocator;
     var temporary_directory = std.testing.tmpDir(.{});
@@ -3389,9 +3676,215 @@ test "list_subtree_links (op=17): the status byte filters the whole subtree" {
     const returned = std.mem.readInt(u32, response[response_header_size..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 3), returned);
 
+    // A filtered page's total is the subtree's links with that status, not every status.
     const link_bytes_end = response_header_size + 4 + returned * @sizeOf(schema.Link);
     const total = std.mem.readInt(u64, response[link_bytes_end..][0..8], .little);
     try std.testing.expectEqual(@as(u64, 3), total);
+}
+
+// Goal: a filtered walk resumes at its cursor's own key and pages through the subtree once.
+// Method: three approved links over two children, one pending beside them, read a link a page.
+test "list_subtree_links (op=17): a filtered walk pages from its cursor through every child" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const a_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "A", .slug = "a", .description = "" },
+    );
+    const b_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "B", .slug = "b", .description = "" },
+    );
+    const approved = @intFromEnum(schema.LinkStatus.approved);
+    const pending = @intFromEnum(schema.LinkStatus.pending);
+    const links = [_]struct { category_id: u64, url: []const u8, status: u8 }{
+        .{ .category_id = a_id, .url = "https://a1.example", .status = approved },
+        .{ .category_id = a_id, .url = "https://a2.example", .status = pending },
+        .{ .category_id = b_id, .url = "https://b1.example", .status = approved },
+        .{ .category_id = a_id, .url = "https://a3.example", .status = approved },
+    };
+    var ids: [links.len]u64 = undefined;
+    for (links, &ids) |link, *id| {
+        id.* = try operations.create_link_with_options(
+            db,
+            link.category_id,
+            .{ .url = link.url, .title = "x", .description = "" },
+            .{ .status = link.status },
+        );
+    }
+
+    var payload: [26]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], top_id, .little);
+    payload[8] = 0;
+    std.mem.writeInt(u32, payload[9..13], 0, .little);
+    std.mem.writeInt(u32, payload[13..17], 1, .little);
+    payload[17] = approved;
+
+    // Key order is category, then id: a1 and a3 under A, then b1 under B.
+    const expected = [_]u64{ ids[0], ids[3], ids[2] };
+    var cursor: u64 = 0;
+    var response: [16384]u8 = undefined;
+    for (expected, 0..) |want, page| {
+        std.mem.writeInt(u64, payload[18..26], cursor, .little);
+        const len = handle_list_subtree_links(
+            db,
+            &response,
+            @intFromEnum(Op.list_subtree_links),
+            &payload,
+        );
+        try std.testing.expectEqual(@intFromEnum(Status.ok), response[response_status_offset]);
+        const row = response[subtree_rows_offset..][0..@sizeOf(schema.Link)];
+        try std.testing.expectEqual(want, std.mem.bytesToValue(schema.Link, row).id);
+        cursor = std.mem.readInt(u64, response[len - 8 ..][0..8], .little);
+        if (page + 1 < expected.len) try std.testing.expectEqual(want, cursor);
+    }
+    try std.testing.expectEqual(@as(u64, 0), cursor);
+}
+
+// Goal: a filtered page stops once it is full and one more match shows a next page, so its
+// work follows offset + limit and not the subtree. Method: two approved links in one child
+// and, in a later child, a row the index cannot hold, which any read past the page refuses;
+// ask for a page of one.
+test "list_subtree_links (op=17): a filtered page stops after its page and one more match" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const first_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "A", .slug = "a", .description = "" },
+    );
+    const later_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "B", .slug = "b", .description = "" },
+    );
+    var link_ids: [2]u64 = undefined;
+    for (&link_ids, [_][]const u8{ "https://a1.example", "https://a2.example" }) |*id, url| {
+        id.* = try operations.create_link_with_options(
+            db,
+            first_id,
+            .{ .url = url, .title = "a", .description = "" },
+            .{ .status = @intFromEnum(schema.LinkStatus.approved) },
+        );
+    }
+    var stray_key: [9]u8 = undefined;
+    stray_key[0..8].* = zigstore.codec.encodeU64(later_id);
+    stray_key[8] = 1;
+    const stray_value = zigstore.codec.encodeU64(0);
+    try db.link_by_category().insert(&stray_key, &stray_value);
+
+    var payload: [26]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], top_id, .little);
+    payload[8] = 0;
+    std.mem.writeInt(u32, payload[9..13], 0, .little);
+    std.mem.writeInt(u32, payload[13..17], 1, .little);
+    payload[17] = @intFromEnum(schema.LinkStatus.approved);
+    std.mem.writeInt(u64, payload[18..26], 0, .little);
+
+    var response: [16384]u8 = undefined;
+    const len = handle_list_subtree_links(
+        db,
+        &response,
+        @intFromEnum(Op.list_subtree_links),
+        &payload,
+    );
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[response_status_offset]);
+    const returned = std.mem.readInt(u32, response[response_header_size..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1), returned);
+    const row = response[subtree_rows_offset..][0..@sizeOf(schema.Link)];
+    try std.testing.expectEqual(link_ids[0], std.mem.bytesToValue(schema.Link, row).id);
+    const next = std.mem.readInt(u64, response[len - 8 ..][0..8], .little);
+    try std.testing.expectEqual(link_ids[0], next);
+}
+
+// Goal: a filtered subtree page reads its own categories' rows and no others. Method: put a
+// row the index cannot hold for a category outside the subtree, which a scan of the whole
+// index refuses as corrupt, then ask for the subtree's approved links.
+test "list_subtree_links (op=17): a filtered page reads only the subtree's own rows" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const outside_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "A", .slug = "a", .description = "" },
+    );
+    const inside_id = try operations.create_category(
+        db,
+        top_id,
+        .{ .name = "B", .slug = "b", .description = "" },
+    );
+    _ = try operations.create_link_with_options(
+        db,
+        inside_id,
+        .{ .url = "https://b1.example", .title = "b1", .description = "" },
+        .{ .status = @intFromEnum(schema.LinkStatus.approved) },
+    );
+    const stray_key = zigstore.codec.encodeU64(outside_id);
+    const stray_value = zigstore.codec.encodeU64(0);
+    try db.link_by_category().insert(&stray_key, &stray_value);
+
+    var payload: [18]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], inside_id, .little);
+    payload[8] = 0;
+    std.mem.writeInt(u32, payload[9..13], 0, .little);
+    std.mem.writeInt(u32, payload[13..17], 50, .little);
+    payload[17] = @intFromEnum(schema.LinkStatus.approved);
+
+    var response: [16384]u8 = undefined;
+    _ = handle_list_subtree_links(db, &response, @intFromEnum(Op.list_subtree_links), &payload);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[response_status_offset]);
+    const returned = std.mem.readInt(u32, response[response_header_size..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1), returned);
+}
+
+// Goal: an id that names no category answers not_found and leaves nothing in the cache, so a
+// caller walking ids cannot grow it. Method: ask for the links under an unknown id.
+test "list_subtree_links (op=17): an unknown category answers not_found and is not cached" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    var payload: [17]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], 999, .little);
+    payload[8] = 0;
+    std.mem.writeInt(u32, payload[9..13], 0, .little);
+    std.mem.writeInt(u32, payload[13..17], 50, .little);
+
+    var response: [4096]u8 = undefined;
+    _ = handle_list_subtree_links(db, &response, @intFromEnum(Op.list_subtree_links), &payload);
+    try std.testing.expectEqual(@intFromEnum(Status.not_found), response[response_status_offset]);
+    try std.testing.expectEqual(@as(u32, 0), db.subtree_cache.descendants.count());
 }
 
 // One flip, one already in state, one unknown id: the reply carries a code per id in order.
@@ -3461,7 +3954,8 @@ test "bulk_update_link_status (op=34) reports per-id result codes" {
     try std.testing.expectEqual(approved, (try operations.get_link(db, link_a)).?.status);
 }
 
-// A count above bulk_items_max is refused before any id is read.
+// Goal: a bulk count above bulk_items_max is refused by the cap itself. Method: send the
+// count with as many ids, into a reply big enough for every result, so only the cap can refuse.
 test "bulk_update_link_status (op=34) caps at 200" {
     const allocator = std.testing.allocator;
     var temporary_directory = std.testing.tmpDir(.{});
@@ -3469,10 +3963,12 @@ test "bulk_update_link_status (op=34) caps at 200" {
     var db = try Directory.open_test_instance(allocator, &temporary_directory);
     defer db.deinit_test_instance();
 
-    var payload: [3]u8 = undefined;
+    const count = bulk_items_max + 1;
+    var payload: [3 + @as(usize, count) * 8]u8 = undefined;
     payload[0] = 1;
-    std.mem.writeInt(u16, payload[1..3], 201, .little);
-    var response: [64]u8 = undefined;
+    std.mem.writeInt(u16, payload[1..3], count, .little);
+    for (0..count) |i| std.mem.writeInt(u64, payload[3 + i * 8 ..][0..8], i + 1, .little);
+    var response: [response_header_size + 4 + @as(usize, count) * id_result_bytes]u8 = undefined;
     const len = handle_bulk_update_link_status(
         db,
         &response,
@@ -3743,6 +4239,64 @@ test "search (op=14): the mode byte selects ranked matching" {
     payload_buffer[base + 3] = 0;
     _ = handle_search(db, &response, @intFromEnum(Op.search), payload_buffer[0 .. base + 4]);
     try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
+}
+
+// Goal: a row's match field is decided by the distinct tokens the search ranked by and no
+// more, so a long query cannot make every row scan every token. Method: `musics`, 31 filler
+// words and then `music`; the plural finds the `music` link, and only a scan past the 32nd
+// token would label it a title match.
+test "search (op=14): the match field reads only the tokens the search ranked by" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.org/", .title = "music", .description = "" },
+    );
+
+    var query_buffer: [256]u8 = undefined;
+    var query: std.Io.Writer = .fixed(&query_buffer);
+    try query.writeAll("musics");
+    for (0..operations.query_tokens_max - 1) |i| try query.print(" q{d:0>2}", .{i});
+    try query.writeAll(" music");
+    const text = query.buffered();
+
+    var payload: [2 + query_buffer.len + 4 + 2]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], @intCast(text.len), .little);
+    @memcpy(payload[2..][0..text.len], text);
+    std.mem.writeInt(u32, payload[2 + text.len ..][0..4], 10, .little);
+    payload[2 + text.len + 4] = @intFromEnum(SearchScope.links_only);
+    payload[2 + text.len + 5] = @intFromEnum(SearchMode.ranked);
+
+    var response: [16384]u8 = undefined;
+    _ = handle_search(db, &response, @intFromEnum(Op.search), payload[0 .. 2 + text.len + 6]);
+    try std.testing.expectEqual(@intFromEnum(Status.ok), response[response_status_offset]);
+    const rows = response_header_size + 2;
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, response[rows..][0..2], .little));
+    const match_field = response[rows + 2 + @sizeOf(schema.Link)];
+    try std.testing.expectEqual(@intFromEnum(MatchField.semantic), match_field);
+}
+
+// Goal: a query over search_query_bytes_max is refused before it is tokenised. Method: parse
+// a query of exactly the maximum and one byte more.
+test "search (op=14): a query over the byte maximum is invalid" {
+    var payload: [2 + search_query_bytes_max + 1 + 4]u8 = undefined;
+    @memset(&payload, 'a');
+    for ([_]usize{ search_query_bytes_max, search_query_bytes_max + 1 }) |query_len| {
+        std.mem.writeInt(u16, payload[0..2], @intCast(query_len), .little);
+        std.mem.writeInt(u32, payload[2 + query_len ..][0..4], 10, .little);
+        const parsed = SearchRequest.parse(payload[0 .. 2 + query_len + 4]);
+        try std.testing.expectEqual(query_len <= search_query_bytes_max, parsed != null);
+    }
 }
 
 // Four links on one site and one on another: three rows, and the site's last row says two more.
@@ -4535,6 +5089,31 @@ test "list_all_links with out-of-range status returns invalid" {
     try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
 }
 
+// Goal: a link list skips its offset row by row, so an offset past list_links_offset_max is
+// refused, as the subtree list refuses its own. Method: list_all_links one past the maximum.
+test "list_all_links: an offset past the maximum answers offset_too_large" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], list_links_offset_max + 1, .little);
+    std.mem.writeInt(u32, payload[4..8], 10, .little);
+
+    var response: [64]u8 = undefined;
+    const reply_len = ListAllLinks.handle(
+        db,
+        &response,
+        @intFromEnum(Op.list_all_links),
+        &payload,
+    );
+    try std.testing.expectEqual(@as(usize, response_header_size), reply_len);
+    try std.testing.expectEqual(@intFromEnum(Status.invalid), response[5]);
+    try std.testing.expectEqual(@intFromEnum(SubStatus.offset_too_large), response[6]);
+}
+
 // A status byte above rejected answers invalid with unsupported_order.
 test "update_link_status: out-of-range status returns invalid + unsupported_order" {
     const allocator = std.testing.allocator;
@@ -4615,7 +5194,96 @@ test "get_categories_by_ids (29): mix of hits and misses returns only the hits" 
     try std.testing.expectEqual(b_id, category_1.id);
 }
 
-// A count above get_categories_by_ids_max is refused before any id is read.
+// Goal: breadcrumbs_by_ids answers err when a row on a chain cannot be read, never a zero-crumb
+// group, which means an unknown id, or a chain cut short to look like a root. Method: a
+// three-byte row under a category id, asked for itself and through a child whose parent it is.
+test "breadcrumbs_by_ids (30): a row that cannot be read answers err" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const broken_id: u64 = 77;
+    const short_value = [_]u8{ 1, 2, 3 };
+    try db.categories_by_id().insert(&zigstore.codec.encodeU64(broken_id), &short_value);
+    const child: schema.Category = .{
+        .id = broken_id + 1,
+        .parent_id = broken_id,
+        .name = .fromSlice("Child"),
+        .slug = .fromSlice("child"),
+    };
+    try db.categories_by_id().insert(&zigstore.codec.encodeU64(child.id), std.mem.asBytes(&child));
+
+    var response: [4096]u8 = undefined;
+    for ([_]u64{ broken_id, child.id }) |id| {
+        var payload: [10]u8 = undefined;
+        std.mem.writeInt(u16, payload[0..2], 1, .little);
+        std.mem.writeInt(u64, payload[2..10], id, .little);
+        _ = handle_breadcrumbs_by_ids(db, &response, @intFromEnum(Op.breadcrumbs_by_ids), &payload);
+        try std.testing.expectEqual(@intFromEnum(Status.err), response[5]);
+    }
+}
+
+// Goal: a stored row that cannot be read answers err, never ok with the row left out as if it
+// were missing. Method: three-byte rows under a category id and a link id, reached through
+// get_categories_by_ids, browse_path (by a slug path that maps to the broken category) and a
+// plain list_subtree_links page.
+test "a corrupt stored row answers err in get_categories_by_ids, browse_path and subtree" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try operations.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const broken_id: u64 = 77;
+    const short_value = [_]u8{ 1, 2, 3 };
+    try db.categories_by_id().insert(&zigstore.codec.encodeU64(broken_id), &short_value);
+    try db.categories_by_slug_path().insert("top/broken", &zigstore.codec.encodeU64(broken_id));
+    try db.links_by_id().insert(&zigstore.codec.encodeU64(999), &short_value);
+    const row_key = schema.CategoryLinkKey.encode(.{ top_id, 999 });
+    try db.link_by_category().insert(&row_key, &.{});
+
+    var response: [4096]u8 = undefined;
+    var ids_payload: [10]u8 = undefined;
+    std.mem.writeInt(u16, ids_payload[0..2], 1, .little);
+    std.mem.writeInt(u64, ids_payload[2..10], broken_id, .little);
+    _ = handle_get_categories_by_ids(
+        db,
+        &response,
+        @intFromEnum(Op.get_categories_by_ids),
+        &ids_payload,
+    );
+    try std.testing.expectEqual(@intFromEnum(Status.err), response[5]);
+
+    const path = "top/broken";
+    var path_payload: [2 + path.len]u8 = undefined;
+    std.mem.writeInt(u16, path_payload[0..2], path.len, .little);
+    @memcpy(path_payload[2..], path);
+    _ = handle_browse_path(db, &response, @intFromEnum(Op.browse_path), &path_payload);
+    try std.testing.expectEqual(@intFromEnum(Status.err), response[5]);
+
+    var subtree_payload: [17]u8 = undefined;
+    std.mem.writeInt(u64, subtree_payload[0..8], top_id, .little);
+    subtree_payload[8] = 0;
+    std.mem.writeInt(u32, subtree_payload[9..13], 0, .little);
+    std.mem.writeInt(u32, subtree_payload[13..17], 10, .little);
+    _ = handle_list_subtree_links(
+        db,
+        &response,
+        @intFromEnum(Op.list_subtree_links),
+        &subtree_payload,
+    );
+    try std.testing.expectEqual(@intFromEnum(Status.err), response[5]);
+}
+
+// Goal: a count above get_categories_by_ids_max is refused by the cap itself. Method: send the
+// count with as many ids, into a reply big enough for every row, so only the cap can refuse.
 test "get_categories_by_ids (29): a count over the maximum is invalid" {
     const allocator = std.testing.allocator;
     var temporary_directory = std.testing.tmpDir(.{});
@@ -4623,12 +5291,18 @@ test "get_categories_by_ids (29): a count over the maximum is invalid" {
     var db = try Directory.open_test_instance(allocator, &temporary_directory);
     defer db.deinit_test_instance();
 
-    var payload: [2]u8 = undefined;
-    std.mem.writeInt(u16, payload[0..2], get_categories_by_ids_max + 1, .little);
-    var response: [128]u8 = undefined;
+    const count = get_categories_by_ids_max + 1;
+    var payload: [2 + @as(usize, count) * 8]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], count, .little);
+    for (0..count) |i| std.mem.writeInt(u64, payload[2 + i * 8 ..][0..8], i + 1, .little);
+    const response = try allocator.alloc(
+        u8,
+        response_header_size + @as(usize, count) * @sizeOf(schema.Category),
+    );
+    defer allocator.free(response);
     const reply_len = handle_get_categories_by_ids(
         db,
-        &response,
+        response,
         @intFromEnum(Op.get_categories_by_ids),
         &payload,
     );

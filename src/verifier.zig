@@ -94,14 +94,30 @@ pub const VerifierState = struct {
     }
 };
 
+pub const VerifierError = error{WritesDuringPass};
+
 pub fn run_once(db: *Directory, state: *VerifierState) !void {
     const started_ms = db.now_millis();
+    const sequence_before = write_sequence(db);
     const totals = try run_once_totals(db);
     const indices = try run_once_indices(db, totals);
+    const slug_path_count = try count_tree(db.categories_by_slug_path(), "");
     log.info(
         "verifier: {d} of {d} links carry a vector",
         .{ totals.vector_count, totals.link_count },
     );
+
+    // Each tree is counted at its own moment, so a write that lands during the pass reads as
+    // drift on a consistent store. Such a pass publishes nothing and says so with an error, so
+    // op 19 cannot report the previous pass, or none, as the one just run.
+    const sequence_after = write_sequence(db);
+    assert(sequence_after >= sequence_before);
+    if (sequence_after != sequence_before) {
+        log.info("verifier: {d} writes landed during the pass; drift not judged", .{
+            sequence_after - sequence_before,
+        });
+        return VerifierError.WritesDuringPass;
+    }
 
     state.mutex.lockUncancelable(db.io);
     state.last_run_at = db.now_seconds();
@@ -109,7 +125,7 @@ pub fn run_once(db: *Directory, state: *VerifierState) !void {
     assert(state.last_run_at > 0);
     state.mutex.unlock(db.io);
 
-    var any_drift = try run_once_derived_drift(db, totals);
+    var any_drift = try run_once_derived_drift(db, totals, slug_path_count);
     for (indices) |invariant| {
         const drift = invariant.drift_bp();
         if (drift == 0) continue;
@@ -131,6 +147,19 @@ pub fn run_once(db: *Directory, state: *VerifierState) !void {
     } else {
         log.info("verifier: completed in {d}ms — all clean", .{elapsed_ms});
     }
+}
+
+// Every commit appends to the WAL and applies while holding write_mutex, so the sequence read
+// under it is a point no write straddles: equal readings around a pass mean none landed.
+fn write_sequence(db: *Directory) u64 {
+    db.write_mutex.lockUncancelable(db.io);
+    defer db.write_mutex.unlock(db.io);
+    if (db.store.wal_writer) |*wal| {
+        const sequence = wal.getSequence();
+        assert(sequence >= wal.durableSeqPublished());
+        return sequence;
+    }
+    return 0;
 }
 
 const TreeTotals = struct {
@@ -229,9 +258,8 @@ fn run_once_set(indices: *[invariant_count]InvariantHealth, id: InvariantId, cou
     slot.observed = counts.observed;
 }
 
-fn run_once_derived_drift(db: *Directory, totals: TreeTotals) !bool {
+fn run_once_derived_drift(db: *Directory, totals: TreeTotals, slug_path_count: u64) !bool {
     var any_drift = false;
-    const slug_path_count = try count_tree(db.categories_by_slug_path(), "");
     if (slug_path_count != totals.category_count) {
         any_drift = true;
         log.warn(
@@ -261,13 +289,68 @@ fn run_once_derived_drift(db: *Directory, totals: TreeTotals) !bool {
     return any_drift;
 }
 
+// Every scan below holds its tree's shared lock only for one chunk: the rangeScan iterator keeps
+// the lock until it is closed, and std.Io.RwLock queues each new reader behind a waiting writer,
+// so one whole-tree pass stalled every get_link once a memtable drain queued (a 4.5 s pass on the
+// 92k store took the worst read from 11 ms to 893 ms). Reopening after each chunk bounds that
+// wait to one chunk of entries and the lookups made for them.
+const scan_chunk_entries: u32 = 1024;
+// Keys in these trees reach the slug-path maximum; one spare byte holds the successor suffix.
+const scan_key_len_max: usize = 2048 + 1;
+// No tree holds anywhere near this many chunks; reaching it means the scan is not advancing.
+const scan_chunks_max: u64 = 1 << 32;
+
+pub const ScanError = error{ ScanKeyTooLong, ScanTooLong };
+
+/// `tree` is a `*BPlusTree`, or in a test a stand-in with the same `rangeScan`.
+fn scan_chunked(tree: anytype, min_key: []const u8, visitor: anytype) !void {
+    comptime assert(scan_chunk_entries > 0);
+    assert(min_key.len < scan_key_len_max);
+    var resume_buffer: [scan_key_len_max]u8 = undefined;
+    var start_key: []const u8 = min_key;
+    for (0..scan_chunks_max) |_| {
+        var iterator = try tree.rangeScan(start_key, null);
+        defer iterator.deinit();
+        for (0..scan_chunk_entries) |visited| {
+            const entry = (try iterator.next()) orelse return;
+            try visitor.visit(entry);
+            if (visited + 1 == scan_chunk_entries) {
+                start_key = try successor_key(entry.key, &resume_buffer);
+                assert(start_key.len <= scan_key_len_max);
+            }
+        }
+        assert(start_key.ptr == &resume_buffer);
+    }
+    return ScanError.ScanTooLong;
+}
+
+// The smallest key after `key` in byte order is `key` with a zero byte appended.
+fn successor_key(key: []const u8, buffer: *[scan_key_len_max]u8) ![]const u8 {
+    if (key.len >= buffer.len) return ScanError.ScanKeyTooLong;
+    @memcpy(buffer[0..key.len], key);
+    buffer[key.len] = 0;
+    const successor = buffer[0 .. key.len + 1];
+    assert(successor.len == key.len + 1);
+    assert(std.mem.order(u8, key, successor) == .lt);
+    return successor;
+}
+
+const EntryCounter = struct {
+    count: u64 = 0,
+
+    fn visit(counter: *EntryCounter, entry: anytype) !void {
+        _ = entry;
+        assert(counter.count < std.math.maxInt(u64));
+        counter.count += 1;
+    }
+};
+
 fn count_tree(tree: *btree.BPlusTree, min_key: []const u8) !u64 {
+    comptime assert(composite_key_len < scan_key_len_max);
     assert(min_key.len <= composite_key_len);
-    var iterator = try tree.rangeScan(min_key, null);
-    defer iterator.deinit();
-    var count: u64 = 0;
-    while (try iterator.next()) |_| count += 1;
-    return count;
+    var counter = EntryCounter{};
+    try scan_chunked(tree, min_key, &counter);
+    return counter.count;
 }
 
 fn tree_non_empty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
@@ -277,125 +360,159 @@ fn tree_non_empty(tree: *btree.BPlusTree, min_key: []const u8) !bool {
     return (try iterator.next()) != null;
 }
 
+fn category_of(entry: anytype) ?schema.Category {
+    if (entry.value.len < @sizeOf(schema.Category)) return null;
+    assert(entry.value.len >= @sizeOf(schema.Category));
+    return std.mem.bytesToValue(schema.Category, entry.value[0..@sizeOf(schema.Category)]);
+}
+
+const TopCounter = struct {
+    walked: u64 = 0,
+    tops: u64 = 0,
+
+    fn visit(counter: *TopCounter, entry: anytype) !void {
+        counter.walked += 1;
+        assert(counter.walked > 0);
+        const category = category_of(entry) orelse return;
+        if (category.parent_id == 0) counter.tops += 1;
+        assert(counter.tops <= counter.walked);
+    }
+};
+
 fn count_tops(db: *Directory) !u64 {
     const min_key = codec.encodeU64(0);
-    var iterator = try db.categories_by_id().rangeScan(&min_key, null);
-    defer iterator.deinit();
-    var walked: u64 = 0;
-    var top_count: u64 = 0;
-    while (try iterator.next()) |entry| : (walked += 1) {
-        if (entry.value.len < @sizeOf(schema.Category)) continue;
-        const category = std.mem.bytesToValue(
-            schema.Category,
-            entry.value[0..@sizeOf(schema.Category)],
-        );
-        if (category.parent_id == 0) top_count += 1;
-    }
-    assert(top_count <= walked);
-    return top_count;
+    var counter = TopCounter{};
+    try scan_chunked(db.categories_by_id(), &min_key, &counter);
+    assert(counter.tops <= counter.walked);
+    return counter.tops;
 }
+
+const ParentCollector = struct {
+    allocator: std.mem.Allocator,
+    parents: std.ArrayListUnmanaged(u64) = .empty,
+    walked: u64 = 0,
+
+    fn visit(collector: *ParentCollector, entry: anytype) !void {
+        collector.walked += 1;
+        assert(collector.walked > 0);
+        const category = category_of(entry) orelse return;
+        if (category.parent_id == 0) return;
+        try collector.parents.append(collector.allocator, category.parent_id);
+        assert(collector.parents.items.len <= collector.walked);
+    }
+};
 
 fn count_orphans(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
 
-    var parents: std.ArrayListUnmanaged(u64) = .empty;
-    defer parents.deinit(db.allocator);
-
-    var walked: u64 = 0;
-    {
-        const min_key = codec.encodeU64(0);
-        var iterator = try db.categories_by_id().rangeScan(&min_key, null);
-        defer iterator.deinit();
-        while (try iterator.next()) |entry| : (walked += 1) {
-            if (entry.value.len < @sizeOf(schema.Category)) continue;
-            const category = std.mem.bytesToValue(
-                schema.Category,
-                entry.value[0..@sizeOf(schema.Category)],
-            );
-            if (category.parent_id != 0) try parents.append(db.allocator, category.parent_id);
-        }
-    }
-    assert(parents.items.len <= walked);
+    var collector = ParentCollector{ .allocator = db.allocator };
+    defer collector.parents.deinit(db.allocator);
+    const min_key = codec.encodeU64(0);
+    try scan_chunked(db.categories_by_id(), &min_key, &collector);
+    assert(collector.parents.items.len <= collector.walked);
 
     var orphans: u64 = 0;
-    for (parents.items) |parent_id| {
+    for (collector.parents.items) |parent_id| {
         assert(parent_id != 0);
         const parent = ops.get_category(db, parent_id) catch null;
         if (parent == null) orphans += 1;
     }
-    assert(orphans <= parents.items.len);
+    assert(orphans <= collector.parents.items.len);
     return orphans;
 }
+
+const LinkCategoryChecker = struct {
+    db: *Directory,
+    category_exists: std.AutoHashMap(u64, bool),
+    walked: u64 = 0,
+    orphans: u64 = 0,
+
+    fn visit(checker: *LinkCategoryChecker, entry: anytype) !void {
+        const ops = @import("operations/operations.zig");
+        checker.walked += 1;
+        assert(checker.walked > 0);
+        if (entry.value.len < @sizeOf(schema.Link)) return;
+        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
+        const slot = try checker.category_exists.getOrPut(link.category_id);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = (ops.get_category(checker.db, link.category_id) catch null) != null;
+        }
+        if (!slot.value_ptr.*) checker.orphans += 1;
+        assert(checker.orphans <= checker.walked);
+    }
+};
 
 fn count_links_with_missing_category(db: *Directory) !u64 {
-    const ops = @import("operations/operations.zig");
+    var checker = LinkCategoryChecker{
+        .db = db,
+        .category_exists = std.AutoHashMap(u64, bool).init(db.allocator),
+    };
+    defer checker.category_exists.deinit();
 
-    var category_exists = std.AutoHashMap(u64, bool).init(db.allocator);
-    defer category_exists.deinit();
-
-    var walked: u64 = 0;
-    var orphans: u64 = 0;
     const min_key = codec.encodeU64(0);
-    var iterator = try db.links_by_id().rangeScan(&min_key, null);
-    defer iterator.deinit();
-    while (try iterator.next()) |entry| : (walked += 1) {
-        if (entry.value.len < @sizeOf(schema.Link)) continue;
-        const link = std.mem.bytesToValue(schema.Link, entry.value[0..@sizeOf(schema.Link)]);
-        const slot = try category_exists.getOrPut(link.category_id);
-        if (!slot.found_existing) {
-            slot.value_ptr.* = (ops.get_category(db, link.category_id) catch null) != null;
-        }
-        if (!slot.value_ptr.*) orphans += 1;
-    }
-    assert(category_exists.count() <= walked);
-    assert(orphans <= walked);
-    return orphans;
+    try scan_chunked(db.links_by_id(), &min_key, &checker);
+    assert(checker.category_exists.count() <= checker.walked);
+    assert(checker.orphans <= checker.walked);
+    return checker.orphans;
 }
+
+const VectorLinkChecker = struct {
+    db: *Directory,
+    walked: u64 = 0,
+    orphans: u64 = 0,
+
+    fn visit(checker: *VectorLinkChecker, entry: anytype) !void {
+        const ops = @import("operations/operations.zig");
+        checker.walked += 1;
+        assert(checker.walked > 0);
+        if (entry.key.len != @sizeOf(u64)) return error.DatabaseCorrupted;
+        const link_id = codec.decodeU64(entry.key[0..8]);
+        if ((ops.get_link(checker.db, link_id) catch null) == null) checker.orphans += 1;
+        assert(checker.orphans <= checker.walked);
+    }
+};
 
 fn count_vectors_with_missing_link(db: *Directory) !u64 {
-    const ops = @import("operations/operations.zig");
-
-    var walked: u64 = 0;
-    var orphans: u64 = 0;
+    var checker = VectorLinkChecker{ .db = db };
     const min_key = codec.encodeU64(0);
-    var iterator = try db.link_vectors().rangeScan(&min_key, null);
-    defer iterator.deinit();
-    while (try iterator.next()) |entry| : (walked += 1) {
-        assert(entry.key.len == @sizeOf(u64));
-        const link_id = codec.decodeU64(entry.key[0..8]);
-        if ((ops.get_link(db, link_id) catch null) == null) orphans += 1;
-    }
-    assert(orphans <= walked);
-    return orphans;
+    try scan_chunked(db.link_vectors(), &min_key, &checker);
+    assert(checker.orphans <= checker.walked);
+    return checker.orphans;
 }
+
+const ExpectedCounts = @import("operations/operations_category.zig").ExpectedCounts;
+
+const SubtreeDriftCounter = struct {
+    counts: *const @import("operations/operations_category.zig").CategoryCounts,
+    walked: u64 = 0,
+    drift: u64 = 0,
+
+    fn visit(counter: *SubtreeDriftCounter, entry: anytype) !void {
+        counter.walked += 1;
+        assert(counter.walked > 0);
+        const category = category_of(entry) orelse return;
+        const want = counter.counts.expected_for(category.id);
+        assert(want.link_count_subtree >= want.link_count);
+        assert(want.child_count_subtree >= want.child_count);
+        var have = ExpectedCounts.of_record(&category);
+        // The direct counts are not this invariant, so only the subtree columns are compared.
+        have.link_count = want.link_count;
+        have.child_count = want.child_count;
+        if (!std.meta.eql(have, want)) counter.drift += 1;
+        assert(counter.drift <= counter.walked);
+    }
+};
 
 fn count_subtree_drift(db: *Directory) !u64 {
     const ops = @import("operations/operations.zig");
     var counts = try ops.compute_category_counts(db);
     defer counts.deinit();
 
-    var walked: u64 = 0;
-    var drift: u64 = 0;
+    var counter = SubtreeDriftCounter{ .counts = &counts };
     const min_key = codec.encodeU64(0);
-    var iterator = try db.categories_by_id().rangeScan(&min_key, null);
-    defer iterator.deinit();
-    while (try iterator.next()) |entry| : (walked += 1) {
-        if (entry.value.len < @sizeOf(schema.Category)) continue;
-        const category = std.mem.bytesToValue(
-            schema.Category,
-            entry.value[0..@sizeOf(schema.Category)],
-        );
-        const want = counts.expected_for(category.id);
-        assert(want.link_count_subtree >= want.link_count);
-        assert(want.child_count_subtree >= want.child_count);
-        if (category.link_count_subtree != want.link_count_subtree) {
-            drift += 1;
-        } else if (category.child_count_subtree != want.child_count_subtree) {
-            drift += 1;
-        }
-    }
-    assert(drift <= walked);
-    return drift;
+    try scan_chunked(db.categories_by_id(), &min_key, &counter);
+    assert(counter.drift <= counter.walked);
+    return counter.drift;
 }
 
 // Goal: drift is a basis-point distance in either direction. Method: four hand-computed pairs.
@@ -789,3 +906,129 @@ test "verifier reports a link whose category no longer exists" {
     try std.testing.expectEqual(@as(u64, 0), invariant.observed);
     try std.testing.expect(invariant.drift_bp() > 0);
 }
+
+// A writer that blocks on the tree's exclusive lock until the scan lets go of it.
+// Stands in for the tree in `scan_chunked` so the test sees each chunk begin. A writer's tryLock
+// succeeds only while no reader holds the tree, so a pass that carried its shared lock from one
+// chunk into the next fails it at the next chunk's start, with no second thread and no timing.
+const ChunkStartProbe = struct {
+    tree: *btree.BPlusTree,
+    chunks: u32 = 0,
+    chunks_started_locked: u32 = 0,
+
+    fn rangeScan(
+        probe: *ChunkStartProbe,
+        start_key: []const u8,
+        end_key: ?[]const u8,
+    ) @TypeOf(probe.tree.rangeScan(start_key, end_key)) {
+        assert(start_key.len <= scan_key_len_max);
+        probe.chunks += 1;
+        if (probe.tree.lock.tryLock(probe.tree.io)) {
+            probe.tree.lock.unlock(probe.tree.io);
+        } else {
+            probe.chunks_started_locked += 1;
+        }
+        assert(probe.chunks_started_locked <= probe.chunks);
+        return probe.tree.rangeScan(start_key, end_key);
+    }
+};
+
+// Goal: a verifier scan gives the tree's lock up between chunks, so a queued writer gets in,
+// instead of holding it shared for the whole pass. Method: count 5,000 rows through a stand-in
+// tree that tries the writer's lock as each chunk starts; every try must succeed, and the pass
+// must take one chunk per scan_chunk_entries rows.
+test "verifier: a scan releases the tree lock between chunks" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const tree = db.categories_by_slug_path();
+    const row_count: u32 = 5000;
+    comptime assert(row_count > 4 * scan_chunk_entries);
+    comptime assert(row_count % scan_chunk_entries != 0);
+    for (0..row_count) |index| {
+        var key_buffer: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "k{d:0>6}", .{index});
+        try tree.insert(key, &codec.encodeU64(index + 1));
+    }
+
+    var probe = ChunkStartProbe{ .tree = tree };
+    var counter = EntryCounter{};
+    try scan_chunked(&probe, "", &counter);
+
+    try std.testing.expectEqual(@as(u64, row_count), counter.count);
+    const chunks_expected: u32 = @divFloor(row_count, scan_chunk_entries) + 1;
+    try std.testing.expectEqual(chunks_expected, probe.chunks);
+    try std.testing.expectEqual(@as(u32, 0), probe.chunks_started_locked);
+}
+
+// Goal: resuming after a chunk neither skips nor repeats a key, including keys that are
+// prefixes of one another. Method: count a tree whose keys straddle several chunk boundaries.
+test "verifier: chunked count resumes exactly after the last key" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const tree = db.categories_by_slug_path();
+    const prefix_keys = [_][]const u8{ "a", "a\x00", "a\x00\x00", "ab" };
+    for (prefix_keys) |key| try tree.insert(key, &codec.encodeU64(1));
+    for (0..3 * scan_chunk_entries) |index| {
+        var key_buffer: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "a{d:0>6}", .{index});
+        try tree.insert(key, &codec.encodeU64(index + 1));
+    }
+    const expected: u64 = prefix_keys.len + 3 * scan_chunk_entries;
+    try std.testing.expectEqual(expected, try count_tree(tree, ""));
+}
+
+// Goal: writes landing during a pass are never reported as drift on a consistent store. Method:
+// a writer thread creates links throughout twenty passes; no pass may report drift, and a quiet
+// pass after it stops must report none either.
+test "verifier: writes during a pass are not reported as drift" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const ops = @import("operations/operations.zig");
+    const top_text: ops.CategoryText = .{ .name = "Top", .slug = "top", .description = "" };
+    const top = try ops.create_category(db, 0, top_text);
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, DriftProbeWriter.run, .{ db, top, &stop });
+
+    var drifted_runs: u32 = 0;
+    for (0..20) |_| {
+        var state = VerifierState{};
+        run_once(db, &state) catch continue;
+        if (state.any_drift) drifted_runs += 1;
+    }
+    stop.store(true, .release);
+    thread.join();
+
+    var quiet = VerifierState{};
+    try run_once(db, &quiet);
+    try std.testing.expect(!quiet.any_drift);
+    try std.testing.expect(quiet.last_run_at > 0);
+    try std.testing.expectEqual(@as(u32, 0), drifted_runs);
+}
+
+const DriftProbeWriter = struct {
+    fn run(directory: *Directory, parent: u64, stop: *std.atomic.Value(bool)) void {
+        const ops = @import("operations/operations.zig");
+        assert(parent != 0);
+        var url_buffer: [64]u8 = undefined;
+        for (0..100_000) |index| {
+            if (stop.load(.acquire)) return;
+            const url = std.fmt.bufPrint(&url_buffer, "https://w{d}.example", .{index}) catch
+                unreachable;
+            assert(url.len > 0);
+            const text: ops.LinkText = .{ .url = url, .title = "x", .description = "" };
+            _ = ops.create_link(directory, parent, text) catch {};
+        }
+    }
+};

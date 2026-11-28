@@ -14,21 +14,27 @@ const HeaderV5 = zigstore.Engine(directory.schema_v5).Header;
 const HeaderV6 = zigstore.Engine(directory.schema_v6).Header;
 const HeaderV7 = zigstore.Engine(directory.schema_v7).Header;
 const HeaderV8 = zigstore.Engine(directory.schema_v8).Header;
+const HeaderV9 = zigstore.Engine(directory.schema_v9).Header;
 const Header = directory.Store.Header;
 const header_page_size = @sizeOf(Header);
 const page_invalid: u64 = std.math.maxInt(u32);
 const side_file = "store.dat.header-upgrade";
-const side_file_len = header_page_size + @sizeOf(u64);
+// The upgraded page, then the page it was made from, then a hash over both. The source page is
+// what lets a redo tell a page 0 it may overwrite from one something else has written since.
+const side_file_len = 2 * header_page_size + @sizeOf(u64);
+// A side file written before the source page was recorded: complete, but blind to page 0.
+const side_file_len_unbound = header_page_size + @sizeOf(u64);
 
 // One step per format bump; `upgrade_header` applies them in order from the version on disk.
 const steps = .{
     .{ HeaderV5, HeaderV6, directory.schema_v6.format_version },
     .{ HeaderV6, HeaderV7, directory.schema_v7.format_version },
     .{ HeaderV7, HeaderV8, directory.schema_v8.format_version },
-    .{ HeaderV8, Header, directory.schema.format_version },
+    .{ HeaderV8, HeaderV9, directory.schema_v9.format_version },
+    .{ HeaderV9, Header, directory.schema.format_version },
 };
 
-pub const UpgradeError = error{CheckpointJournalPending};
+pub const UpgradeError = error{ CheckpointJournalPending, SideFileStale };
 
 pub fn upgrade_header(io: std.Io, data_dir: []const u8) !void {
     comptime {
@@ -75,6 +81,7 @@ pub fn upgrade_header(io: std.Io, data_dir: []const u8) !void {
         return UpgradeError.CheckpointJournalPending;
     }
 
+    const source = page;
     var version = found.format_version;
     inline for (steps) |step| {
         if (version + 1 == step[2]) {
@@ -84,8 +91,12 @@ pub fn upgrade_header(io: std.Io, data_dir: []const u8) !void {
     }
     assert(version == directory.schema.format_version);
     assert(version > found.format_version);
+    if (found.format_version < directory.format_version_status_counts) {
+        page = derived_counts_marked_stale(&page);
+    }
+    assert(!std.mem.eql(u8, &page, &source));
 
-    try write_side_file(io, data_directory, data_dir, &page);
+    try write_side_file(io, data_directory, data_dir, .{ .target = &page, .source = &source });
     try write_page0(io, store, &page);
     try remove_side_file(io, data_directory, data_dir);
     log.info(
@@ -120,6 +131,18 @@ fn upgraded(
     return std.mem.toBytes(new);
 }
 
+// A store from before format 10 has zeros where its categories now keep per-status subtree
+// counts. Marking its derived counts stale in the same page write that sets the new format
+// makes the first boot recount them once (`Directory.recover`); the mark stays on disk until a
+// checkpoint after the recount clears it, so a crash during the recount only repeats it.
+fn derived_counts_marked_stale(page: *const [header_page_size]u8) [header_page_size]u8 {
+    var header = std.mem.bytesToValue(Header, page);
+    assert(header.format_version == directory.format_version_status_counts);
+    assert(header.magic == directory.schema.magic);
+    header.derived_counts_version = directory.derived_counts_version_stale;
+    return std.mem.toBytes(header);
+}
+
 fn redo_side_file(
     io: std.Io,
     data_directory: std.Io.Dir,
@@ -131,35 +154,83 @@ fn redo_side_file(
         else => return err,
     };
     var buffer: [side_file_len]u8 = undefined;
-    const bytes_read = side.readPositionalAll(io, &buffer, 0) catch 0;
+    // After a crash mid write_page0 the side file is the only good copy of page 0, so a read
+    // error stops the boot with the file kept instead of passing for an incomplete file.
+    const bytes_read = side.readPositionalAll(io, &buffer, 0) catch |err| {
+        side.close(io);
+        log.warn("{s} is unreadable: {}; store.dat is left as it is", .{ side_file, err });
+        return err;
+    };
     side.close(io);
 
-    var complete = false;
-    if (bytes_read == side_file_len) {
-        const page_hash = std.mem.readInt(u64, buffer[header_page_size..][0..8], .little);
-        complete = page_hash == std.hash.Wyhash.hash(0, buffer[0..header_page_size]);
-    }
-    if (complete) {
-        try write_page0(io, store, buffer[0..header_page_size]);
-        log.info("store.dat header upgrade redone from {s}", .{side_file});
-    } else {
+    if (!hash_matches(buffer[0..bytes_read], side_file_len)) {
+        if (hash_matches(buffer[0..bytes_read], side_file_len_unbound)) {
+            log.warn("{s} does not record its source page; store.dat is left as it is", .{
+                side_file,
+            });
+            return UpgradeError.SideFileStale;
+        }
         log.warn("discarded an incomplete {s}; store.dat page 0 was never touched", .{side_file});
+        try remove_side_file(io, data_directory, data_dir);
+        return false;
     }
+
+    const target = buffer[0..header_page_size];
+    const source = buffer[header_page_size..][0..header_page_size];
+    var page0: [header_page_size]u8 = undefined;
+    const page0_len = try store.readPositionalAll(io, &page0, 0);
+    if (page0_len < header_page_size or !page_is_mix_of(&page0, source, target)) {
+        log.warn("{s} was made from another page 0; store.dat is left as it is", .{side_file});
+        return UpgradeError.SideFileStale;
+    }
+    try write_page0(io, store, target);
+    log.info("store.dat header upgrade redone from {s}", .{side_file});
     try remove_side_file(io, data_directory, data_dir);
-    return complete;
+    return true;
 }
+
+fn hash_matches(bytes: []const u8, len: usize) bool {
+    assert(len > @sizeOf(u64));
+    if (bytes.len != len) return false;
+    const covered = len - @sizeOf(u64);
+    assert(covered >= header_page_size);
+    const stored = std.mem.readInt(u64, bytes[covered..][0..8], .little);
+    return stored == std.hash.Wyhash.hash(0, bytes[0..covered]);
+}
+
+// Page 0 may be overwritten only while it is still the source, already the target, or a write
+// of the target torn part way over the source: every byte then matches one of the two. A page
+// 0 that something else rewrote since the side file was made holds bytes neither has.
+fn page_is_mix_of(
+    page0: *const [header_page_size]u8,
+    source: *const [header_page_size]u8,
+    target: *const [header_page_size]u8,
+) bool {
+    for (page0, source, target) |byte, source_byte, target_byte| {
+        if (byte != source_byte and byte != target_byte) return false;
+    }
+    return true;
+}
+
+const SidePages = struct {
+    target: *const [header_page_size]u8,
+    source: *const [header_page_size]u8,
+};
 
 fn write_side_file(
     io: std.Io,
     data_directory: std.Io.Dir,
     data_dir: []const u8,
-    page: *const [header_page_size]u8,
+    pages: SidePages,
 ) !void {
+    assert(!std.mem.eql(u8, pages.target, pages.source));
     var buffer: [side_file_len]u8 = undefined;
-    @memcpy(buffer[0..header_page_size], page);
-    const page_hash = std.hash.Wyhash.hash(0, page);
-    std.mem.writeInt(u64, buffer[header_page_size..][0..8], page_hash, .little);
-    assert(std.mem.readInt(u64, buffer[header_page_size..][0..8], .little) == page_hash);
+    @memcpy(buffer[0..header_page_size], pages.target);
+    @memcpy(buffer[header_page_size..][0..header_page_size], pages.source);
+    const covered = side_file_len - @sizeOf(u64);
+    const pages_hash = std.hash.Wyhash.hash(0, buffer[0..covered]);
+    std.mem.writeInt(u64, buffer[covered..][0..8], pages_hash, .little);
+    assert(hash_matches(&buffer, side_file_len));
 
     const side = try data_directory.createFile(io, side_file, .{ .truncate = true });
     defer side.close(io);
@@ -229,12 +300,17 @@ fn write_page(
     try file.writePositionalAll(io, page, 0);
 }
 
-fn read_header(io: std.Io, data_directory: std.Io.Dir) !Header {
+fn read_page0(io: std.Io, data_directory: std.Io.Dir) ![header_page_size]u8 {
     const file = try data_directory.openFile(io, "store.dat", .{});
     defer file.close(io);
     var page0: [header_page_size]u8 = undefined;
     const bytes_read = try file.readPositionalAll(io, &page0, 0);
     assert(bytes_read == header_page_size);
+    return page0;
+}
+
+fn read_header(io: std.Io, data_directory: std.Io.Dir) !Header {
+    const page0 = try read_page0(io, data_directory);
     return std.mem.bytesToValue(Header, &page0);
 }
 
@@ -262,7 +338,11 @@ fn expect_carried_over(v5: *const HeaderV5, upgraded_header: *const Header) !voi
     );
     try testing.expectEqual(v5.next_link_id, upgraded_header.next_link_id);
     try testing.expectEqual(v5.links_approved, upgraded_header.links_approved);
-    try testing.expectEqual(v5.derived_counts_version, upgraded_header.derived_counts_version);
+    try testing.expect(v5.derived_counts_version != directory.derived_counts_version_stale);
+    try testing.expectEqual(
+        directory.derived_counts_version_stale,
+        upgraded_header.derived_counts_version,
+    );
     try testing.expectEqual(page_invalid, upgraded_header.link_vectors_root);
     try testing.expectEqual(@as(u64, 0), upgraded_header.link_vectors_count);
     try testing.expectEqual(@as(u64, 0), upgraded_header.embedding_model);
@@ -378,6 +458,40 @@ test "header upgrade: v8 keeps everything" {
     try testing.expectEqual(@as(u64, 0xB6E5), header.embedding_model);
 }
 
+// Goal: a v9 page 0 keeps every root and counter and has its derived counts marked stale,
+// because format 10 gives the category records per-status counts a v9 store never kept.
+// Method: write a checkpointed v9 header, upgrade, read it back; upgrade again, and expect the
+// page unchanged, so a boot after a crash cannot lose the mark it has not yet acted on.
+test "header upgrade: v9 marks derived counts stale and keeps everything else" {
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tmp_path(&scratch, &path_buffer);
+
+    var v9 = std.mem.zeroes(HeaderV9);
+    v9.magic = directory.schema_v9.magic;
+    v9.format_version = directory.schema_v9.format_version;
+    v9.seq = 41;
+    v9.categories_by_id_root = 7;
+    v9.categories_by_id_count = 59_218;
+    v9.links_approved = 92_001;
+    v9.derived_counts_version = 2 + 41;
+    try write_page(testing.io, scratch.dir, &std.mem.toBytes(v9));
+
+    try upgrade_header(testing.io, path);
+    const header = try read_header(testing.io, scratch.dir);
+    try testing.expectEqual(directory.schema.format_version, header.format_version);
+    try testing.expectEqual(directory.derived_counts_version_stale, header.derived_counts_version);
+    try testing.expectEqual(@as(u64, 41), header.seq);
+    try testing.expectEqual(@as(u64, 7), header.categories_by_id_root);
+    try testing.expectEqual(@as(u64, 59_218), header.categories_by_id_count);
+    try testing.expectEqual(@as(u64, 92_001), header.links_approved);
+
+    const page_before = try read_page0(testing.io, scratch.dir);
+    try upgrade_header(testing.io, path);
+    try testing.expectEqualSlices(u8, &page_before, &try read_page0(testing.io, scratch.dir));
+}
+
 // Goal: the upgrade is idempotent. Method: upgrade a v5 store twice and compare the result once.
 test "header upgrade: running it again on a current store changes nothing" {
     var scratch = testing.tmpDir(.{});
@@ -406,8 +520,16 @@ test "header upgrade: a complete side file left by a crash is redone over a torn
     const v6_page = upgraded(HeaderV5, HeaderV6, directory.schema_v6.format_version, &v5_page);
     const v7_page = upgraded(HeaderV6, HeaderV7, directory.schema_v7.format_version, &v6_page);
     const v8_page = upgraded(HeaderV7, HeaderV8, directory.schema_v8.format_version, &v7_page);
-    const current_page = upgraded(HeaderV8, Header, directory.schema.format_version, &v8_page);
-    try write_side_file(testing.io, scratch.dir, path, &current_page);
+    const v9_page = upgraded(HeaderV8, HeaderV9, directory.schema_v9.format_version, &v8_page);
+    const current_page = derived_counts_marked_stale(
+        &upgraded(HeaderV9, Header, directory.schema.format_version, &v9_page),
+    );
+    try write_side_file(
+        testing.io,
+        scratch.dir,
+        path,
+        .{ .target = &current_page, .source = &v5_page },
+    );
     {
         const file = try scratch.dir.openFile(testing.io, "store.dat", .{ .mode = .read_write });
         defer file.close(testing.io);
@@ -420,6 +542,64 @@ test "header upgrade: a complete side file left by a crash is redone over a torn
     const header = try read_header(testing.io, scratch.dir);
     try expect_carried_over(&v5, &header);
     try testing.expectError(error.FileNotFound, scratch.dir.access(testing.io, side_file, .{}));
+}
+
+// Goal: a complete side file is never redone over a page 0 that was rewritten after it was
+// made, as an older binary or a restored store.dat would leave it. Method: a side file made from
+// a v8 page at seq 77, then a newer v8 page 0 at seq 99, then upgrade: refused, page 0 kept.
+test "header upgrade: a side file made from another page 0 is refused" {
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tmp_path(&scratch, &path_buffer);
+
+    var v8 = std.mem.zeroes(HeaderV8);
+    v8.magic = directory.schema_v8.magic;
+    v8.format_version = directory.schema_v8.format_version;
+    v8.page_size = header_page_size;
+    v8.seq = 77;
+    v8.links_by_id_root = 3;
+    v8.page_count = 10;
+    const v8_page = std.mem.toBytes(v8);
+    const v9_page = upgraded(HeaderV8, HeaderV9, directory.schema_v9.format_version, &v8_page);
+    const side_page = upgraded(HeaderV9, Header, directory.schema.format_version, &v9_page);
+    const pages: SidePages = .{ .target = &side_page, .source = &v8_page };
+    try write_side_file(testing.io, scratch.dir, path, pages);
+
+    var later = v8;
+    later.seq = 99;
+    later.links_by_id_root = 42;
+    later.page_count = 60;
+    try write_page(testing.io, scratch.dir, &std.mem.toBytes(later));
+
+    try testing.expectError(UpgradeError.SideFileStale, upgrade_header(testing.io, path));
+    const page0 = std.mem.bytesToValue(HeaderV8, &try read_page0(testing.io, scratch.dir));
+    try testing.expectEqual(@as(u64, 99), page0.seq);
+    try testing.expectEqual(@as(u64, 42), page0.links_by_id_root);
+    try scratch.dir.access(testing.io, side_file, .{});
+}
+
+// Goal: a complete side file in the old layout, which cannot show its source page, is kept and
+// stops the upgrade instead of being redone blind. Method: write page plus hash, upgrade.
+test "header upgrade: a side file without its source page is refused" {
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tmp_path(&scratch, &path_buffer);
+
+    const v5 = try write_v5_store(testing.io, scratch.dir);
+    var unbound: [side_file_len_unbound]u8 = undefined;
+    @memcpy(unbound[0..header_page_size], &std.mem.toBytes(v5));
+    const page_hash = std.hash.Wyhash.hash(0, unbound[0..header_page_size]);
+    std.mem.writeInt(u64, unbound[header_page_size..][0..8], page_hash, .little);
+    {
+        const side = try scratch.dir.createFile(testing.io, side_file, .{});
+        defer side.close(testing.io);
+        try side.writePositionalAll(testing.io, &unbound, 0);
+    }
+
+    try testing.expectError(UpgradeError.SideFileStale, upgrade_header(testing.io, path));
+    try scratch.dir.access(testing.io, side_file, .{});
 }
 
 // Goal: a short side file is ignored. Method: leave 100 junk bytes as the side file, upgrade.
@@ -440,6 +620,27 @@ test "header upgrade: a truncated side file is discarded and the upgrade runs fr
 
     const header = try read_header(testing.io, scratch.dir);
     try expect_carried_over(&v5, &header);
+}
+
+// Goal: a side file that cannot be read stops the upgrade and is kept, because it may be the
+// only good copy of page 0. Method: make the side file a link to a directory, which opens but
+// fails every read, and upgrade.
+test "header upgrade: an unreadable side file stops the upgrade and is kept" {
+    var scratch = testing.tmpDir(.{});
+    defer scratch.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tmp_path(&scratch, &path_buffer);
+
+    _ = try write_v5_store(testing.io, scratch.dir);
+    try scratch.dir.createDir(testing.io, "unreadable", .default_dir);
+    try scratch.dir.symLink(testing.io, "unreadable", side_file, .{ .is_directory = true });
+
+    try testing.expectError(error.IsDir, upgrade_header(testing.io, path));
+    try scratch.dir.access(testing.io, side_file, .{});
+    try testing.expectEqual(
+        directory.schema_v5.format_version,
+        (try read_header(testing.io, scratch.dir)).format_version,
+    );
 }
 
 // Goal: a pending checkpoint journal blocks the upgrade. Method: write a journal, expect the

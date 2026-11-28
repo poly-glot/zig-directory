@@ -16,6 +16,8 @@ const entities = @import("entities.zig");
 const adjacency = @import("adjacency.zig");
 const derived_snapshot = @import("../derived_snapshot.zig");
 
+const log = std.log.scoped(.facts);
+
 pub const StringId = u32;
 pub const IdSet = std.AutoHashMapUnmanaged(u64, void);
 
@@ -42,6 +44,42 @@ const neighbour_category_links_max: usize = 512;
 // A name carried by more categories than this is a filing template ("Business and Economy"
 // sits under every region), not a subject, so its namesakes are not offered as related.
 const namesakes_max: usize = 24;
+
+// One question visits at most this many links and keeps at most this many groups (and as many
+// group-and-site pairs) before it is refused as too broad, never answered in part. A visit
+// costs 60 to 80 ns (measured on a 3M-link index), so the visit bound holds a request to about
+// 0.3 s; it sits above the 3.04M links production holds, and a question that would scan more
+// than it is told to narrow itself. A group costs about 160 bytes of tallies, pairs and sorted
+// groups (2^17 of them took 20 MiB), so the group bound is the request's scratch slab over
+// group_slab_bytes, which leaves headroom for the rest of the question: 2^17 groups in the
+// default 32 MiB slab, four times as many in a 128 MiB one.
+pub const links_visited_max: u64 = 1 << 22;
+pub const group_slab_bytes: u32 = 256;
+pub const groups_max: u32 = groups_max_for(32 * 1024 * 1024);
+
+comptime {
+    assert(groups_max == 1 << 17);
+}
+
+pub fn groups_max_for(slab_bytes: u32) u32 {
+    assert(slab_bytes >= group_slab_bytes);
+    return @divFloor(slab_bytes, group_slab_bytes);
+}
+
+/// Past three quarters of links_visited_max an unscoped count is near the point where every
+/// such question answers too broad, which the operator should hear before it happens.
+pub fn visited_headroom_low(link_count: u64) bool {
+    return link_count > @divExact(links_visited_max, 4) * 3;
+}
+
+fn warn_if_visited_headroom_low(link_count: u64) void {
+    if (!visited_headroom_low(link_count)) return;
+    log.warn(
+        "facts index holds {d} links, past three quarters of links_visited_max {d}: " ++
+            "raise the bound before unscoped questions answer too broad",
+        .{ link_count, links_visited_max },
+    );
+}
 
 const parents_that_file_things_by_name = std.StaticStringMap(void).initComptime(.{
     .{"Breeds"}, .{"Kitchen_and_Dining"}, .{"Poultry"},
@@ -133,6 +171,8 @@ pub const Query = struct {
     group_limit: u32 = 10,
     page_limit: u32 = 20,
     after_id: u64 = 0,
+    // The caller sets this from its scratch slab with groups_max_for.
+    groups_max: u32 = groups_max,
 };
 
 pub const Group = struct {
@@ -183,6 +223,13 @@ pub const Answer = struct {
     page: []const PageRow,
     next_after_id: u64,
 };
+
+/// A country code read from a snapshot is either none or assigned; `known` asserts as much of
+/// every code it is handed, so anything else is refused at restore.
+fn country_or_none(code: countries.Code) bool {
+    if (std.mem.eql(u8, &code, &countries.none)) return true;
+    return countries.is_assigned(code);
+}
 
 fn known(code: countries.Code) bool {
     if (code[0] != 0) assert(code[1] != 0);
@@ -432,6 +479,7 @@ pub const FactsIndex = struct {
         self.touched_links.clearAndFree(allocator);
         self.touched_categories.clearAndFree(allocator);
         self.touched_entities.clearAndFree(allocator);
+        warn_if_visited_headroom_low(self.links.count());
         self.ready.store(true, .release);
     }
 
@@ -561,6 +609,7 @@ pub const FactsIndex = struct {
         try self.snapshot_restore_links(allocator, payload);
         try self.snapshot_restore_entities(allocator, payload);
         self.views_stale = true;
+        warn_if_visited_headroom_low(self.links.count());
     }
 
     pub fn snapshot_discard(self: *FactsIndex, allocator: std.mem.Allocator) void {
@@ -606,6 +655,7 @@ pub const FactsIndex = struct {
             if (record.id == 0) return error.SnapshotCorrupt;
             if (record.name >= strings_total) return error.SnapshotCorrupt;
             if (record.files_things_by_name > 1) return error.SnapshotCorrupt;
+            if (!country_or_none(record.named_country)) return error.SnapshotCorrupt;
             if (self.categories.contains(record.id)) return error.SnapshotCorrupt;
             self.categories.putAssumeCapacity(record.id, .{
                 .parent_id = record.parent_id,
@@ -639,6 +689,7 @@ pub const FactsIndex = struct {
             if (record.site >= strings_total) return error.SnapshotCorrupt;
             if (record.hosted > 1) return error.SnapshotCorrupt;
             if (record.subdomain > record.hosted) return error.SnapshotCorrupt;
+            if (!country_or_none(record.cctld)) return error.SnapshotCorrupt;
             if (self.links.contains(record.id)) return error.SnapshotCorrupt;
             self.links.putAssumeCapacity(record.id, .{
                 .category_id = record.category_id,
@@ -680,6 +731,9 @@ pub const FactsIndex = struct {
                 .org_count = record.org_count,
             };
             const country_count: usize = record.country_count;
+            for (record.countries[0..country_count]) |code| {
+                if (!country_or_none(code)) return error.SnapshotCorrupt;
+            }
             @memcpy(fact.countries[0..country_count], record.countries[0..country_count]);
             @memcpy(fact.name_ids[0..names], record.name_ids[0..names]);
             self.entities.putAssumeCapacity(record.link_id, fact);
@@ -1175,13 +1229,25 @@ pub const FactsIndex = struct {
         arena: std.mem.Allocator,
         request: *const Query,
     ) !Answer {
+        var evaluator = try self.evaluator_for(arena, request);
+        const answer = try evaluator.run();
+        assert(answer.page.len <= request.page_limit);
+        assert(answer.groups.len <= request.group_limit);
+        return answer;
+    }
+
+    fn evaluator_for(
+        self: *const FactsIndex,
+        arena: std.mem.Allocator,
+        request: *const Query,
+    ) !Evaluator {
         assert(self.current());
         const scopes = try self.scopes_for(arena, request);
         var name: ?StringId = null;
         if (request.entity_name.len > 0) name = self.name_id(request.entity_name);
 
         const string_count = self.strings.values.items.len;
-        var evaluator: Evaluator = .{
+        const evaluator: Evaluator = .{
             .index = self,
             .arena = arena,
             .query = request,
@@ -1190,11 +1256,17 @@ pub const FactsIndex = struct {
             .site_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
             .host_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
             .domain_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
+            .category_orders = try std.DynamicBitSetUnmanaged.initEmpty(
+                arena,
+                self.categories_by_order.len,
+            ),
+            .page_ids = try arena.alloc(u64, request.page_limit),
+            .groups_limit = request.groups_max,
         };
-        const answer = try evaluator.run();
-        assert(answer.page.len <= request.page_limit);
-        assert(answer.groups.len <= request.group_limit);
-        return answer;
+        assert(evaluator.page_ids.len == request.page_limit);
+        assert(evaluator.groups_limit > 0);
+        assert(evaluator.visited_max == links_visited_max);
+        return evaluator;
     }
 
     /// The category subtrees a query is confined to, disjoint and in DFS order: the category
@@ -1739,8 +1811,18 @@ const Evaluator = struct {
     site_set: std.DynamicBitSetUnmanaged,
     host_set: std.DynamicBitSetUnmanaged,
     domain_set: std.DynamicBitSetUnmanaged,
-    category_set: IdSet = .empty,
-    matches: std.ArrayListUnmanaged(u64) = .empty,
+    // Categories by their DFS order; one with no view (not in the tree) is kept by id.
+    category_orders: std.DynamicBitSetUnmanaged,
+    categories_unplaced: IdSet = .empty,
+    // The page: the smallest matching ids above the cursor, ascending, at most page_limit of
+    // them, so a broad question never holds a list of every match.
+    page_ids: []u64,
+    page_len: u32 = 0,
+    matches: u64 = 0,
+    matches_after_cursor: u64 = 0,
+    visited: u64 = 0,
+    visited_max: u64 = links_visited_max,
+    groups_limit: u32 = groups_max,
     tallies: std.AutoHashMapUnmanaged(u64, Tally) = .empty,
     group_sites: std.AutoHashMapUnmanaged(GroupSite, void) = .empty,
 
@@ -1758,21 +1840,20 @@ const Evaluator = struct {
                 try self.visit_dirty();
             },
         }
-        const matches = self.matches.items;
-        assert(matches.len <= self.index.links.count());
-        assert(self.site_set.count() <= matches.len);
-        assert(self.host_set.count() <= matches.len);
+        assert(self.matches <= self.visited);
+        assert(self.matches_after_cursor <= self.matches);
+        assert(self.site_set.count() <= self.matches);
+        assert(self.host_set.count() <= self.matches);
         assert(self.domain_set.count() <= self.host_set.count());
 
-        std.mem.sortUnstable(u64, matches, {}, std.sort.asc(u64));
-        const paged = try self.page(matches);
+        const paged = try self.page();
         assert(paged.rows.len <= self.query.page_limit);
         return .{
-            .total = matches.len,
+            .total = self.matches,
             .sites = self.site_set.count(),
             .hosts = self.host_set.count(),
             .domains = self.domain_set.count(),
-            .categories = self.category_set.count(),
+            .categories = self.category_orders.count() + self.categories_unplaced.count(),
             .groups = try self.top_groups(),
             .page = paged.rows,
             .next_after_id = paged.next_after_id,
@@ -1876,13 +1957,48 @@ const Evaluator = struct {
 
     fn visit(self: *Evaluator, id: u64, fact: *const LinkFact) !void {
         assert(id != 0);
+        self.visited += 1;
+        if (self.visited > self.visited_max) return error.TooBroad;
         const ties = self.admit(id, fact) orelse return;
-        try self.matches.append(self.arena, id);
+        self.matches += 1;
+        self.offer_to_page(id);
         self.site_set.set(fact.site);
         self.host_set.set(fact.host);
         self.domain_set.set(fact.domain);
-        try self.category_set.put(self.arena, fact.category_id, {});
+        try self.count_category(fact.category_id);
         try self.tally(id, fact, &ties);
+    }
+
+    /// Each link is visited once, so the ids offered are distinct.
+    fn offer_to_page(self: *Evaluator, id: u64) void {
+        const limit = self.page_ids.len;
+        assert(self.page_len <= limit);
+        if (id <= self.query.after_id) return;
+        self.matches_after_cursor += 1;
+        if (self.page_len == limit) {
+            if (limit == 0) return;
+            if (id > self.page_ids[limit - 1]) return;
+            self.page_len -= 1;
+        }
+
+        var slot: usize = self.page_len;
+        while (slot > 0) : (slot -= 1) {
+            assert(self.page_ids[slot - 1] != id);
+            if (self.page_ids[slot - 1] < id) break;
+            self.page_ids[slot] = self.page_ids[slot - 1];
+        }
+        self.page_ids[slot] = id;
+        self.page_len += 1;
+        assert(self.page_len <= limit);
+    }
+
+    fn count_category(self: *Evaluator, category_id: u64) !void {
+        const placed = self.index.category_views.get(category_id) orelse {
+            try self.categories_unplaced.put(self.arena, category_id, {});
+            return;
+        };
+        assert(placed.order < self.category_orders.bit_length);
+        self.category_orders.set(placed.order);
     }
 
     fn admit(self: *Evaluator, id: u64, fact: *const LinkFact) ?Ties {
@@ -1968,9 +2084,11 @@ const Evaluator = struct {
         assert(site < self.index.strings.values.items.len);
         const slot = try self.tallies.getOrPut(self.arena, key);
         if (!slot.found_existing) slot.value_ptr.* = .{};
+        if (self.tallies.count() > self.groups_limit) return error.TooBroad;
         slot.value_ptr.links += 1;
 
         const pair = try self.group_sites.getOrPut(self.arena, .{ .key = key, .site = site });
+        if (self.group_sites.count() > self.groups_limit) return error.TooBroad;
         if (!pair.found_existing) slot.value_ptr.sites += 1;
         assert(slot.value_ptr.sites <= slot.value_ptr.links);
     }
@@ -1985,7 +2103,7 @@ const Evaluator = struct {
         while (tallies.next()) |entry| : (visited += 1) {
             assert(visited < self.tallies.count());
             groups.appendAssumeCapacity(.{
-                .label = try self.label(entry.key_ptr.*),
+                .label = try self.label_borrowed(entry.key_ptr.*),
                 .category_id = if (self.query.group_by == .branch) entry.key_ptr.* else 0,
                 .links = entry.value_ptr.links,
                 .sites = entry.value_ptr.sites,
@@ -2000,15 +2118,18 @@ const Evaluator = struct {
         }
         const top = groups.items[0..@min(groups.items.len, self.query.group_limit)];
         assert(top.len <= self.query.group_limit);
+        for (top) |*group| group.label = try self.arena.dupe(u8, group.label);
         return top;
     }
 
-    fn label(self: *Evaluator, key: u64) ![]const u8 {
+    /// The label as the index holds it, valid while the index lock is held: `top_groups` dupes
+    /// only the groups it keeps.
+    fn label_borrowed(self: *Evaluator, key: u64) ![]const u8 {
         switch (self.query.group_by) {
             .none, .branch => return "",
             .domain, .site, .host, .person, .org => {
                 assert(key <= std.math.maxInt(StringId));
-                return self.arena.dupe(u8, self.index.strings.get(@intCast(key)));
+                return self.index.strings.get(@intCast(key));
             },
             .religion => {
                 assert(key < @typeInfo(entities.Religion).@"enum".fields.len);
@@ -2024,14 +2145,14 @@ const Evaluator = struct {
 
     const Page = struct { rows: []const PageRow, next_after_id: u64 };
 
-    fn page(self: *Evaluator, sorted_ids: []const u64) !Page {
-        assert(std.sort.isSorted(u64, sorted_ids, {}, std.sort.asc(u64)));
-        const start = std.sort.upperBound(u64, sorted_ids, self.query.after_id, order_u64);
-        const end = @min(sorted_ids.len, start + self.query.page_limit);
-        assert(start <= end);
+    fn page(self: *Evaluator) !Page {
+        const ids = self.page_ids[0..self.page_len];
+        assert(std.sort.isSorted(u64, ids, {}, std.sort.asc(u64)));
+        assert(ids.len <= self.matches_after_cursor);
+        if (ids.len > 0) assert(ids[0] > self.query.after_id);
 
-        const rows = try self.arena.alloc(PageRow, end - start);
-        for (sorted_ids[start..end], rows) |id, *row| {
+        const rows = try self.arena.alloc(PageRow, ids.len);
+        for (ids, rows) |id, *row| {
             const fact = self.index.links.get(id).?;
             const entity = self.index.entities.getPtr(id);
             row.* = .{
@@ -2047,18 +2168,14 @@ const Evaluator = struct {
             };
         }
         assert(rows.len <= self.query.page_limit);
-        const more = end < sorted_ids.len;
+        const more = self.matches_after_cursor > ids.len;
         if (more) assert(rows.len == self.query.page_limit);
         return .{
             .rows = rows,
-            .next_after_id = if (more and end > start) sorted_ids[end - 1] else 0,
+            .next_after_id = if (more and ids.len > 0) ids[ids.len - 1] else 0,
         };
     }
 };
-
-fn order_u64(context: u64, item: u64) std.math.Order {
-    return std.math.order(context, item);
-}
 
 fn country_key(code: countries.Code) u64 {
     assert(known(code));
@@ -2254,22 +2371,14 @@ test "subtree_link_ids counts a link once under nested and repeated roots" {
 }
 
 /// What visiting every link answers for `request`: the oracle each driver must agree with.
+/// The request's page must hold every match.
 fn scanned(index: *const FactsIndex, arena: std.mem.Allocator, request: *const Query) ![]u64 {
     assert(index.current());
-    const string_count = index.strings.values.items.len;
-    var evaluator: Evaluator = .{
-        .index = index,
-        .arena = arena,
-        .query = request,
-        .scopes = try index.scopes_for(arena, request),
-        .name = if (request.entity_name.len > 0) index.name_id(request.entity_name) else null,
-        .site_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
-        .host_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
-        .domain_set = try std.DynamicBitSetUnmanaged.initEmpty(arena, string_count),
-    };
+    assert(request.after_id == 0);
+    var evaluator = try index.evaluator_for(arena, request);
     try evaluator.visit_every_link();
-    std.mem.sortUnstable(u64, evaluator.matches.items, {}, std.sort.asc(u64));
-    return evaluator.matches.items;
+    assert(evaluator.page_len == evaluator.matches);
+    return evaluator.page_ids[0..evaluator.page_len];
 }
 
 fn expect_drivers_agree_with_a_scan(
@@ -2734,6 +2843,37 @@ test "snapshot restore refuses a truncated section and a row with a foreign stri
     try testing.expectEqual(@as(usize, 0), from_foreign.links.count());
 }
 
+// Goal: a snapshot row whose country code is neither none nor assigned is refused at restore,
+// not left for the first query to trip over. Method: write one link, set its ccTLD to a half
+// code, restore.
+test "snapshot restore refuses a country code that is not assigned" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    index.begin_load(io);
+    const one = test_link(.{ .id = 1, .category_id = 10 }, "http://one.example.pk/");
+    try index.load_link(io, allocator, &one);
+    index.finish_load(io, allocator);
+
+    var buffer: [4 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    var payload = derived_snapshot.SectionWriter.init(&writer);
+    try index.snapshot_write(io, &payload);
+    const written = buffer[0..writer.end];
+
+    // The strings hold the host in lower case, so the only upper-case `PK` is the link's code.
+    const cctld_offset = std.mem.lastIndexOf(u8, written, "PK").?;
+    written[cctld_offset + 1] = 0;
+    var reader = std.Io.Reader.fixed(written);
+    var section = derived_snapshot.SectionReader.init(&reader);
+    var restored: FactsIndex = .{};
+    defer restored.deinit(allocator);
+    try testing.expectError(error.SnapshotCorrupt, restored.snapshot_restore(allocator, &section));
+    restored.snapshot_discard(allocator);
+}
+
 // While loading, apply a newer insert and a delete before the loader hands over its older reads
 // of the same links: the apply-path state must win and the touched set must be cleared after.
 test "a link the apply path touches while loading keeps that state, not the loader's read" {
@@ -3021,6 +3161,111 @@ test "a query counts links, distinct sites and hosts, groups by site, and pages 
     try testing.expectEqual(@as(u64, 12), second.page[0].link_id);
     try testing.expectEqual(@as(u64, 13), second.page[1].link_id);
     try testing.expectEqual(@as(u64, 0), second.next_after_id);
+}
+
+// Goal: a broad count holds its page and its counters, never a list of every match, so its
+// memory does not grow with the matches. Method: 2,000 links counted with a 12 KiB allocator,
+// less than their ids alone take, then the second page from the cursor.
+test "a broad count keeps only its page, not every match" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    try build_tree(&index, io, allocator, &.{
+        test_category(.{ .id = 1, .parent_id = 0 }, "Top"),
+        test_category(.{ .id = 2, .parent_id = 1 }, "Arts"),
+    });
+    const link_count: u64 = 2000;
+    for (1..link_count + 1) |n| {
+        var url_buffer: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "http://site.example/{d}", .{n});
+        const link = test_link(.{ .id = @intCast(n), .category_id = 2 }, url);
+        try index.observe(io, allocator, &inserted(link));
+    }
+
+    var slab: [12 * 1024]u8 = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(&slab);
+    const first = try index.query(io, allocator, fixed.allocator(), .{ .status = null });
+    try testing.expectEqual(link_count, first.total);
+    try testing.expectEqual(@as(u64, 1), first.categories);
+    try testing.expectEqual(@as(usize, 20), first.page.len);
+    for (first.page, 1..) |row, id| try testing.expectEqual(@as(u64, id), row.link_id);
+    try testing.expectEqual(@as(u64, 20), first.next_after_id);
+
+    fixed.reset();
+    const request: Query = .{ .status = null, .after_id = link_count - 5 };
+    const last = try index.query(io, allocator, fixed.allocator(), request);
+    try testing.expectEqual(link_count, last.total);
+    try testing.expectEqual(@as(usize, 5), last.page.len);
+    try testing.expectEqual(link_count - 4, last.page[0].link_id);
+    try testing.expectEqual(@as(u64, 0), last.next_after_id);
+}
+
+// Goal: a question that would visit more links, or keep more groups, than one request may is
+// refused as too broad rather than answered in part. Method: three links on three hosts,
+// evaluated with a visit budget of two, then grouped by host with a group budget of two.
+test "a question over its visit or group budget is refused as too broad" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    try build_tree(&index, io, allocator, &.{
+        test_category(.{ .id = 1, .parent_id = 0 }, "Top"),
+        test_category(.{ .id = 2, .parent_id = 1 }, "Arts"),
+    });
+    const urls = [_][]const u8{ "http://a.example/", "http://b.example/", "http://c.example/" };
+    for (urls, 10..) |url, id| {
+        const link = test_link(.{ .id = @intCast(id), .category_id = 2 }, url);
+        try index.observe(io, allocator, &inserted(link));
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const grouped: Query = .{ .status = null, .group_by = .host };
+    const whole = try index.query(io, allocator, arena, grouped);
+    try testing.expectEqual(@as(usize, 3), whole.groups.len);
+
+    var visiting = try index.evaluator_for(arena, &grouped);
+    visiting.visited_max = 2;
+    try testing.expectError(error.TooBroad, visiting.run());
+
+    var grouping = try index.evaluator_for(arena, &grouped);
+    grouping.groups_limit = 2;
+    try testing.expectError(error.TooBroad, grouping.run());
+}
+
+// Goal: the group bound follows the slab the caller reports, and the visit bound warns before
+// the store grows into it. Method: the same three hosts grouped with a query bound of two, the
+// bound for a 128 MiB slab, and the headroom test either side of three quarters.
+test "the group bound is the query's and the visit bound warns at three quarters" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var index: FactsIndex = .{};
+    defer index.deinit(allocator);
+
+    try build_tree(&index, io, allocator, &.{
+        test_category(.{ .id = 1, .parent_id = 0 }, "Top"),
+        test_category(.{ .id = 2, .parent_id = 1 }, "Arts"),
+    });
+    const urls = [_][]const u8{ "http://a.example/", "http://b.example/", "http://c.example/" };
+    for (urls, 10..) |url, id| {
+        const link = test_link(.{ .id = @intCast(id), .category_id = 2 }, url);
+        try index.observe(io, allocator, &inserted(link));
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const narrow: Query = .{ .status = null, .group_by = .host, .groups_max = 2 };
+    try testing.expectError(error.TooBroad, index.query(io, allocator, arena, narrow));
+
+    try testing.expectEqual(4 * groups_max, groups_max_for(128 * 1024 * 1024));
+    const three_quarters = @divExact(links_visited_max, 4) * 3;
+    try testing.expect(!visited_headroom_low(three_quarters));
+    try testing.expect(visited_headroom_low(three_quarters + 1));
 }
 
 // Tie Pakistan through a ccTLD on one link and through a category on two others, one of which

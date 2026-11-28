@@ -78,16 +78,22 @@ pub const Model = struct {
         const book_bytes = bytes[header_bytes + centroid_floats * 4 ..][0 .. book_floats * 4];
         try read_floats(centroid_bytes, @as(*[centroid_floats]f32, @ptrCast(self.centroids)));
         try read_floats(book_bytes, @as(*[book_floats]f32, @ptrCast(self.books)));
-        self.hash = std.hash.Fnv1a_64.hash(bytes);
-        // A stored link vector carries `model_hash = 0` when no model coded it, and its codes
-        // are reused only when that hash matches the loaded model, so a model must never hash
-        // to zero.
+        self.hash = try nonzero_model_hash(std.hash.Fnv1a_64.hash(bytes));
         assert(self.hash != 0);
         self.compute_book_norms();
         return self;
     }
 
+    /// A stored link vector carries `model_hash = 0` when no model coded it, and its codes are
+    /// reused only when that hash matches the loaded model, so a model file that hashes to zero
+    /// is refused. The file is the operator's, so this is an error and not an assertion.
+    fn nonzero_model_hash(hash: u64) LoadError!u64 {
+        if (hash == 0) return LoadError.VectorModelValue;
+        return hash;
+    }
+
     pub fn deinit(self: *const Model, allocator: std.mem.Allocator) void {
+        assert(self.hash != 0);
         allocator.destroy(self.centroids);
         allocator.destroy(self.books);
         allocator.destroy(self.book_norms);
@@ -291,6 +297,14 @@ test "a synthetic model round-trips through the file parser and hashes its bytes
 
 // Hand the parser a short buffer, a zeroed header, a header with the wrong dimension count and
 // a valid header followed by a NaN float, and check each is refused with its own error.
+// Goal: a model file that hashes to zero is refused with an error, since a zero hash marks a
+// vector no model coded. Method: the check alone, for zero and for a non-zero hash; crafting a
+// file that hashes to zero is not practical.
+test "a model hash of zero is refused, not asserted" {
+    try std.testing.expectError(LoadError.VectorModelValue, Model.nonzero_model_hash(0));
+    try std.testing.expectEqual(@as(u64, 7), try Model.nonzero_model_hash(7));
+}
+
 test "the parser refuses a truncated file, a wrong magic, a wrong shape and a NaN float" {
     const bytes = try testing.allocator.alloc(u8, file_bytes);
     defer testing.allocator.free(bytes);

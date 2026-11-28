@@ -4,7 +4,9 @@
 //! 2026-10-28, those rebuilds read 21 GB from a block volume capped near 24 MB/s: fifteen
 //! minutes with search hanging. The file carries the checkpoint's WAL sequence and is restored
 //! only while the superblock still carries that sequence, so the WAL tail recovery replays
-//! through `apply` is exactly what the restored indexes are missing. Every section is a
+//! through `apply` is exactly what the restored indexes are missing. It also carries the
+//! superblock's link and category counts, because two different stores can stand at the same
+//! sequence (every bulk-loaded store boots at 0). Every section is a
 //! consistent cut taken under its index's shared lock; a stale, torn or foreign file is logged
 //! and the index in question loads by scanning, as it did before the snapshot existed.
 
@@ -19,7 +21,9 @@ const log = std.log.scoped(.derived_snapshot);
 pub const file_name = "derived.snap";
 const temporary_file_name = "derived.snap.tmp";
 const magic: [8]u8 = "DMOZSNAP".*;
-pub const format_version: u32 = 1;
+// Version 2 added the store's counts; a version 1 file carries zeros there, which an empty
+// store would match, so it is refused rather than read.
+pub const format_version: u32 = 2;
 
 // The file streams through this buffer in both directions; every record is far smaller, so it
 // bounds the syscall count without a large frame on the checkpoint worker's stack.
@@ -48,8 +52,10 @@ const Header = extern struct {
     store_format: u32,
     seq: u64,
     model_hash: u64,
+    links_by_id_count: u64,
+    categories_by_id_count: u64,
     section_count: u32,
-    reserved: [28]u8,
+    reserved: [12]u8,
 };
 
 const SectionHeader = extern struct {
@@ -233,6 +239,7 @@ fn write_file(directory: *Directory, file: std.Io.File, seq: u64, ready: Restore
     var file_writer = file.writer(io, &buffer);
     const writer = &file_writer.interface;
 
+    const binding = store_binding(directory);
     const header = Header{
         .magic = magic,
         .version = format_version,
@@ -240,6 +247,8 @@ fn write_file(directory: *Directory, file: std.Io.File, seq: u64, ready: Restore
         .seq = seq,
         .model_hash = directory.link_vector_index.codebooks.hash,
         .section_count = ready.count(),
+        .links_by_id_count = binding.links_by_id_count,
+        .categories_by_id_count = binding.categories_by_id_count,
         .reserved = @splat(0),
     };
     assert(header.section_count <= section_order.len);
@@ -339,9 +348,12 @@ fn read_file(directory: *Directory, file: std.Io.File, restored: *Restored) !voi
 
     var header: Header = undefined;
     try reader.readSliceAll(std.mem.asBytes(&header));
+    const binding = store_binding(directory);
     try check_header(&header, .{
         .seq = directory.store.header.seq,
         .store_format = Store.schema_def.format_version,
+        .links_by_id_count = binding.links_by_id_count,
+        .categories_by_id_count = binding.categories_by_id_count,
     });
     assert(header.section_count <= section_order.len);
 
@@ -351,12 +363,38 @@ fn read_file(directory: *Directory, file: std.Io.File, restored: *Restored) !voi
     }
 }
 
-const HeaderExpectation = struct { seq: u64, store_format: u32 };
+const HeaderExpectation = struct {
+    seq: u64,
+    store_format: u32,
+    links_by_id_count: u64,
+    categories_by_id_count: u64,
+};
+
+const StoreBinding = struct { links_by_id_count: u64, categories_by_id_count: u64 };
+
+// The counts the superblock carries, read under the lock the checkpoint writes them under. A
+// pressure flush between checkpoints can move them without moving the sequence, which makes a
+// later crash boot scan instead of restore: the safe direction.
+fn store_binding(directory: *Directory) StoreBinding {
+    const store = directory.store;
+    store.header_lock.lockUncancelable(directory.io);
+    defer store.header_lock.unlock(directory.io);
+    const binding = StoreBinding{
+        .links_by_id_count = store.header.links_by_id_count,
+        .categories_by_id_count = store.header.categories_by_id_count,
+    };
+    assert(binding.links_by_id_count == store.header.links_by_id_count);
+    return binding;
+}
 
 fn check_header(header: *const Header, expected: HeaderExpectation) !void {
     if (!std.mem.eql(u8, &header.magic, &magic)) return error.SnapshotForeign;
     if (header.version != format_version) return error.SnapshotForeign;
     if (header.store_format != expected.store_format) return error.SnapshotForeign;
+    if (header.links_by_id_count != expected.links_by_id_count) return error.SnapshotForeign;
+    if (header.categories_by_id_count != expected.categories_by_id_count) {
+        return error.SnapshotForeign;
+    }
     if (header.seq != expected.seq) return error.SnapshotStale;
     if (header.section_count > section_order.len) return error.SnapshotCorrupt;
     assert(header.version == format_version);
@@ -505,11 +543,15 @@ test "check_header accepts the current header and rejects each foreign or stale 
         .seq = 77,
         .model_hash = 1,
         .section_count = 4,
+        .links_by_id_count = 91_995,
+        .categories_by_id_count = 59_218,
         .reserved = @splat(0),
     };
     const expected: HeaderExpectation = .{
         .seq = 77,
         .store_format = Store.schema_def.format_version,
+        .links_by_id_count = 91_995,
+        .categories_by_id_count = 59_218,
     };
     try check_header(&valid, expected);
 
@@ -532,4 +574,48 @@ test "check_header accepts the current header and rejects each foreign or stale 
     var overfull = valid;
     overfull.section_count = 5;
     try testing.expectError(error.SnapshotCorrupt, check_header(&overfull, expected));
+
+    var other_links = valid;
+    other_links.links_by_id_count = 0;
+    try testing.expectError(error.SnapshotForeign, check_header(&other_links, expected));
+
+    var other_categories = valid;
+    other_categories.categories_by_id_count = 59_219;
+    try testing.expectError(error.SnapshotForeign, check_header(&other_categories, expected));
+}
+
+// Goal: a snapshot is never restored into a different store that happens to stand at the same
+// sequence. Method: build a store with a category and a link, load the facts index, checkpoint
+// and write the snapshot stamped with sequence 0; crash, delete the store and its WAL, and boot
+// the fresh empty store, which also stands at 0, in the same directory.
+test "derived snapshot from another store at the same sequence is not restored" {
+    const allocator = testing.allocator;
+    var temporary_directory = testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    const operations = @import("operations/operations.zig");
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_crash_test_instance();
+        try directory.recover();
+        const top_id = (try operations.resolve_slug_path(directory, "top")).?;
+        _ = try operations.create_link(
+            directory,
+            top_id,
+            .{ .url = "http://one.tripod.com/", .title = "One", .description = "" },
+        );
+        try operations.load_facts_index(directory);
+        _ = try directory.checkpoint();
+        try write(directory, 0);
+    }
+    for ([_][]const u8{ "store.dat", "wal.bin", "snapshot.meta" }) |name| {
+        temporary_directory.dir.deleteFile(testing.io, name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+    var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer directory.deinit_crash_test_instance();
+    try testing.expectEqual(@as(u64, 0), directory.store.header.seq);
+    try directory.recover();
+    try testing.expect(!directory.derived_restored.facts);
 }

@@ -124,7 +124,7 @@ pub fn get_link(db: *Directory, id: u64) !?schema.Link {
     };
     if (value.len != @sizeOf(schema.Link)) return OperationError.DatabaseCorrupted;
     const link = std.mem.bytesToValue(schema.Link, value[0..@sizeOf(schema.Link)]);
-    assert(link.id == id);
+    if (link.id != id) return OperationError.DatabaseCorrupted;
     return link;
 }
 
@@ -155,6 +155,13 @@ fn update_link_locked(
 
     const old_link = (try get_link(db, id)) orelse return OperationError.LinkNotFound;
     assert(old_link.id == id);
+    // The apply step hands the new url's hash entry to this link, so taking another link's url
+    // would unindex that link; a later delete of this one would then let a third copy in.
+    if (url) |new_url| {
+        if (!std.mem.eql(u8, new_url, old_link.url.slice())) {
+            if (try create_link_url_taken(db, new_url)) return OperationError.DuplicateUrl;
+        }
+    }
 
     var new_link = old_link;
     if (url) |new_url| new_link.url = codec.FixedString(64).fromSlice(new_url);
@@ -373,23 +380,49 @@ fn resolve_link_value(_: *Directory, value: []const u8) !?schema.Link {
     return std.mem.bytesToValue(schema.Link, value[0..@sizeOf(schema.Link)]);
 }
 
+// A page reads at most this many index rows. A filter that matches few rows, such as the
+// moderation queue's pending links, would otherwise walk the whole index in one request; past
+// the budget the page ends early with a cursor at the last row read, and the caller pages on
+// from there. A row costs about 2 us (the 92k store scanned in 146 to 177 ms), so a page costs
+// at most about 100 ms.
+pub const list_scan_rows_max: u32 = 50_000;
+
+/// Every index this pages (links_by_id, link_by_category, link_by_submitter) ends its key with
+/// the link id, which is where an early end puts the cursor.
 fn paginate_links(
     db: *Directory,
     iterator: anytype,
     page: *const shared.Page,
+    category_id: ?u64,
     buffer: []schema.Link,
     comptime resolve: anytype,
+    scan_rows_max: u32,
 ) !LinkPage {
+    assert(scan_rows_max > 0);
     const cursor_mode = page.after_id > 0;
     var count: u32 = 0;
     var skipped: u32 = 0;
+    var scanned: u32 = 0;
     var next_after_id: u64 = 0;
     var last_id: u64 = 0;
+    var last_scanned_id: u64 = 0;
     const max = @min(page.limit, @as(u32, @intCast(buffer.len)));
 
     defer iterator.deinit();
-    while (try iterator.next()) |entry| {
+    while (try iterator.next()) |entry| : (scanned += 1) {
+        if (scanned == scan_rows_max) {
+            // An offset cannot resume from a cursor, so one the budget cannot reach is refused.
+            if (!cursor_mode and skipped < page.offset) return error.OffsetTooLarge;
+            next_after_id = last_scanned_id;
+            break;
+        }
+        if (entry.key.len < 8) return OperationError.DatabaseCorrupted;
+        last_scanned_id = codec.decodeU64(entry.key[entry.key.len - 8 ..][0..8]);
         const link = (try resolve(db, entry.value)) orelse continue;
+        // The scan reads the tree as drained when the listing began, but the record comes from
+        // the memtable first, so a link moved since then still has a row here: skip it rather
+        // than list it under a category it has left.
+        if (category_id) |listed_id| if (link.category_id != listed_id) continue;
         if (page.status_filter) |status| if (link.status != status) continue;
         if (!cursor_mode and skipped < page.offset) {
             skipped += 1;
@@ -399,16 +432,25 @@ fn paginate_links(
             next_after_id = last_id;
             break;
         }
-        assert(link.id > last_id);
-        if (cursor_mode) assert(link.id > page.after_id);
+        // Rows ascend by link id in the key; a record that breaks the order came from a value
+        // naming another link, which is stored data, not a programming error.
+        if (link.id <= last_id) return OperationError.DatabaseCorrupted;
+        if (cursor_mode and link.id <= page.after_id) return OperationError.DatabaseCorrupted;
         buffer[count] = link;
         last_id = link.id;
         count += 1;
     }
 
     assert(count <= max);
+    assert(scanned <= scan_rows_max);
     if (cursor_mode) assert(skipped == 0);
-    if (next_after_id != 0) assert(count == max);
+    if (count < max) {
+        if (next_after_id != 0) assert(scanned == scan_rows_max);
+    }
+    if (count > 0) assert(buffer[count - 1].id == last_id);
+    if (category_id) |listed_id| {
+        for (buffer[0..count]) |link| assert(link.category_id == listed_id);
+    }
     return .{ .items = buffer[0..count], .next_after_id = next_after_id };
 }
 
@@ -423,9 +465,18 @@ pub fn list_links(
     const start_key = schema.CategoryLinkKey.encode(.{ category_id, seek_id });
     const end_key = schema.CategoryLinkKey.encode(.{ category_id, std.math.maxInt(u64) });
     var iterator = try db.link_by_category().rangeScan(&start_key, &end_key);
-    const result = try paginate_links(db, &iterator, &page, buffer, resolve_link_by_id);
+    const result = try paginate_links(
+        db,
+        &iterator,
+        &page,
+        category_id,
+        buffer,
+        resolve_link_by_id,
+        list_scan_rows_max,
+    );
     assert(result.items.len <= page.limit);
     if (result.next_after_id != 0) assert(result.next_after_id >= seek_id);
+    for (result.items) |link| assert(link.category_id == category_id);
     return result;
 }
 
@@ -440,12 +491,22 @@ pub fn list_links_by_submitter(
     const start_key = schema.SubmitterLinkKey.encode(.{ submitter_id, seek_id });
     const end_key = schema.SubmitterLinkKey.encode(.{ submitter_id, std.math.maxInt(u64) });
     var iterator = try db.link_by_submitter().rangeScan(&start_key, &end_key);
-    const result = try paginate_links(db, &iterator, &page, buffer, resolve_link_by_id);
+    const result = try paginate_links(
+        db,
+        &iterator,
+        &page,
+        null,
+        buffer,
+        resolve_link_by_id,
+        list_scan_rows_max,
+    );
     assert(result.items.len <= page.limit);
     if (result.next_after_id != 0) assert(result.next_after_id >= seek_id);
-    for (result.items) |link| assert(link.submitter_id == submitter_id);
+    for (result.items) |link| {
+        if (link.submitter_id != submitter_id) return OperationError.DatabaseCorrupted;
+    }
     // Submitter 0 means anonymous, and `apply` never indexes it.
-    if (submitter_id == 0) assert(result.items.len == 0);
+    if (submitter_id == 0 and result.items.len > 0) return OperationError.DatabaseCorrupted;
     return result;
 }
 
@@ -458,7 +519,15 @@ pub fn list_all_links(
     const seek_id: u64 = if (page.after_id > 0) page.after_id +| 1 else 0;
     const start_key = codec.encodeU64(seek_id);
     var iterator = try db.links_by_id().rangeScan(&start_key, null);
-    const result = try paginate_links(db, &iterator, &page, buffer, resolve_link_value);
+    const result = try paginate_links(
+        db,
+        &iterator,
+        &page,
+        null,
+        buffer,
+        resolve_link_value,
+        list_scan_rows_max,
+    );
     assert(result.items.len <= page.limit);
     if (result.next_after_id != 0) assert(result.next_after_id >= seek_id);
     return result;
@@ -629,6 +698,76 @@ test "list_links_by_submitter: cursor (after_id) resumes past the given id" {
     try std.testing.expectEqual(@as(usize, 1), page3.items.len);
     try std.testing.expectEqual(ids[4], page3.items[0].id);
     try std.testing.expectEqual(@as(u64, 0), page3.next_after_id);
+}
+
+// Goal: a filtered list reads no more than its scan budget of rows, ends early with a cursor
+// at the last row read, and refuses an offset the budget cannot reach. Method: five approved
+// links listed for pending with a budget of three, then from the cursor, then with an offset.
+test "paginate_links: a filtered page stops at its scan budget with a cursor" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    var ids: [5]u64 = undefined;
+    for (&ids, 0..) |*id, n| {
+        var url_buffer: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "https://s{d}.example", .{n});
+        id.* = try create_link_with_options(
+            db,
+            top_id,
+            .{ .url = url, .title = "s", .description = "" },
+            .{ .status = @intFromEnum(schema.LinkStatus.approved) },
+        );
+    }
+    try db.drain_one_memtable(db.memtable_links_by_id(), db.links_by_id());
+
+    const pending = @intFromEnum(schema.LinkStatus.pending);
+    var buffer: [10]schema.Link = undefined;
+    const first_key = codec.encodeU64(0);
+    var from_start = try db.links_by_id().rangeScan(&first_key, null);
+    const first = try paginate_links(
+        db,
+        &from_start,
+        &.{ .limit = 10, .status_filter = pending },
+        null,
+        &buffer,
+        resolve_link_value,
+        3,
+    );
+    try std.testing.expectEqual(@as(usize, 0), first.items.len);
+    try std.testing.expectEqual(ids[2], first.next_after_id);
+
+    const resume_key = codec.encodeU64(first.next_after_id + 1);
+    var from_cursor = try db.links_by_id().rangeScan(&resume_key, null);
+    const rest = try paginate_links(
+        db,
+        &from_cursor,
+        &.{ .limit = 10, .status_filter = pending, .after_id = first.next_after_id },
+        null,
+        &buffer,
+        resolve_link_value,
+        3,
+    );
+    try std.testing.expectEqual(@as(usize, 0), rest.items.len);
+    try std.testing.expectEqual(@as(u64, 0), rest.next_after_id);
+
+    var with_offset = try db.links_by_id().rangeScan(&first_key, null);
+    try std.testing.expectError(error.OffsetTooLarge, paginate_links(
+        db,
+        &with_offset,
+        &.{ .offset = 1, .limit = 10, .status_filter = pending },
+        null,
+        &buffer,
+        resolve_link_value,
+        3,
+    ));
 }
 
 // Goal: the status counters count each created link under its status. Method: six links
@@ -1384,4 +1523,134 @@ test "a committed link stays visible while its memtable shard is draining" {
     memtable.lockAll();
     for (0..zigstore.MEMTABLE_SHARDS) |i| memtable.resetShardBackLocked(i);
     memtable.unlockAll();
+}
+
+// Goal: an edit cannot give a link another link's url, so the url-hash index keeps naming the
+// first owner and a later delete cannot let a duplicate in. Method: edit B onto A's url, keep
+// B's own url, delete B, then create A's url again.
+test "update_link refuses a url another link already has" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    _ = try create_link(
+        db,
+        top_id,
+        .{ .url = "http://one.example/", .title = "A", .description = "" },
+    );
+    const b = try create_link(
+        db,
+        top_id,
+        .{ .url = "http://two.example/", .title = "B", .description = "" },
+    );
+    try std.testing.expectError(
+        OperationError.DuplicateUrl,
+        update_link(db, b, "http://one.example/", null, null),
+    );
+    try update_link(db, b, "http://two.example/", "B again", null);
+    try delete_link(db, b);
+    try std.testing.expectError(
+        OperationError.DuplicateUrl,
+        create_link(db, top_id, .{ .url = "http://one.example/", .title = "C", .description = "" }),
+    );
+}
+
+// Goal: a link moved after a listing drained its index is not listed under the category it
+// left. Method: drain `link_by_category`, move the link so only the memtables hold the move,
+// then page the old category's tree rows as `list_links` does after its drain.
+test "list_links skips a row whose link has moved to another category" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const a_id = try category.create_category(
+        db,
+        top_id,
+        .{ .name = "A", .slug = "a", .description = "" },
+    );
+    const b_id = try category.create_category(
+        db,
+        top_id,
+        .{ .name = "B", .slug = "b", .description = "" },
+    );
+    const link_id = try create_link(
+        db,
+        a_id,
+        .{ .url = "http://moved.example/", .title = "Moved", .description = "" },
+    );
+    try db.drain_one_memtable(db.memtable_link_by_category(), db.link_by_category());
+    try move_link(db, .{ .id = link_id, .new_parent_id = b_id });
+
+    const start_key = schema.CategoryLinkKey.encode(.{ a_id, 0 });
+    const end_key = schema.CategoryLinkKey.encode(.{ a_id, std.math.maxInt(u64) });
+    var iterator = try db.link_by_category().rangeScan(&start_key, &end_key);
+    var buffer: [4]schema.Link = undefined;
+    const page: shared.Page = .{ .limit = 4 };
+    const result = try paginate_links(
+        db,
+        &iterator,
+        &page,
+        a_id,
+        &buffer,
+        resolve_link_by_id,
+        list_scan_rows_max,
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+// Goal: a stored record or index value that contradicts its key fails the read with
+// DatabaseCorrupted instead of aborting the server. Method: plant a link record under another
+// id, then an index row whose value names an earlier link, and read both.
+test "get_link and list_links answer a contradicting record with DatabaseCorrupted" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const a = try create_link(
+        db,
+        top_id,
+        .{ .url = "http://c1.example/", .title = "c", .description = "" },
+    );
+    const b = try create_link(
+        db,
+        top_id,
+        .{ .url = "http://c2.example/", .title = "c", .description = "" },
+    );
+    try db.drain_all_memtables();
+
+    const row_key = schema.CategoryLinkKey.encode(.{ top_id, b });
+    const row_value = codec.encodeU64(a);
+    try db.link_by_category().insert(&row_key, &row_value);
+    var buffer: [4]schema.Link = undefined;
+    try std.testing.expectError(
+        OperationError.DatabaseCorrupted,
+        list_links(db, top_id, .{ .limit = 4 }, &buffer),
+    );
+
+    var record = (try get_link(db, b)).?;
+    record.id = b + 100;
+    const id_key = codec.encodeU64(b);
+    try db.links_by_id().insert(&id_key, std.mem.asBytes(&record));
+    try std.testing.expectError(OperationError.DatabaseCorrupted, get_link(db, b));
 }

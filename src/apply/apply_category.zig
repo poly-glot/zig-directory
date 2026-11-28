@@ -42,6 +42,7 @@ pub fn apply_category_inserted(
         effect.cat.parent_id,
         .child_count,
         true,
+        .{},
     );
 
     try db.memtable_categories_by_id().put(&id_key, std.mem.asBytes(&effect.cat));
@@ -87,7 +88,14 @@ pub fn apply_category_deleted(
     try db.memtable_cat_by_parent().delete(&parent_child_key);
     assert(db.memtable_cat_by_parent().get(&parent_child_key) != .found);
 
-    _ = try db.categories_by_slug_path().delete(effect.slug_path);
+    // A legacy category's change set may carry a path it does not own (see
+    // `deleted_slug_path`), so the key goes only when it names this category.
+    var slug_path_buffer: [16]u8 = undefined;
+    if (try db.categories_by_slug_path().search(effect.slug_path, &slug_path_buffer)) |value| {
+        if (std.mem.eql(u8, value, &id_key)) {
+            _ = try db.categories_by_slug_path().delete(effect.slug_path);
+        }
+    }
 
     const slug = effect.cat.slug.slice();
     var slug_only_buffer: [16]u8 = undefined;
@@ -108,6 +116,7 @@ pub fn apply_category_deleted(
         effect.cat.parent_id,
         .child_count,
         false,
+        schema.SubtreeStatusCounts.of_subtree(&effect.cat),
     );
 
     try delete_category_vector(db, effect.cat.id);
@@ -258,6 +267,7 @@ pub fn apply_category_moved(db: *Directory, effect: *const changeset.CategoryMov
         effect.old_parent_id,
         .child_count,
         false,
+        schema.SubtreeStatusCounts.of_subtree(&effect.cat),
     );
 
     try apply.cascade_ancestor_counts(
@@ -266,6 +276,7 @@ pub fn apply_category_moved(db: *Directory, effect: *const changeset.CategoryMov
         effect.new_parent_id,
         .child_count,
         true,
+        schema.SubtreeStatusCounts.of_subtree(&effect.cat),
     );
 
     db.subtree_cache.invalidate_all();
