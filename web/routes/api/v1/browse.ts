@@ -13,7 +13,7 @@ async function browseRoot(client: DmozClient) {
     children: categories.map((c) =>
       categoryJson(c, categoryPath([...chain, c]))
     ),
-    totalLinksInSubtree: root?.linkCountSubtree ?? 0,
+    totalLinksInSubtree: root?.linkCountSubtreeApproved ?? 0,
   };
 }
 
@@ -30,7 +30,7 @@ async function browseCategory(client: DmozClient, path: string) {
     children: result.children.map((child) =>
       categoryJson(child, categoryPath([...chain, child]))
     ),
-    totalLinksInSubtree: result.totalLinksInSubtree,
+    totalLinksInSubtree: result.category.linkCountSubtreeApproved,
   };
 }
 

@@ -31,11 +31,24 @@ import {
 } from "./dmoz-protocol.gen.ts";
 
 export { type Category, type Link, type LinkStatus, Op, Status, SubStatus };
+
+export type LinkStatusFilter = LinkStatus | "any";
 export { linkStatusFromByte } from "./dmoz-protocol.gen.ts";
 
 const REQUEST_HEADER_SIZE = 8;
 const RESPONSE_HEADER_SIZE = 10;
 const REQUEST_TIMEOUT_MS = 10_000;
+const REQUEST_FRAME_MAX_BYTES = 65_535;
+
+/**
+ * A filtered list page reads a bounded number of index rows on the server
+ * (50,000 for ops 13/16/27, 10,000 for op 17), so a rare status such as the
+ * moderation queue's pending links can come back empty with a cursor. The
+ * client follows that cursor, up to this many requests, so a caller sees an
+ * empty page only at the end or after 3.2M rows; past the bound the page
+ * keeps its cursor and the caller's "next" carries on from there.
+ */
+export const FILTERED_PAGE_REQUESTS_MAX = 64;
 
 /** Server cap on a single get_categories_by_ids request. */
 export const GET_CATEGORIES_BY_IDS_MAX = 200;
@@ -67,7 +80,6 @@ export interface BrowseResult {
   category: Category;
   ancestors: Category[];
   children: Category[];
-  totalLinksInSubtree: number;
 }
 
 /** One node of a breadcrumb chain: id + raw (unformatted) name + slug segment. */
@@ -87,6 +99,8 @@ export type SearchLink = Link & {
 const SEARCH_SCOPE_CODE = { both: 0, links: 1, categories: 2 } as const;
 const SEARCH_MODE_RANKED = 1;
 const SEARCH_MODE_HYBRID = 2;
+
+export const SEARCH_QUERY_MAX_CHARS = 256;
 
 export const EMBEDDING_DIMS = 384;
 export const MAX_VECTORS_PER_WRITE = 32;
@@ -156,7 +170,7 @@ export interface LinkQuery {
   via?: readonly CountryEdge[];
   hostedOnly?: boolean;
   subdomainOnly?: boolean;
-  status?: LinkStatus | "any";
+  status?: LinkStatusFilter;
   words?: string;
   allWords?: boolean;
   religions?: readonly Religion[];
@@ -476,6 +490,10 @@ export class DmozError extends Error {
   }
 }
 
+export function isTooBroad(e: unknown): e is DmozError {
+  return e instanceof DmozError && e.subStatus === SubStatus.TooBroad;
+}
+
 // ── DmozClient ────────────────────────────────────────────────
 
 export class DmozClient {
@@ -487,13 +505,18 @@ export class DmozClient {
     reject: (e: Error) => void;
   }> = [];
   private readBuffer: Uint8Array = new Uint8Array(0);
-  private readLoopRunning = false;
+  private readonly requestTimeoutMs: number;
   /** Serializes all request send+queue operations so wire order matches queue order. */
   private sendChain: Promise<void> = Promise.resolve();
 
-  constructor(host?: string, port?: number) {
+  constructor(
+    host?: string,
+    port?: number,
+    requestTimeoutMs: number = REQUEST_TIMEOUT_MS,
+  ) {
     this.host = host ?? Deno.env.get("DMOZDB_HOST") ?? "localhost";
     this.port = port ?? Number(Deno.env.get("DMOZDB_PORT") ?? "8080");
+    this.requestTimeoutMs = requestTimeoutMs;
   }
 
   // ── Connection management ─────────────────────────────────
@@ -501,13 +524,14 @@ export class DmozClient {
   private async ensureConnected(): Promise<Deno.TcpConn> {
     if (this.conn) return this.conn;
     try {
-      this.conn = await Deno.connect({
+      const conn = await Deno.connect({
         hostname: this.host,
         port: this.port,
         transport: "tcp",
       });
-      this.startReadLoop();
-      return this.conn;
+      this.conn = conn;
+      this.readLoop(conn);
+      return conn;
     } catch (e) {
       this.conn = null;
       throw new Error(
@@ -525,7 +549,6 @@ export class DmozClient {
       }
       this.conn = null;
     }
-    this.readLoopRunning = false;
     this.readBuffer = new Uint8Array(0);
     const pending = this.responseQueue.splice(0);
     for (const entry of pending) {
@@ -539,23 +562,19 @@ export class DmozClient {
 
   // ── Read loop ─────────────────────────────────────────────
 
-  private startReadLoop() {
-    if (this.readLoopRunning) return;
-    this.readLoopRunning = true;
-    this.readLoop();
-  }
-
-  private async readLoop() {
+  private async readLoop(conn: Deno.TcpConn) {
     const buf = new Uint8Array(65536);
-    while (this.readLoopRunning && this.conn) {
+    while (this.conn === conn) {
       let n: number | null;
       try {
-        n = await this.conn.read(buf);
+        n = await conn.read(buf);
       } catch (e) {
+        if (this.conn !== conn) return;
         console.error("Read loop error:", e);
         this.disconnect();
         return;
       }
+      if (this.conn !== conn) return;
       if (n === null) {
         this.disconnect();
         return;
@@ -605,13 +624,20 @@ export class DmozClient {
 
   // ── Request / response ────────────────────────────────────
 
-  private request(
+  private async request(
     op: number,
     payload: Uint8Array,
     flags = 0,
     count = 0,
   ): Promise<RawResponse> {
     const frame = buildFrame(op, flags, count, payload);
+    if (frame.length > REQUEST_FRAME_MAX_BYTES) {
+      throw new DmozError(
+        Status.Invalid,
+        SubStatus.None,
+        `request frame of ${frame.length} bytes exceeds the ${REQUEST_FRAME_MAX_BYTES}-byte limit`,
+      );
+    }
 
     const result = new Promise<RawResponse>((resolve, reject) => {
       this.sendChain = this.sendChain.then(async () => {
@@ -630,15 +656,22 @@ export class DmozClient {
       });
     });
 
-    return Promise.race([
-      result,
-      new Promise<never>((_resolve, reject) => {
-        setTimeout(
-          () => reject(new Error("dmozdb request timed out after 10s")),
-          REQUEST_TIMEOUT_MS,
+    return await this.settleWithin(result);
+  }
+
+  private settleWithin(result: Promise<RawResponse>): Promise<RawResponse> {
+    let timer: number | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `dmozdb request timed out after ${this.requestTimeoutMs}ms`,
+          ),
         );
-      }),
-    ]);
+        this.disconnect();
+      }, this.requestTimeoutMs);
+    });
+    return Promise.race([result, timeout]).finally(() => clearTimeout(timer));
   }
 
   private assertOk(resp: RawResponse) {
@@ -701,20 +734,34 @@ export class DmozClient {
    * count still comes from the response header, so the row block parses
    * exactly as before; the cursor is the 8 bytes immediately after it.
    */
-  private async listEntitiesWithCursor(
+  private listEntitiesWithCursor(
     op: Op,
-    payload: Uint8Array,
-    itemSize: number,
-    parse: (r: BufferReader) => Link,
+    build: (afterId: number | undefined) => Uint8Array,
+    afterId: number | undefined,
   ): Promise<LinkPage> {
-    const resp = await this.request(op, payload);
-    this.assertOk(resp);
-    const links = readArray(resp.payload, resp.count, itemSize, parse);
-    const cursorOff = resp.count * itemSize;
-    const nextAfterId = resp.payload.length >= cursorOff + 8
-      ? Number(new BufferReader(resp.payload, cursorOff).u64())
-      : 0;
-    return { links, nextAfterId };
+    return this.followEmptyPages(async (pageAfterId) => {
+      const resp = await this.request(op, build(pageAfterId));
+      this.assertOk(resp);
+      const links = readArray(resp.payload, resp.count, LINK_SIZE, readLink);
+      const cursorOff = resp.count * LINK_SIZE;
+      const nextAfterId = resp.payload.length >= cursorOff + 8
+        ? Number(new BufferReader(resp.payload, cursorOff).u64())
+        : 0;
+      return { links, nextAfterId };
+    }, afterId);
+  }
+
+  /** Re-asks from the cursor while a page is empty but not the last; see FILTERED_PAGE_REQUESTS_MAX. */
+  private async followEmptyPages<P extends LinkPage>(
+    fetchPage: (afterId: number | undefined) => Promise<P>,
+    afterId: number | undefined,
+  ): Promise<P> {
+    let page = await fetchPage(afterId);
+    for (let requests = 1; requests < FILTERED_PAGE_REQUESTS_MAX; requests++) {
+      if (page.links.length > 0 || page.nextAfterId === 0) break;
+      page = await fetchPage(page.nextAfterId);
+    }
+    return page;
   }
 
   /**
@@ -726,13 +773,15 @@ export class DmozClient {
    */
   private writeListExtras(
     w: BufferWriter,
-    opts: { status?: LinkStatus; afterId?: number },
+    opts: { status?: LinkStatusFilter; afterId?: number },
   ): BufferWriter {
+    const status = opts.status ?? "approved";
+    const code = status === "any" ? undefined : statusToCode(status);
     if (opts.afterId !== undefined) {
-      w.u8(opts.status !== undefined ? statusToCode(opts.status) : 0xFF);
+      w.u8(code ?? 0xFF);
       w.u64(opts.afterId);
-    } else if (opts.status !== undefined) {
-      w.u8(statusToCode(opts.status));
+    } else if (code !== undefined) {
+      w.u8(code);
     }
     return w;
   }
@@ -976,125 +1025,99 @@ export class DmozClient {
     return this.deleteEntity(Op.DeleteLink, id);
   }
 
-  /**
-   * Per-category link page (op=13). When `opts.status` is set, the server
-   * walks `link_by_category` and filters by status — sees rows past the
-   * first 100 that would be hidden by a JS-side post-filter.
-   */
   listLinks(
     categoryId: number,
     opts: {
       offset?: number;
       limit?: number;
-      status?: LinkStatus;
+      status?: LinkStatusFilter;
       afterId?: number;
     } = {},
   ): Promise<LinkPage> {
     const offset = opts.offset ?? 0;
     const limit = opts.limit ?? 100;
-    const w = new BufferWriter().u64(categoryId).u32(offset).u32(limit);
-    this.writeListExtras(w, opts);
-    return this.listEntitiesWithCursor(
-      Op.ListLinks,
-      w.build(),
-      LINK_SIZE,
-      readLink,
-    );
+    return this.listEntitiesWithCursor(Op.ListLinks, (afterId) => {
+      const w = new BufferWriter().u64(categoryId).u32(offset).u32(limit);
+      return this.writeListExtras(w, { status: opts.status, afterId }).build();
+    }, opts.afterId);
   }
 
-  /**
-   * Whole-DB link page ordered by link id (op=16). When `opts.status` is
-   * set, the server scans `links_by_id` and applies the status filter so
-   * the admin moderation queue sees pending rows past the page window.
-   */
   listAllLinks(
     opts: {
       offset?: number;
       limit?: number;
-      status?: LinkStatus;
+      status?: LinkStatusFilter;
       afterId?: number;
     } = {},
   ): Promise<LinkPage> {
     const offset = opts.offset ?? 0;
     const limit = opts.limit ?? 12;
-    const w = new BufferWriter().u32(offset).u32(limit);
-    this.writeListExtras(w, opts);
-    return this.listEntitiesWithCursor(
-      Op.ListAllLinks,
-      w.build(),
-      LINK_SIZE,
-      readLink,
-    );
+    return this.listEntitiesWithCursor(Op.ListAllLinks, (afterId) => {
+      const w = new BufferWriter().u32(offset).u32(limit);
+      return this.writeListExtras(w, { status: opts.status, afterId }).build();
+    }, opts.afterId);
   }
 
-  /**
-   * Per-submitter link page (op=27). When `opts.status` is set, the
-   * server filters the per-user secondary index so the dashboard's
-   * per-tab counts and listings stay correct past 100 submissions.
-   */
   listMySubmissions(
     submitterId: number,
     opts: {
       offset?: number;
       limit?: number;
-      status?: LinkStatus;
+      status?: LinkStatusFilter;
       afterId?: number;
     } = {},
   ): Promise<LinkPage> {
     const offset = opts.offset ?? 0;
     const limit = opts.limit ?? 100;
-    const w = new BufferWriter().u64(submitterId).u32(offset).u32(limit);
-    this.writeListExtras(w, opts);
-    return this.listEntitiesWithCursor(
-      Op.ListLinksBySubmitter,
-      w.build(),
-      LINK_SIZE,
-      readLink,
-    );
+    return this.listEntitiesWithCursor(Op.ListLinksBySubmitter, (afterId) => {
+      const w = new BufferWriter().u64(submitterId).u32(offset).u32(limit);
+      return this.writeListExtras(w, { status: opts.status, afterId }).build();
+    }, opts.afterId);
   }
 
   /**
-   * Subtree link page (op=17). When `opts.status` is set, the server
-   * walks the full descendant link set, filters by status, and returns
-   * the paged matches plus the *filtered* total across the whole subtree.
+   * Subtree link page (op=17). `total` is the subtree's exact link count for
+   * `opts.status` (approved unless set), or over every status for "any".
    */
-  async listSubtreeLinks(
+  listSubtreeLinks(
     categoryId: number,
     opts: {
       order?: number;
       offset?: number;
       limit?: number;
-      status?: LinkStatus;
+      status?: LinkStatusFilter;
       afterId?: number;
     } = {},
   ): Promise<{ links: Link[]; total: number; nextAfterId: number }> {
     const order = opts.order ?? 0;
     const offset = opts.offset ?? 0;
     const limit = opts.limit ?? 50;
-    const w = new BufferWriter()
-      .u64(categoryId)
-      .u8(order)
-      .u32(offset)
-      .u32(limit);
-    this.writeListExtras(w, opts);
-    const resp = await this.request(Op.ListSubtreeLinks, w.build());
-    this.assertOk(resp);
+    return this.followEmptyPages(async (afterId) => {
+      const w = new BufferWriter()
+        .u64(categoryId)
+        .u8(order)
+        .u32(offset)
+        .u32(limit);
+      this.writeListExtras(w, { status: opts.status, afterId });
+      const resp = await this.request(Op.ListSubtreeLinks, w.build());
+      this.assertOk(resp);
 
-    const r = new BufferReader(resp.payload);
-    const count = r.u32();
-    const links = readArray(
-      resp.payload.subarray(r.offset),
-      count,
-      LINK_SIZE,
-      readLink,
-    );
-    r.skip(count * LINK_SIZE);
-    const total = Number(r.u64());
-    // Trailing cursor (appended after total); older servers omit it.
-    const nextAfterId = resp.payload.length >= r.offset + 8
-      ? Number(r.u64())
-      : 0;
-    return { links, total, nextAfterId };
+      const r = new BufferReader(resp.payload);
+      const count = r.u32();
+      const links = readArray(
+        resp.payload.subarray(r.offset),
+        count,
+        LINK_SIZE,
+        readLink,
+      );
+      r.skip(count * LINK_SIZE);
+      const total = Number(r.u64());
+      // Trailing cursor (appended after total); older servers omit it.
+      const nextAfterId = resp.payload.length >= r.offset + 8
+        ? Number(r.u64())
+        : 0;
+      return { links, total, nextAfterId };
+    }, opts.afterId);
   }
 
   // -- Integrity / index health --
@@ -1167,9 +1190,7 @@ export class DmozClient {
     );
     r.skip(childCount * CATEGORY_SIZE);
 
-    const totalLinksInSubtree = Number(r.u64());
-
-    return { category, ancestors, children, totalLinksInSubtree };
+    return { category, ancestors, children };
   }
 
   async search(
@@ -1180,6 +1201,7 @@ export class DmozClient {
       mode?: "all_terms" | "ranked";
       queryEmbedding?: QueryEmbedding;
       capPerSite?: boolean;
+      status?: LinkStatusFilter;
     } = {},
   ): Promise<SearchResult> {
     const limit = opts.limit ?? 20;
@@ -1221,7 +1243,11 @@ export class DmozClient {
     }
 
     const vectorUsed = embedding !== undefined && r.u8() === 1;
-    return { categories, links, vectorUsed };
+    const status = opts.status ?? "approved";
+    const visible = status === "any"
+      ? links
+      : links.filter((link) => link.status === status);
+    return { categories, links: visible, vectorUsed };
   }
 
   async matchNames(phrases: readonly string[]): Promise<NameMatch[] | null> {

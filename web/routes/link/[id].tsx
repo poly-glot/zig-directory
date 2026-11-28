@@ -1,8 +1,9 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
-import { DmozError, getClient, type Link } from "../../lib/dmoz-client.ts";
+import { getClient, type Link } from "../../lib/dmoz-client.ts";
 import { formatLongDateOrDash, pad7, safeHostname } from "../../lib/format.ts";
 import { safeHref } from "../../lib/url.ts";
+import { loadVisibleLink } from "../../lib/link-access.ts";
 import Eyebrow from "../../components/common/Eyebrow/Eyebrow.tsx";
 import Hostname from "../../components/common/Hostname/Hostname.tsx";
 import Crumbs, { type Crumb } from "../../components/common/Crumbs/Crumbs.tsx";
@@ -50,22 +51,15 @@ async function loadAdjacent(
 
 export const handler = define.handlers<Data>({
   async GET(ctx) {
-    const id = Number(ctx.params.id);
-    if (!Number.isFinite(id) || id <= 0) {
-      return new Response("Not found", { status: 404 });
-    }
-
     const client = getClient();
-    let link: Link;
-    try {
-      link = await client.getLink(id);
-    } catch (e) {
-      if (e instanceof DmozError && e.status === 1) {
-        return new Response("Not found", { status: 404 });
-      }
-      throw e;
-    }
+    const loaded = await loadVisibleLink(
+      client,
+      ctx.params.id,
+      ctx.state.user,
+    );
+    if (loaded instanceof Response) return loaded;
 
+    const link = loaded;
     let crumbs: Crumb[] = [];
     let categoryPath = "";
     let adjacent: Link[] = [];

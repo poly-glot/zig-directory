@@ -16,8 +16,13 @@
  * predicate tells you.
  */
 
-import { type DmozClient, getClient, type LinkPage } from "./dmoz-client.ts";
-import type { Link, LinkStatus } from "./dmoz-protocol.gen.ts";
+import {
+  type DmozClient,
+  getClient,
+  type LinkPage,
+  type LinkStatusFilter,
+} from "./dmoz-client.ts";
+import type { Link } from "./dmoz-protocol.gen.ts";
 
 interface PageArgs {
   offset?: number;
@@ -27,7 +32,7 @@ interface PageArgs {
 }
 
 interface Filter {
-  status?: LinkStatus;
+  status?: LinkStatusFilter;
 }
 
 /** Per-category links via `link_by_category` (op=13). */

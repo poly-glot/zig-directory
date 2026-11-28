@@ -1,9 +1,19 @@
 import { define } from "../../../utils.ts";
 import { registerClient, validateRedirectUris } from "../../../lib/oauth.ts";
+import { clientAddress, consumeAttempt } from "../../../lib/rate-limit.ts";
 import { oauthError } from "./_lib/errors.ts";
 
 export const handler = define.handlers({
   async POST(ctx) {
+    const address = clientAddress(ctx.req, ctx.info);
+    if (!(await consumeAttempt("clientRegistration", address))) {
+      return oauthError(
+        "temporarily_unavailable",
+        "Too many client registrations",
+        429,
+      );
+    }
+
     let body: Record<string, unknown>;
     try {
       body = await ctx.req.json();

@@ -1,7 +1,7 @@
 import type { Link } from "../../../lib/dmoz-client.ts";
 import SectionHead from "../../common/SectionHead/SectionHead.tsx";
 import LinkCard from "../../common/LinkCard/LinkCard.tsx";
-import { formatLongDate } from "../../../lib/format.ts";
+import { formatLongDate, listingsLede } from "../../../lib/format.ts";
 import CategoryToolbar, {
   type Sort,
   type TagChip,
@@ -27,12 +27,6 @@ interface Props {
   tagChips: TagChip[];
   clearTagHref: string;
   rawCount: number;
-}
-
-function ledeText(page: number, count: number, total: number): string {
-  const startIdx = (page - 1) * PAGE_SIZE + 1;
-  const endIdx = (page - 1) * PAGE_SIZE + count;
-  return `Showing ${startIdx.toLocaleString()}–${endIdx.toLocaleString()} of ${total.toLocaleString()} editor-approved links.`;
 }
 
 function ListingItem({ link }: { link: LinkWithCategory }) {
@@ -80,7 +74,7 @@ export default function ListingsSection(props: Props) {
           num={hasSubcategories ? "02" : "01"}
           topic="Listings"
           title="All links in this category."
-          lede={ledeText(page, pageLinks.length, pageTotal)}
+          lede={listingsLede(page, pageLinks.length, pageTotal, PAGE_SIZE)}
         />
         <CategoryToolbar
           currentPath={currentPath}

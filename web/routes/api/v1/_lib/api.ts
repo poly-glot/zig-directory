@@ -1,6 +1,7 @@
 import {
   type Category,
   DmozError,
+  isTooBroad,
   type Link,
   Status,
 } from "../../../../lib/dmoz-client.ts";
@@ -15,15 +16,42 @@ const HTTP_STATUS_BY_DMOZ_STATUS: Record<number, number> = {
   [Status.Invalid]: 400,
 };
 
-export function pageSize(raw: string | null): number {
-  const n = parseInt(raw ?? "", 10);
-  if (!Number.isFinite(n) || n < 1) return DEFAULT_PAGE_SIZE;
-  return Math.min(n, MAX_PAGE_SIZE);
+function boundedInteger(
+  raw: string | null,
+  bounds: { fallback: number; min: number; max: number },
+): number | undefined {
+  if (raw === null || raw === "") return bounds.fallback;
+  if (!/^\d+$/.test(raw)) return undefined;
+
+  const n = Number(raw);
+  return n >= bounds.min && n <= bounds.max ? n : undefined;
 }
 
-export function nonNegativeInt(raw: string | null): number {
-  const n = parseInt(raw ?? "", 10);
-  return Number.isFinite(n) && n >= 0 ? n : 0;
+export function pageSize(raw: string | null): number | undefined {
+  return boundedInteger(raw, {
+    fallback: DEFAULT_PAGE_SIZE,
+    min: 1,
+    max: MAX_PAGE_SIZE,
+  });
+}
+
+export function afterCursor(raw: string | null): number | undefined {
+  return boundedInteger(raw, {
+    fallback: 0,
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  });
+}
+
+export function badRequest(error: string): Response {
+  return Response.json({ error }, { status: 400 });
+}
+
+export const PAGE_SIZE_MESSAGE =
+  `limit must be a whole number from 1 to ${MAX_PAGE_SIZE}`;
+
+export function cursorMessage(name: string): string {
+  return `${name} must be a whole number of 0 or more`;
 }
 
 export function categoryNotFound(path: string): Response {
@@ -41,7 +69,7 @@ export function categoryJson(c: Category, path: string) {
     description: c.description,
     linkCount: c.linkCount,
     childCount: c.childCount,
-    linkCountSubtree: c.linkCountSubtree,
+    linkCountSubtree: c.linkCountSubtreeApproved,
     childCountSubtree: c.childCountSubtree,
   };
 }
@@ -61,7 +89,15 @@ export function linkJson(l: Link) {
   };
 }
 
+const TOO_BROAD_MESSAGE =
+  "The question is too broad: a word or filter in it matches too many links. " +
+  "Narrow it with rarer words, by requiring every word to match, or by " +
+  "adding a category or a country.";
+
 export function errorResponse(e: unknown): Response {
+  if (isTooBroad(e)) {
+    return Response.json({ error: TOO_BROAD_MESSAGE }, { status: 400 });
+  }
   if (e instanceof DmozError) {
     const status = HTTP_STATUS_BY_DMOZ_STATUS[e.status] ?? 502;
     return Response.json({ error: e.message }, { status });

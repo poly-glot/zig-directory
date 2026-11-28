@@ -7,7 +7,12 @@ import {
   type Link,
 } from "../../lib/dmoz-client.ts";
 import Crumbs from "../../components/common/Crumbs/Crumbs.tsx";
-import { categoryPath, formatCategoryName, pad2 } from "../../lib/format.ts";
+import {
+  categoryPath,
+  formatCategoryName,
+  pad2,
+  pageCount,
+} from "../../lib/format.ts";
 import { buildPathLabel } from "../search/_lib/facets.ts";
 import RelatedCategories, {
   type RelatedCategory,
@@ -71,7 +76,7 @@ async function relatedCategories(
     const chains = await client.breadcrumbsByIds(ids);
     const categories = await client.getCategoriesByIds(ids);
     const subtreeLinks = new Map(
-      categories.map((c) => [c.id, c.linkCountSubtree]),
+      categories.map((c) => [c.id, c.linkCountSubtreeApproved]),
     );
 
     return ids.filter((id) => chains.has(id)).map((id) => ({
@@ -108,7 +113,10 @@ async function annotateLinks(
     try {
       const cats = await client.getCategoriesByIds(uniqueIds);
       for (const c of cats) {
-        cache.set(c.id, { name: c.name, linkCountSubtree: c.linkCountSubtree });
+        cache.set(c.id, {
+          name: c.name,
+          linkCountSubtree: c.linkCountSubtreeApproved,
+        });
       }
     } catch (e) {
       console.error("annotateLinks: getCategoriesByIds failed:", e);
@@ -172,7 +180,7 @@ export const handler = define.handlers<Data>({
           ...emptyData(currentPath, sort, activeTag),
           result,
           page: pageNum,
-          pageTotal: result.totalLinksInSubtree,
+          pageTotal: result.category.linkCountSubtreeApproved,
           offsetCapHit: true,
         });
       }
@@ -185,7 +193,7 @@ export const handler = define.handlers<Data>({
         client,
         linksPage.links,
         result.category.name,
-        result.category.linkCountSubtree,
+        result.category.linkCountSubtreeApproved,
         result.category.id,
       );
 
@@ -244,10 +252,7 @@ export default define.page<typeof handler>(function CategoryPage(props) {
   const ancestors = result?.ancestors ?? [];
   const children = result?.children ?? [];
 
-  const totalPages = Math.min(
-    Math.ceil(pageTotal / PAGE_SIZE) || 1,
-    MAX_PAGES,
-  );
+  const totalPages = pageCount(pageTotal, PAGE_SIZE, MAX_PAGES);
   const showListings = !offsetCapHit && rawCount > 0;
   const isEmpty = Boolean(category) && !error && !offsetCapHit &&
     children.length === 0 && rawCount === 0;

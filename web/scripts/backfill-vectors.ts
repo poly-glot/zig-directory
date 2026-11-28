@@ -23,6 +23,7 @@ do {
   const page = await client.listAllLinks({
     afterId,
     limit: MAX_VECTORS_PER_WRITE,
+    status: "any",
   });
 
   const chains = await client.breadcrumbsByIds([

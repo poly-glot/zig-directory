@@ -1,7 +1,7 @@
 import { encodeBase64Url } from "jsr:@std/encoding@^1/base64url";
 import { importJWK, importPKCS8, jwtVerify, SignJWT } from "jose";
 import { isCimdClientId, resolveCimdClient } from "./cimd.ts";
-import { getKv } from "./kv-users.ts";
+import { getKv, getUserById } from "./kv-users.ts";
 
 export interface OAuthClient {
   clientId: string;
@@ -35,6 +35,7 @@ const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 function isLoopbackOrHttps(raw: string): boolean {
   try {
     const url = new URL(raw);
+    if (url.hostname.includes("*")) return false;
     if (url.protocol === "https:") return true;
     return url.protocol === "http:" &&
       (url.hostname === "127.0.0.1" || url.hostname === "localhost");
@@ -83,8 +84,10 @@ export async function resolveClient(
 }
 
 function hostMatches(host: string, pattern: string): boolean {
-  if (pattern === "*") return true;
-  if (pattern.startsWith("*.")) return host.endsWith(pattern.slice(1));
+  const wildcardSuffix = pattern.startsWith("*.") ? pattern.slice(1) : null;
+  if (wildcardSuffix?.slice(1).includes(".")) {
+    return host.endsWith(wildcardSuffix);
+  }
   return host === pattern;
 }
 
@@ -272,7 +275,7 @@ async function getVerificationKey(): Promise<
 // The scope the MCP resource advertises in scopes_supported and demands in its
 // WWW-Authenticate challenge. Verified here too: a token that never carried it
 // must not be spendable on a write just because its audience and role match.
-const MCP_SCOPE = "mcp";
+export const MCP_SCOPE = "mcp";
 
 function grantsScope(claim: unknown, required: string): boolean {
   return typeof claim === "string" && claim.split(" ").includes(required);
@@ -294,7 +297,10 @@ export async function verifyBearerToken(
     if (!grantsScope(payload.scope, MCP_SCOPE)) {
       return null;
     }
-    return { userId: payload.sub, role: payload.role };
+
+    const user = await getUserById(payload.sub);
+    if (!user) return null;
+    return { userId: user.id, role: user.role };
   } catch {
     return null;
   }

@@ -8,16 +8,17 @@ import {
   NEIGHBOURS_MAX,
 } from "../../../lib/dmoz-client.ts";
 import { categoryPath } from "../../../lib/format.ts";
-import { categoryJson, categoryNotFound, errorResponse } from "./_lib/api.ts";
+import {
+  badRequest,
+  categoryJson,
+  categoryNotFound,
+  errorResponse,
+} from "./_lib/api.ts";
 
 const KINDS: readonly NeighbourKind[] = ["site", "category", "entity"];
 const HOST_SUFFIX = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 const DEFAULT_LIMIT = 10;
 const MAX_HOST_BYTES = 64;
-
-function badRequest(error: string): Response {
-  return Response.json({ error }, { status: 400 });
-}
 
 function limitOf(raw: string | null): number | undefined {
   if (raw === null || raw === "") return DEFAULT_LIMIT;

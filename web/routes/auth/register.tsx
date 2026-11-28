@@ -1,6 +1,7 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
 import { createUser, updateUser } from "../../lib/kv-users.ts";
+import { clientAddress, consumeAttempt } from "../../lib/rate-limit.ts";
 import { createSession } from "../../lib/session.ts";
 import Eyebrow from "../../components/common/Eyebrow/Eyebrow.tsx";
 import styles from "./login.module.css";
@@ -64,6 +65,13 @@ export const handler = define.handlers<Data>({
     const { errors, values } = validate(form);
     if (Object.keys(errors).length > 0) return page({ errors, values });
 
+    if (!(await consumeAttempt("register", clientAddress(ctx.req, ctx.info)))) {
+      return page({
+        errors: { general: "Too many accounts created. Try again later." },
+        values,
+      }, { status: 429 });
+    }
+
     const email = values.email!;
     const username = values.username!;
     const displayName = values.displayName!;
@@ -72,7 +80,7 @@ export const handler = define.handlers<Data>({
     try {
       const user = await createUser(email, username, password);
       if (displayName) await updateUser(user.id, { displayName });
-      const { cookie } = await createSession(user.id);
+      const { cookie } = await createSession(user.id, ctx.req);
       return new Response(null, {
         status: 303,
         headers: { Location: "/", "Set-Cookie": cookie },

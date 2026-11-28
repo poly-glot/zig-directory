@@ -1,9 +1,8 @@
-import { DESCRIPTION_MAX, type FormState, TITLE_MAX } from "./types.ts";
+import type { FormState } from "./types.ts";
 
-function readString(form: FormData, key: string, max = 8192): string {
+function readString(form: FormData, key: string): string {
   const v = form.get(key);
-  if (typeof v !== "string") return "";
-  return v.slice(0, max).trim();
+  return typeof v === "string" ? v.trim() : "";
 }
 
 function readInt(form: FormData, key: string): number {
@@ -15,9 +14,9 @@ function readInt(form: FormData, key: string): number {
 
 export function parseFormState(form: FormData): FormState {
   return {
-    url: readString(form, "url", 64),
-    title: readString(form, "title", TITLE_MAX),
-    description: readString(form, "description", DESCRIPTION_MAX),
+    url: readString(form, "url"),
+    title: readString(form, "title"),
+    description: readString(form, "description"),
     categoryId: readInt(form, "categoryId"),
     subcategoryId: readInt(form, "subcategoryId"),
     affiliated: form.get("affiliated") === "1",

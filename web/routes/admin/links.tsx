@@ -92,6 +92,7 @@ async function loadLinks(
   nextAfterId: number;
 }> {
   const status = filter === "all" ? undefined : filter;
+  const listStatus = status ?? "any";
 
   // Search mode: the search op caps at 50 hits and has no cursor, so there is
   // no pagination here. Status is applied client-side over the hit set.
@@ -99,6 +100,7 @@ async function loadLinks(
     const res = await client.search(query, {
       scope: "links",
       limit: PAGE_SIZE,
+      status: "any",
     });
     return {
       links: res.links.filter((l) => !status || l.status === status),
@@ -111,7 +113,7 @@ async function loadLinks(
   if (categoryId <= 0) {
     const { links, nextAfterId } = await client.listAllLinks({
       limit: PAGE_SIZE,
-      status,
+      status: listStatus,
       afterId,
     });
     return {
@@ -127,10 +129,12 @@ async function loadLinks(
 
   const direct = await client.listLinks(categoryId, {
     limit: PAGE_SIZE,
-    status,
+    status: listStatus,
     afterId,
   });
-  if (direct.links.length > 0) {
+  // An empty page with a cursor is not the end: the client stopped following
+  // it at its request bound, so the next page carries on in this category.
+  if (direct.links.length > 0 || direct.nextAfterId !== 0) {
     return {
       links: direct.links,
       subtreeMode: false,
@@ -144,10 +148,10 @@ async function loadLinks(
   try {
     const sub = await client.listSubtreeLinks(categoryId, {
       limit: PAGE_SIZE,
-      status,
+      status: listStatus,
       afterId,
     });
-    if (sub.links.length > 0) {
+    if (sub.links.length > 0 || sub.nextAfterId !== 0) {
       return {
         links: sub.links,
         subtreeMode: true,

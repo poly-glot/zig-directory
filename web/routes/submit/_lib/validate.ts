@@ -3,6 +3,7 @@ import {
   DESCRIPTION_MIN,
   type FormState,
   TITLE_MAX,
+  URL_MAX_BYTES,
 } from "./types.ts";
 import { isHttpUrl } from "../../../lib/url.ts";
 
@@ -11,6 +12,8 @@ export function validateStep1(state: FormState): Record<string, string> {
   if (!state.url) errors.url = "URL is required.";
   else if (!isHttpUrl(state.url)) {
     errors.url = "Enter a valid http:// or https:// URL.";
+  } else if (new TextEncoder().encode(state.url).length > URL_MAX_BYTES) {
+    errors.url = `URL must be ${URL_MAX_BYTES} bytes or fewer.`;
   }
   if (!state.title) errors.title = "Title is required.";
   else if (state.title.length > TITLE_MAX) {

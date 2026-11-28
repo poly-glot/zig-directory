@@ -6,6 +6,7 @@ never has to translate them itself.
 """
 
 import os
+from http import HTTPStatus
 from typing import Any, NamedTuple, cast
 
 import httpx2
@@ -18,10 +19,21 @@ UNKNOWN_PATH_HINT = (
     "to start at the top."
 )
 
+UPSTREAM_CONNECT_TIMEOUT_S = 3
+UPSTREAM_READ_TIMEOUT_S = 10
+
 _api = httpx2.AsyncClient(
     base_url=os.environ.get("DMOZ_API_URL", "http://127.0.0.1:8000"),
-    timeout=30,
+    timeout=httpx2.Timeout(UPSTREAM_READ_TIMEOUT_S, connect=UPSTREAM_CONNECT_TIMEOUT_S),
 )
+
+
+class UpstreamError(ToolError):
+    """An error status from the API, kept so a caller can tell 404 from 503."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class Browsed(NamedTuple):
@@ -64,11 +76,24 @@ def _parse_response(response: httpx2.Response) -> JSON:
         The decoded JSON object.
 
     Raises:
-        ToolError: If the response carries a 4xx or 5xx status.
+        UpstreamError: If the response carries a 4xx or 5xx status.
     """
     if response.is_error:
-        raise ToolError(_error_detail(response))
+        raise UpstreamError(_error_detail(response), response.status_code)
     return cast(JSON, response.json())
+
+
+async def _request(method: str, endpoint: str, **kwargs: Any) -> JSON:
+    """Send one request, turning a transport failure into a ``ToolError``."""
+    try:
+        response = await _api.request(method, endpoint, **kwargs)
+    except httpx2.TimeoutException as slow:
+        raise ToolError(
+            "the directory service timed out, please retry shortly"
+        ) from slow
+    except httpx2.HTTPError as unreachable:
+        raise ToolError("the directory service did not answer") from unreachable
+    return _parse_response(response)
 
 
 async def fetch(endpoint: str, **params: str | int) -> JSON:
@@ -88,11 +113,11 @@ async def fetch(endpoint: str, **params: str | int) -> JSON:
     Raises:
         ToolError: If the API answers with an error status.
     """
-    response = await _api.get(
+    return await _request(
+        "GET",
         endpoint,
         params={name: value for name, value in params.items() if value != ""},
     )
-    return _parse_response(response)
 
 
 async def post_authorized(endpoint: str, *, token: str, json_body: JSON) -> JSON:
@@ -113,12 +138,12 @@ async def post_authorized(endpoint: str, *, token: str, json_body: JSON) -> JSON
         ToolError: If the API answers with an error status, including the
             401 and 403 it raises for a token that is missing or unprivileged.
     """
-    response = await _api.post(
+    return await _request(
+        "POST",
         endpoint,
         json=json_body,
         headers={"Authorization": f"Bearer {token}"},
     )
-    return _parse_response(response)
 
 
 async def category_at(path: str) -> Browsed:
@@ -131,16 +156,19 @@ async def category_at(path: str) -> Browsed:
         The resolved category with its ancestor chain and direct children.
 
     Raises:
-        ToolError: If the API cannot be reached, or if no category sits at
-            ``path``. Both carry ``UNKNOWN_PATH_HINT`` so the model is told
-            how to find a real path rather than guessing again.
+        ToolError: If no category sits at ``path``, carrying
+            ``UNKNOWN_PATH_HINT`` so the model is told how to find a real path
+            rather than guessing again. Any other failure, an outage included,
+            propagates unchanged so it is not mistaken for a bad path.
     """
     try:
         browsed = await fetch("/api/v1/browse", path=path)
-    except ToolError as unreachable:
+    except UpstreamError as refused:
+        if refused.status != HTTPStatus.NOT_FOUND:
+            raise
         raise ToolError(
             f'no category at path "{path}". {UNKNOWN_PATH_HINT}'
-        ) from unreachable
+        ) from refused
 
     category = browsed["category"]
     if category is None:

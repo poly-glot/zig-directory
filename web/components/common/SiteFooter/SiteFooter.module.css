@@ -40,6 +40,22 @@
 .grid a:hover {
   color: var(--ink);
 }
+.signOut {
+  margin: 0;
+}
+.signOut button {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  padding: 0;
+  text-align: left;
+}
+.signOut button:hover {
+  color: var(--ink);
+}
 .brand {
   font-weight: 900;
   font-size: 14px;

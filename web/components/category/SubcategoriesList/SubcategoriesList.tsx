@@ -24,7 +24,7 @@ export default function SubcategoriesList({ items, currentPath }: Props) {
               num={pad2(i + 1)}
               href={`/category/${currentPath}/${child.slug || child.id}`}
               name={child.name}
-              count={child.linkCountSubtree ?? 0}
+              count={child.linkCountSubtreeApproved}
             />
           ))}
         </ul>

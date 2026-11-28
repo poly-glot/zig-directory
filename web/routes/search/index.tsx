@@ -6,10 +6,12 @@ import {
   getClient,
   type Link,
   QUERY_LINKS_MAX_ROWS,
+  SEARCH_QUERY_MAX_CHARS,
   type SearchLink,
   type SearchResult,
 } from "../../lib/dmoz-client.ts";
 import { embedQuery } from "../../lib/embedder.ts";
+import { searchFailure } from "./_lib/failure.ts";
 import { tokensFor } from "./_lib/highlight.tsx";
 import {
   buildHref,
@@ -311,6 +313,14 @@ export const handler = define.handlers<Data>({
     const cat = parsePositiveInt(url.searchParams.get("cat"));
     const year = parsePositiveInt(url.searchParams.get("year"));
 
+    if (q.length > SEARCH_QUERY_MAX_CHARS) {
+      ctx.state.title = "Search";
+      return page({
+        ...emptyData("", sort, cat, year),
+        error: `Search for at most ${SEARCH_QUERY_MAX_CHARS} characters.`,
+      }, { status: 400 });
+    }
+
     ctx.state.title = q ? `Search: ${q}` : "Search";
 
     if (!q) return page(emptyData(q, sort, cat, year));
@@ -359,11 +369,11 @@ export const handler = define.handlers<Data>({
       });
       return timed(data, watch);
     } catch (e) {
-      console.error("Search failed:", e);
+      const failure = searchFailure(e);
       return page({
         ...emptyData(q, sort, cat, year),
-        error: "Search unavailable",
-      });
+        error: failure.error,
+      }, { status: failure.status });
     }
   },
 });

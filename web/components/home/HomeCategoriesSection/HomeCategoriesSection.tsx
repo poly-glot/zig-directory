@@ -36,7 +36,7 @@ export default function HomeCategoriesSection({ categories }: Props) {
                   num={pad2(i + 1)}
                   href={`/category/${cat.slug || cat.id}`}
                   name={cat.name}
-                  count={cat.linkCountSubtree ?? 0}
+                  count={cat.linkCountSubtreeApproved}
                 />
               ))}
             </ul>

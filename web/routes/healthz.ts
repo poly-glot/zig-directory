@@ -1,12 +1,5 @@
 import { define } from "../utils.ts";
 
-// Kubernetes liveness/readiness/startup probe target.
-//
-// The web process is up if this route answers at all. We additionally verify
-// the backend is reachable so the pod restarts when dmozdb dies inside the
-// same container: a failing liveness probe restarts the pod, and the
-// entrypoint relaunches both processes. A bare TCP connect (no binary
-// handshake) is enough — if dmozdb crashed, its loopback port stops accepting.
 const HOST = Deno.env.get("DMOZDB_HOST") ?? "localhost";
 const PORT = Number(Deno.env.get("DMOZDB_PORT") ?? "8080");
 

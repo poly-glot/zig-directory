@@ -8,14 +8,17 @@ import {
   type LinkQueryGroupBy,
   MAX_ENTITY_NAME_BYTES,
   QUERY_LINKS_MAX_ROWS,
+  SEARCH_QUERY_MAX_CHARS,
 } from "../../../../lib/dmoz-client.ts";
 import { type Religion, RELIGIONS } from "../../../../lib/dmoz-protocol.gen.ts";
 import { categoryPath } from "../../../../lib/format.ts";
 import {
+  afterCursor,
+  badRequest,
   categoryNotFound,
+  cursorMessage,
   errorResponse,
   linkJson,
-  nonNegativeInt,
 } from "../_lib/api.ts";
 
 const GROUP_BY: readonly LinkQueryGroupBy[] = [
@@ -33,6 +36,24 @@ const WORD_MATCHES = ["any", "all"] as const;
 const COUNTRY_CODE = /^[A-Za-z]{2}$/;
 const DEFAULT_GROUPS = 10;
 const DEFAULT_LIMIT = 20;
+const PARAMETERS = new Set([
+  "after",
+  "budget",
+  "category",
+  "country",
+  "domain",
+  "entity",
+  "group",
+  "groups",
+  "hosted",
+  "limit",
+  "match",
+  "named",
+  "religion",
+  "subdomain",
+  "via",
+  "words",
+]);
 
 function oneOf<T extends string>(
   raw: string | null,
@@ -73,13 +94,22 @@ function rows(raw: string | null, fallback: number): number | undefined {
   return valid ? n : undefined;
 }
 
-function badRequest(error: string): Response {
-  return Response.json({ error }, { status: 400 });
+function unknownParameters(params: URLSearchParams): string[] {
+  return [...new Set(params.keys())].filter((name) => !PARAMETERS.has(name));
 }
 
 export const handler = define.handlers({
   async GET(ctx) {
     const params = ctx.url.searchParams;
+    const unknown = unknownParameters(params);
+    if (unknown.length > 0) {
+      return badRequest(
+        `unknown parameters: ${unknown.join(", ")}; known: ${
+          [...PARAMETERS].join(", ")
+        }`,
+      );
+    }
+
     const country = (params.get("country") ?? "").trim();
     const groupBy = oneOf(params.get("group"), GROUP_BY, "none");
     const via = listOf<CountryEdge>(
@@ -94,6 +124,10 @@ export const handler = define.handlers({
     const withinBudget = ["1", "true"].includes(params.get("budget") ?? "");
     const groupLimit = rows(params.get("groups"), DEFAULT_GROUPS);
     const limit = rows(params.get("limit"), DEFAULT_LIMIT);
+    const words = (params.get("words") ?? "").trim();
+    const domain = (params.get("domain") ?? "").trim();
+    const path = (params.get("category") ?? "").trim();
+    const afterId = afterCursor(params.get("after"));
 
     if (country !== "" && !COUNTRY_CODE.test(country)) {
       return badRequest("country must be a two-letter ISO 3166 code");
@@ -122,10 +156,29 @@ export const handler = define.handlers({
         `groups and limit must be 0 to ${QUERY_LINKS_MAX_ROWS}`,
       );
     }
+    if (afterId === undefined) return badRequest(cursorMessage("after"));
+    if (words.length > SEARCH_QUERY_MAX_CHARS) {
+      return badRequest(
+        `words must be at most ${SEARCH_QUERY_MAX_CHARS} characters`,
+      );
+    }
+    const narrowed = [
+      path,
+      domain,
+      country,
+      words,
+      entity,
+      ...named,
+      ...religions,
+    ].some((filter) => filter !== "");
+    if (!narrowed) {
+      return badRequest(
+        "give at least one of category, named, domain, country, words, entity or religion",
+      );
+    }
 
     try {
       const client = getClient();
-      const path = (params.get("category") ?? "").trim();
       let categoryId = 0;
       if (path !== "") {
         const browsed = await client.browsePathIfFound(path);
@@ -137,19 +190,19 @@ export const handler = define.handlers({
         categoryId,
         categoryNames: named,
         wordsWithinBudget: withinBudget,
-        domain: (params.get("domain") ?? "").trim(),
+        domain,
         country: country.toUpperCase(),
         via,
         hostedOnly: ["1", "true"].includes(params.get("hosted") ?? ""),
         subdomainOnly: ["1", "true"].includes(params.get("subdomain") ?? ""),
-        words: (params.get("words") ?? "").trim(),
+        words,
         allWords: match === "all",
         religions,
         entity,
         groupBy,
         groupLimit,
         limit,
-        afterId: nonNegativeInt(params.get("after")),
+        afterId,
       });
       if (!result.ready) {
         return Response.json(

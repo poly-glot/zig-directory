@@ -1,18 +1,20 @@
 import { page } from "fresh";
 import { define } from "../../utils.ts";
 import { authenticateUser } from "../../lib/kv-users.ts";
+import {
+  clientAddress,
+  consumeAttempt,
+  refundAttempt,
+} from "../../lib/rate-limit.ts";
 import { createSession } from "../../lib/session.ts";
 import Eyebrow from "../../components/common/Eyebrow/Eyebrow.tsx";
 import styles from "./login.module.css";
+import { safeRedirect } from "./_lib/redirect.ts";
 
 interface Data {
   error?: string;
   email?: string;
   redirect: string;
-}
-
-function safeRedirect(raw: string | null): string {
-  return raw && /^\/(?!\/)/.test(raw) ? raw : "/";
 }
 
 export const handler = define.handlers<Data>({
@@ -37,12 +39,26 @@ export const handler = define.handlers<Data>({
       });
     }
 
+    const address = clientAddress(ctx.req, ctx.info);
+    if (!(await consumeAttempt("login", address))) {
+      return page(
+        {
+          error: "Too many sign-in attempts. Try again later.",
+          email,
+          redirect,
+        },
+        { status: 429 },
+      );
+    }
+
     const user = await authenticateUser(email, password);
     if (!user) {
       return page({ error: "Invalid email or password", email, redirect });
     }
 
-    const { cookie } = await createSession(user.id);
+    await refundAttempt("login", address);
+
+    const { cookie } = await createSession(user.id, ctx.req);
     return new Response(null, {
       status: 303,
       headers: { Location: redirect, "Set-Cookie": cookie },

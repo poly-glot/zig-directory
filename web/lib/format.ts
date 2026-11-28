@@ -2,6 +2,25 @@
 // "Aug 12, 2026" / "Aug 2026" / "2 days ago" rendering stays identical
 // in every slice — change once, applied everywhere.
 
+export function listingsLede(
+  page: number,
+  count: number,
+  total: number,
+  pageSize: number,
+): string {
+  const first = (page - 1) * pageSize + 1;
+  const last = (page - 1) * pageSize + count;
+  return `Showing ${first.toLocaleString()}–${last.toLocaleString()} of ${total.toLocaleString()} editor-approved links.`;
+}
+
+export function pageCount(
+  total: number,
+  pageSize: number,
+  maxPages: number,
+): number {
+  return Math.min(Math.ceil(total / pageSize) || 1, maxPages);
+}
+
 export function pad2(n: number): string {
   return n.toString().padStart(2, "0");
 }

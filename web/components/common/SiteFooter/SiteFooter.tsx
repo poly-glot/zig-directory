@@ -20,7 +20,9 @@ function AccountList({ user }: Props) {
           )
           : null}
         <li>
-          <a href="/auth/logout">Sign out</a>
+          <form class={styles.signOut} method="POST" action="/auth/logout">
+            <button type="submit">Sign out</button>
+          </form>
         </li>
       </ul>
     );

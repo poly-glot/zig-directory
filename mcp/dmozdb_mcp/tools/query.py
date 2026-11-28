@@ -2,6 +2,7 @@ from typing import Annotated, Literal
 
 from fastmcp import Context
 from fastmcp.apps import PrefabAppConfig
+from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp_types import ToolAnnotations
 from pydantic import Field
@@ -9,7 +10,7 @@ from pydantic import Field
 from dmozdb_mcp import client, formatting, views
 from dmozdb_mcp.app import mcp_app
 from dmozdb_mcp.client import JSON
-from dmozdb_mcp.formatting import MAX_LIMIT
+from dmozdb_mcp.formatting import MAX_AFTER_ID, MAX_LIMIT, utf8_bytes_at_most
 
 MAX_GROUPS = 50
 DEFAULT_GROUPS = 10
@@ -33,6 +34,20 @@ type Religion = Literal[
     "paganism",
 ]
 ALL_EDGES: tuple[CountryEdge, ...] = ("cctld", "category", "entity")
+DOMAIN_BYTES_MAX = 64
+ENTITY_BYTES_MAX = 64
+CATEGORY_NAME_BYTES_MAX = 128
+WORDS_BYTES_MAX = 256
+
+type CategoryName = Annotated[
+    str,
+    Field(max_length=CATEGORY_NAME_BYTES_MAX, pattern="^[^,]*$"),
+    utf8_bytes_at_most(CATEGORY_NAME_BYTES_MAX),
+]
+
+
+def _narrowed(*filters: str) -> bool:
+    return any(value.strip() for value in filters)
 
 
 def _headline(found: JSON) -> str:
@@ -47,7 +62,7 @@ def _headline(found: JSON) -> str:
 def _group_line(group: JSON) -> str:
     links = formatting.counted(group["links"], "link", "links")
     sites = formatting.counted(group["sites"], "site", "sites")
-    return f"  {group['key']} — {links}, {sites}"
+    return f"  {formatting.single_line(str(group['key']))} — {links}, {sites}"
 
 
 def _summarize(found: JSON, group_by: str) -> list[str]:
@@ -75,8 +90,13 @@ def _summarize(found: JSON, group_by: str) -> list[str]:
         "optional keywords. Use it for "
         "how many, which domains, which countries, which religions, or links "
         "naming someone; use search_directory to find sites by meaning. "
-        "Category paths come from browse_category or search_directory. Pass "
-        "the after_id from a reply to get the next page of links."
+        "Category paths come from browse_category or search_directory. At "
+        "least one of category_path, category_names, domain, country, words, "
+        "entity or religions is required; a call with none is refused. A "
+        "question whose words match too many links is refused as too broad: "
+        "narrow it with rarer words, match_all_words, a category_path or a "
+        "country. Pass the after_id from a reply to get the next page of "
+        "links."
     ),
     annotations=ToolAnnotations(
         title="Count and group links",
@@ -90,13 +110,15 @@ async def query_links(
     domain: Annotated[
         str,
         Field(
-            max_length=64,
+            max_length=DOMAIN_BYTES_MAX,
             description=(
                 'Host or domain suffix, matched on whole labels: "tripod.com" '
                 'covers every *.tripod.com host, "pk" every .pk host, "ac.uk" '
-                "UK universities. Empty for any domain."
+                f"UK universities. At most {DOMAIN_BYTES_MAX} bytes of UTF-8. "
+                "Empty for any domain."
             ),
         ),
+        utf8_bytes_at_most(DOMAIN_BYTES_MAX),
     ] = "",
     country: Annotated[
         str,
@@ -130,12 +152,15 @@ async def query_links(
     entity: Annotated[
         str,
         Field(
-            max_length=64,
+            max_length=ENTITY_BYTES_MAX,
             description=(
                 "A person or organisation the link names, matched as a whole "
-                'name in any case, such as "Jamia Farooqia". Empty for none.'
+                'name in any case, such as "Jamia Farooqia". At most '
+                f"{ENTITY_BYTES_MAX} bytes of UTF-8, so fewer characters "
+                "outside ASCII. Empty for none."
             ),
         ),
+        utf8_bytes_at_most(ENTITY_BYTES_MAX),
     ] = "",
     category_path: Annotated[
         str,
@@ -148,12 +173,14 @@ async def query_links(
         ),
     ] = "",
     category_names: Annotated[
-        tuple[str, ...],
+        tuple[CategoryName, ...],
         Field(
             max_length=16,
             description=(
-                "Only links under a category that carries one of these names, "
-                "wherever it sits in the tree and in singular or plural: "
+                "Only links under a category that carries one of these names "
+                f"(each at most {CATEGORY_NAME_BYTES_MAX} bytes of UTF-8, no "
+                "commas), wherever it sits in the tree and in singular or "
+                "plural: "
                 '["politicians", "presidents", "prime ministers"] collects the '
                 "people filed under every such category. Combines with "
                 "category_path. Empty for no name filter."
@@ -183,13 +210,15 @@ async def query_links(
     words: Annotated[
         str,
         Field(
-            max_length=256,
+            max_length=WORDS_BYTES_MAX,
             description=(
                 "Keywords a link's title, URL or description must contain, "
-                "whole words of two or more letters. Empty for no keyword "
+                "whole words of two or more letters, at most "
+                f"{WORDS_BYTES_MAX} bytes of UTF-8. Empty for no keyword "
                 "filter."
             ),
         ),
+        utf8_bytes_at_most(WORDS_BYTES_MAX),
     ] = "",
     match_all_words: Annotated[
         bool,
@@ -221,6 +250,7 @@ async def query_links(
         int,
         Field(
             ge=0,
+            le=MAX_AFTER_ID,
             description=(
                 "Cursor for the next page of links: pass the after_id this "
                 "tool reported last time. 0 starts at the first page."
@@ -228,6 +258,20 @@ async def query_links(
         ),
     ] = 0,
 ) -> ToolResult:
+    if not _narrowed(
+        category_path,
+        domain,
+        country,
+        words,
+        entity,
+        *category_names,
+        *religions,
+    ):
+        raise ToolError(
+            "give at least one of category_path, category_names, domain, "
+            "country, words, entity or religions; with none the question "
+            "covers the whole directory and is refused."
+        )
     if category_path:
         await client.category_at(category_path)
     found = await client.fetch(

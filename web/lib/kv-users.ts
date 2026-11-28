@@ -15,6 +15,14 @@ export interface User {
   updatedAt: string;
 }
 
+const PBKDF2_ITERATIONS = 600_000;
+const LEGACY_PBKDF2_ITERATIONS = 100_000;
+const UNKNOWN_USER_PASSWORD_HASH = [
+  PBKDF2_ITERATIONS,
+  "00".repeat(16),
+  "00".repeat(32),
+].join(":");
+
 let _kv: Deno.Kv | null = null;
 
 export async function getKv(): Promise<Deno.Kv> {
@@ -39,12 +47,14 @@ function hexDecode(hex: string): Uint8Array {
   return bytes;
 }
 
-async function hashPassword(password: string): Promise<string> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const encoder = new TextEncoder();
+async function derivePasswordHash(
+  password: string,
+  salt: Uint8Array,
+  iterations: number,
+): Promise<string> {
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(password),
+    new TextEncoder().encode(password),
     "PBKDF2",
     false,
     ["deriveBits"],
@@ -53,40 +63,66 @@ async function hashPassword(password: string): Promise<string> {
     {
       name: "PBKDF2",
       salt: salt.buffer as ArrayBuffer,
-      iterations: 100000,
+      iterations,
       hash: "SHA-256",
     },
     keyMaterial,
     256,
   );
-  return `${hexEncode(salt.buffer as ArrayBuffer)}:${hexEncode(bits)}`;
+  return hexEncode(bits);
+}
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await derivePasswordHash(password, salt, PBKDF2_ITERATIONS);
+  return [PBKDF2_ITERATIONS, hexEncode(salt.buffer as ArrayBuffer), hash]
+    .join(":");
+}
+
+function parsePasswordHash(
+  storedHash: string,
+): { iterations: number; saltHex: string; hashHex: string } {
+  const parts = storedHash.split(":");
+  if (parts.length === 2) {
+    const [saltHex, hashHex] = parts;
+    return { iterations: LEGACY_PBKDF2_ITERATIONS, saltHex, hashHex };
+  }
+
+  const [iterations, saltHex, hashHex] = parts;
+  return { iterations: Number(iterations), saltHex, hashHex };
 }
 
 async function verifyPassword(
   password: string,
   storedHash: string,
 ): Promise<boolean> {
-  const [saltHex, hashHex] = storedHash.split(":");
-  const salt = hexDecode(saltHex);
-  const encoder = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
+  const { iterations, saltHex, hashHex } = parsePasswordHash(storedHash);
+  const hash = await derivePasswordHash(
+    password,
+    hexDecode(saltHex),
+    iterations,
   );
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      salt: salt.buffer as ArrayBuffer,
-      iterations: 100000,
-      hash: "SHA-256",
-    },
-    keyMaterial,
-    256,
-  );
-  return hexEncode(bits) === hashHex;
+  return hash === hashHex;
+}
+
+async function upgradePasswordHash(
+  user: User,
+  password: string,
+): Promise<User> {
+  const kv = await getKv();
+  const entry = await kv.get<User>(["users", user.id]);
+  if (!entry.value) return user;
+
+  const upgraded = {
+    ...entry.value,
+    passwordHash: await hashPassword(password),
+  };
+  const result = await kv
+    .atomic()
+    .check(entry)
+    .set(["users", user.id], upgraded)
+    .commit();
+  return result.ok ? upgraded : user;
 }
 
 export async function createUser(
@@ -152,11 +188,16 @@ export async function authenticateUser(
   password: string,
 ): Promise<User | null> {
   const user = await getUserByEmail(email);
-  if (!user) return null;
+  const valid = await verifyPassword(
+    password,
+    user?.passwordHash ?? UNKNOWN_USER_PASSWORD_HASH,
+  );
+  if (!user || !valid) return null;
 
-  const valid = await verifyPassword(password, user.passwordHash);
-  if (!valid) return null;
-
+  const { iterations } = parsePasswordHash(user.passwordHash);
+  if (iterations < PBKDF2_ITERATIONS) {
+    return await upgradePasswordHash(user, password);
+  }
   return user;
 }
 

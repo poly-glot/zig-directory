@@ -1,10 +1,17 @@
 import { define } from "../../../utils.ts";
-import { getClient } from "../../../lib/dmoz-client.ts";
+import { getClient, SEARCH_QUERY_MAX_CHARS } from "../../../lib/dmoz-client.ts";
 import { categoryPath } from "../../../lib/format.ts";
 import { embedQuery } from "../../../lib/embedder.ts";
 import { rankedQuery } from "../../search/_lib/targets.ts";
 import { logSearch, stopwatch } from "../../../lib/timing.ts";
-import { categoryJson, errorResponse, linkJson, pageSize } from "./_lib/api.ts";
+import {
+  badRequest,
+  categoryJson,
+  errorResponse,
+  linkJson,
+  PAGE_SIZE_MESSAGE,
+  pageSize,
+} from "./_lib/api.ts";
 
 type Scope = "both" | "links" | "categories";
 
@@ -21,11 +28,16 @@ export const handler = define.handlers({
     const { searchParams } = ctx.url;
     const query = (searchParams.get("q") ?? "").trim();
     if (query.length < MIN_QUERY_LENGTH) {
-      return Response.json(
-        { error: `q must be at least ${MIN_QUERY_LENGTH} characters` },
-        { status: 400 },
+      return badRequest(`q must be at least ${MIN_QUERY_LENGTH} characters`);
+    }
+    if (query.length > SEARCH_QUERY_MAX_CHARS) {
+      return badRequest(
+        `q must be at most ${SEARCH_QUERY_MAX_CHARS} characters`,
       );
     }
+    const limit = pageSize(searchParams.get("limit"));
+    if (limit === undefined) return badRequest(PAGE_SIZE_MESSAGE);
+
     try {
       const client = getClient();
       const watch = stopwatch();
@@ -36,7 +48,7 @@ export const handler = define.handlers({
         : await watch.time("embed", () => embedQuery(ranked));
       const result = await watch.time("search", () =>
         client.search(ranked, {
-          limit: pageSize(searchParams.get("limit")),
+          limit,
           scope,
           mode: "ranked",
           capPerSite: true,

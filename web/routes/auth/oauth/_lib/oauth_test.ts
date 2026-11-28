@@ -13,6 +13,7 @@ import {
   verifyPkce,
 } from "../../../../lib/oauth.ts";
 import { isCimdClientId, resolveCimdClient } from "../../../../lib/cimd.ts";
+import { createUser, deleteUser, getKv } from "../../../../lib/kv-users.ts";
 
 Deno.env.set("KV_PATH", ":memory:");
 
@@ -101,26 +102,38 @@ Deno.test({
   },
 });
 
-Deno.test(
-  "verifyBearerToken accepts a validly signed token and rejects tampering",
-  async () => {
-    const { privateKey, publicKey } = await generateKeyPair("RS256", {
-      modulusLength: 2048,
-      extractable: true,
-    });
-    const publicJwk = await exportJWK(publicKey);
-    publicJwk.alg = "RS256";
+async function installTestSigningKeys(): Promise<void> {
+  const { privateKey, publicKey } = await generateKeyPair("RS256", {
+    modulusLength: 2048,
+    extractable: true,
+  });
+  const publicJwk = await exportJWK(publicKey);
+  publicJwk.alg = "RS256";
 
-    Deno.env.set("OAUTH_ISSUER_URL", "https://issuer.example.com");
-    Deno.env.set("MCP_RESOURCE_URL", "https://resource.example.com/mcp");
-    Deno.env.set(
-      "MCP_JWT_PRIVATE_KEY_PEM",
-      (await exportPKCS8(privateKey)).trim().replaceAll("\n", "\\n"),
+  Deno.env.set("OAUTH_ISSUER_URL", "https://issuer.example.com");
+  Deno.env.set("MCP_RESOURCE_URL", "https://resource.example.com/mcp");
+  Deno.env.set(
+    "MCP_JWT_PRIVATE_KEY_PEM",
+    (await exportPKCS8(privateKey)).trim().replaceAll("\n", "\\n"),
+  );
+  Deno.env.set("MCP_JWT_PUBLIC_KEY_JWK", JSON.stringify(publicJwk));
+}
+
+Deno.test({
+  name:
+    "verifyBearerToken accepts a validly signed token and rejects tampering",
+  sanitizeResources: false,
+  async fn() {
+    await installTestSigningKeys();
+    const admin = await createUser(
+      "bearer@example.com",
+      "bearer",
+      "password-1",
+      "admin",
     );
-    Deno.env.set("MCP_JWT_PUBLIC_KEY_JWK", JSON.stringify(publicJwk));
 
     const { accessToken } = await signAccessToken({
-      userId: "user-1",
+      userId: admin.id,
       role: "admin",
       clientId: "client-1",
       resource: "https://resource.example.com/mcp",
@@ -128,7 +141,7 @@ Deno.test(
     });
 
     assertEquals(await verifyBearerToken(accessToken), {
-      userId: "user-1",
+      userId: admin.id,
       role: "admin",
     });
     assertEquals(
@@ -138,7 +151,7 @@ Deno.test(
     assertEquals(await verifyBearerToken("not-a-jwt"), null);
 
     const wrongAudience = await signAccessToken({
-      userId: "user-1",
+      userId: admin.id,
       role: "admin",
       clientId: "client-1",
       resource: "https://someone-elses-resource.example.com/mcp",
@@ -150,7 +163,7 @@ Deno.test(
     // so a token that never carried it must not be spendable here even though
     // its signature, issuer, audience and role all check out.
     const withoutScope = await signAccessToken({
-      userId: "user-1",
+      userId: admin.id,
       role: "admin",
       clientId: "client-1",
       resource: "https://resource.example.com/mcp",
@@ -159,18 +172,49 @@ Deno.test(
     assertEquals(await verifyBearerToken(withoutScope.accessToken), null);
 
     const amongOtherScopes = await signAccessToken({
-      userId: "user-1",
+      userId: admin.id,
       role: "admin",
       clientId: "client-1",
       resource: "https://resource.example.com/mcp",
       scope: "profile mcp offline_access",
     });
     assertEquals(await verifyBearerToken(amongOtherScopes.accessToken), {
-      userId: "user-1",
+      userId: admin.id,
       role: "admin",
     });
   },
-);
+});
+
+Deno.test({
+  name: "verifyBearerToken reports the current role and drops deleted users",
+  sanitizeResources: false,
+  async fn() {
+    await installTestSigningKeys();
+    const admin = await createUser(
+      "demoted@example.com",
+      "demoted",
+      "password-1",
+      "admin",
+    );
+    const { accessToken } = await signAccessToken({
+      userId: admin.id,
+      role: "admin",
+      clientId: "client-1",
+      resource: "https://resource.example.com/mcp",
+      scope: "mcp",
+    });
+
+    const kv = await getKv();
+    await kv.set(["users", admin.id], { ...admin, role: "user" });
+    assertEquals(await verifyBearerToken(accessToken), {
+      userId: admin.id,
+      role: "user",
+    });
+
+    await deleteUser(admin.id);
+    assertEquals(await verifyBearerToken(accessToken), null);
+  },
+});
 
 Deno.test("redirect matching is exact for plain patterns", () => {
   assert(redirectUriMatches(
@@ -225,6 +269,17 @@ Deno.test("wildcard host patterns only match subdomains", () => {
       "https://*.example.com/cb",
     ),
   );
+});
+
+Deno.test("registered redirect_uris may not use a wildcard host", () => {
+  assertEquals(validateRedirectUris(["https://*/cb"]), null);
+  assertEquals(validateRedirectUris(["https://*.com/cb"]), null);
+  assertEquals(validateRedirectUris(["https://*.example.com/cb"]), null);
+});
+
+Deno.test("a bare or top-level wildcard host matches no real host", () => {
+  assert(!redirectUriMatches("https://evil.example/cb", "https://*/cb"));
+  assert(!redirectUriMatches("https://evil.com/cb", "https://*.com/cb"));
 });
 
 Deno.test("CIMD client ids must be https URLs", () => {
