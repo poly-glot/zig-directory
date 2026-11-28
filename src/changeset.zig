@@ -4,8 +4,9 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const codec = @import("zigstore").codec;
-const wire_codec = @import("zigstore").wire_codec;
+const zigstore = @import("zigstore");
+const codec = zigstore.codec;
+const wire_codec = zigstore.wire_codec;
 const schema = @import("schema.zig");
 const test_support = @import("test_support.zig");
 
@@ -179,6 +180,36 @@ pub const DecodeError = error{
     OutOfMemory,
 };
 
+// The zigstore WAL refuses a record over 16 MiB at append with `error.RecordTooLarge` (the
+// recovery bound in `wal.zig`, which the engine does not export). The refusal comes before the
+// append, so it is an error and not a crash, but a change set that always exceeds it can never
+// commit: a rename above the size would always fail, and a repair chunk above it would hold its
+// task in the queue for good.
+pub const record_len_max: u64 = 16 * 1024 * 1024;
+// Every buffer a path is composed into (the change-set compute, the repair worker) is this long,
+// so an old path from a store written before paths were capped may be that long; the new path
+// is a key. Each path carries a u32 length.
+pub const path_composed_len_max: u64 = 2048;
+pub const swap_encoded_len_max: u64 = 4 + path_composed_len_max + 4 + zigstore.MAX_KEY_LEN + 8;
+// Everything else in the largest change set that carries swaps, a move: two ancestor chains of
+// depth_max, the category record, old and new paths and the queued prefix. The test "the
+// largest change set that carries swaps fits one WAL record" measures it.
+const swap_change_set_rest_len_max: u64 = 16 * 1024;
+/// The most slug-path swaps one change set may carry: the bound on the inline rename threshold
+/// and on the repair worker's chunk size, which decide how many swaps a change set gets.
+pub const swaps_per_change_set_max: u32 = @intCast(@divFloor(
+    record_len_max - swap_change_set_rest_len_max,
+    swap_encoded_len_max,
+));
+
+comptime {
+    assert(swaps_per_change_set_max >= 1000);
+    // The queued prefix is an old path too; it must not outgrow the bound the swaps assume.
+    assert(@FieldType(schema.RepairTask, "old_slug_prefix").capacity <= path_composed_len_max);
+    assert(swaps_per_change_set_max * swap_encoded_len_max + swap_change_set_rest_len_max <=
+        record_len_max);
+}
+
 pub fn encode(allocator: std.mem.Allocator, change_set: ChangeSet) ![]u8 {
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(allocator);
@@ -214,6 +245,139 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !ChangeSet {
             assert(cursor <= bytes.len);
             return @unionInit(ChangeSet, @tagName(op), variant);
         },
+    }
+}
+
+/// The engine checks a key only when apply inserts it, after the WAL append, and a key it
+/// refuses there fails every replay as well, so the store cannot boot. Slug paths are the one
+/// key a change set carries whose length is a runtime value rather than a record type's
+/// capacity (`apply.zig` asserts the rest at comptime), so every path a change set will insert
+/// is checked here, on the commit path, before the append.
+pub fn ensure_keys_fit(change_set: *const ChangeSet) error{PathTooLong}!void {
+    const inserted: InsertedPaths = switch (change_set.*) {
+        .category_inserted => |*effect| .{ .own = effect.slug_path },
+        .category_renamed => |*effect| .{
+            .own = effect.new_slug_path,
+            .swaps = effect.descendant_swaps,
+            .queued = effect.above_threshold,
+        },
+        .category_moved => |*effect| .{
+            .own = effect.new_slug_path,
+            .swaps = effect.descendant_swaps,
+            .queued = effect.above_threshold,
+        },
+        .slug_path_repair_chunk => |*effect| .{ .swaps = effect.swaps },
+        else => return,
+    };
+    if (inserted.queued) assert(inserted.swaps.len == 0);
+    if (inserted.own.len > zigstore.MAX_KEY_LEN) return error.PathTooLong;
+    for (inserted.swaps) |swap| {
+        assert(swap.cat_id != 0);
+        assert(swap.new_path.len > 0);
+        if (swap.new_path.len > zigstore.MAX_KEY_LEN) return error.PathTooLong;
+    }
+}
+
+// The slug-path keys a change set inserts: the category's own path and its descendants' new
+// paths. The old paths are only deleted, which the engine does at any length.
+const InsertedPaths = struct {
+    own: []const u8 = "",
+    swaps: []const SlugPathSwap = &.{},
+    queued: bool = false,
+};
+
+// Goal: every slug path a change set would insert is refused above the engine's key limit, and
+// the old paths it only deletes are not. Method: one change set per carrier with a path one
+// byte over, then the same with the long path only on the deleting side.
+test "ensure_keys_fit refuses an inserted slug path over MAX_KEY_LEN" {
+    const long_path: [zigstore.MAX_KEY_LEN + 1]u8 = @splat('p');
+    const fitting_path = long_path[0..zigstore.MAX_KEY_LEN];
+    const long_swap = [_]SlugPathSwap{.{ .old_path = "a", .new_path = &long_path, .cat_id = 2 }};
+    const old_long = [_]SlugPathSwap{.{ .old_path = &long_path, .new_path = "a", .cat_id = 2 }};
+
+    const inserted: ChangeSet = .{ .category_inserted = .{
+        .cat = .{ .id = 1 },
+        .ancestor_updates = &.{},
+        .tokens = &.{},
+        .slug_path = &long_path,
+        .is_shallowest_for_slug = false,
+    } };
+    try std.testing.expectError(error.PathTooLong, ensure_keys_fit(&inserted));
+
+    var renamed: ChangeSet = .{ .category_renamed = .{
+        .old_cat = .{ .id = 1 },
+        .new_cat = .{ .id = 1 },
+        .old_slug_path = &long_path,
+        .new_slug_path = fitting_path,
+        .descendant_swaps = &old_long,
+        .above_threshold = false,
+        .enqueue = .{},
+    } };
+    try ensure_keys_fit(&renamed);
+    renamed.category_renamed.descendant_swaps = &long_swap;
+    try std.testing.expectError(error.PathTooLong, ensure_keys_fit(&renamed));
+
+    var chunk: ChangeSet = .{ .slug_path_repair_chunk = .{ .task_seq = 1, .swaps = &old_long } };
+    try ensure_keys_fit(&chunk);
+    chunk.slug_path_repair_chunk.swaps = &long_swap;
+    try std.testing.expectError(error.PathTooLong, ensure_keys_fit(&chunk));
+}
+
+// Goal: a change set carrying `swaps_per_change_set_max` swaps of the longest paths still fits
+// one WAL record, so neither a rename at the inline threshold nor a repair chunk can be refused
+// as too large. Method: encode a move and a rename with every slice at its maximum, first
+// without swaps to measure the rest, then with the full count of swaps.
+test "the largest change set that carries swaps fits one WAL record" {
+    const allocator = std.testing.allocator;
+    const depth_max = @import("operations/operations_shared.zig").depth_max;
+    const old_path: [path_composed_len_max]u8 = @splat('o');
+    const new_path: [zigstore.MAX_KEY_LEN]u8 = @splat('n');
+    const chain: [depth_max]AncestorUpdate = @splat(.{
+        .cat_id = 1,
+        .link_count_subtree_delta = -1,
+        .child_count_subtree_delta = -1,
+    });
+    const swaps = try allocator.alloc(SlugPathSwap, swaps_per_change_set_max);
+    defer allocator.free(swaps);
+    @memset(swaps, .{ .old_path = &old_path, .new_path = &new_path, .cat_id = 2 });
+    const enqueue: EnqueueOnApply = .{ .seq = 1, .old_slug_prefix = &old_path };
+
+    var moved: ChangeSet = .{ .category_moved = .{
+        .cat = .{ .id = 2 },
+        .old_parent_id = 1,
+        .new_parent_id = 3,
+        .old_chain_updates = &chain,
+        .new_chain_updates = &chain,
+        .old_slug_path = &old_path,
+        .new_slug_path = &new_path,
+        .link_subtree_delta = 1,
+        .child_subtree_delta = 1,
+        .descendant_swaps = &.{},
+        .above_threshold = true,
+        .enqueue = enqueue,
+    } };
+    var renamed: ChangeSet = .{ .category_renamed = .{
+        .old_cat = .{ .id = 2 },
+        .new_cat = .{ .id = 2 },
+        .old_slug_path = &old_path,
+        .new_slug_path = &new_path,
+        .descendant_swaps = &.{},
+        .above_threshold = true,
+        .enqueue = enqueue,
+    } };
+    for ([_]*ChangeSet{ &moved, &renamed }) |change_set| {
+        const rest = try encode(allocator, change_set.*);
+        defer allocator.free(rest);
+        try std.testing.expect(rest.len <= swap_change_set_rest_len_max);
+    }
+
+    moved.category_moved.descendant_swaps = swaps;
+    renamed.category_renamed.descendant_swaps = swaps;
+    const chunk: ChangeSet = .{ .slug_path_repair_chunk = .{ .task_seq = 1, .swaps = swaps } };
+    for ([_]*const ChangeSet{ &moved, &renamed, &chunk }) |change_set| {
+        const encoded = try encode(allocator, change_set.*);
+        defer allocator.free(encoded);
+        try std.testing.expect(encoded.len <= record_len_max);
     }
 }
 

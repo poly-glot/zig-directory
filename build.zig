@@ -1,6 +1,6 @@
 //! Build graph for dmozdb: the server executable with its `run` step, the `test` step over the
-//! `src/` and `bench/` test roots, the `-Dtools=true` executables (bench and dmoz_import, always
-//! ReleaseFast so their numbers stay comparable across runs) and the `gen-client-ts` generator
+//! `src/` and `bench/` test roots, the `-Dtools=true` executables (bench, always ReleaseFast so its
+//! numbers stay comparable across runs, and dmoz_import) and the `gen-client-ts` generator
 //! step. Each helper registers exactly the steps its name says, so `build` fixes the step list.
 
 const std = @import("std");
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
 
     add_server(b, target, optimize, zigstore);
     add_tests(b, target, optimize, zigstore);
-    if (build_tools) add_tools(b, target, zigstore);
+    if (build_tools) add_tools(b, target, optimize, zigstore);
     add_client_generator(b, target, optimize, zigstore);
 
     assert(b.top_level_steps.count() == top_level_steps_count);
@@ -101,8 +101,17 @@ fn add_tests(
     assert(b.top_level_steps.contains("test"));
 }
 
-fn add_tools(b: *std.Build, target: std.Build.ResolvedTarget, zigstore: *std.Build.Module) void {
+fn add_tools(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zigstore: *std.Build.Module,
+) void {
     const installed_before = b.getInstallStep().dependencies.items.len;
+    // The importer writes the store.dat the ReleaseSafe server opens, so it keeps its safety
+    // checks: it follows -Doptimize, and builds ReleaseSafe when none is given.
+    const import_optimize: std.builtin.OptimizeMode =
+        if (b.user_input_options.contains("optimize")) optimize else .ReleaseSafe;
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
@@ -119,7 +128,7 @@ fn add_tools(b: *std.Build, target: std.Build.ResolvedTarget, zigstore: *std.Bui
     const import_mod = b.createModule(.{
         .root_source_file = b.path("src/import_main.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = import_optimize,
     });
     import_mod.addImport("zigstore", zigstore);
     const import_exe = b.addExecutable(.{
@@ -128,7 +137,8 @@ fn add_tools(b: *std.Build, target: std.Build.ResolvedTarget, zigstore: *std.Bui
     });
     b.installArtifact(import_exe);
 
-    assert(bench_mod.optimize.? == import_mod.optimize.?);
+    assert(bench_mod.optimize.? == .ReleaseFast);
+    assert(import_mod.optimize.? == import_optimize);
     assert(b.getInstallStep().dependencies.items.len == installed_before + 2);
 }
 

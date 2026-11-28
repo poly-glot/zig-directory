@@ -17,7 +17,11 @@ pub const Category = extern struct {
     link_count: u32 = 0,
     child_count: u32 = 0,
     sort_order: u32 = 0,
-    _pad0: u32 = 0,
+    // Format 10 keeps the subtree's approved and pending links in the two spare words the
+    // record already had, so it did not grow and no reader of it changed size. Rejected is the
+    // subtree total less these two (`link_count_subtree_with_status`): every link carries one of
+    // the three statuses, so two counters and the total say all three exactly.
+    link_count_subtree_approved: u32 = 0,
     created_at: i64 = 0,
     updated_at: i64 = 0,
 
@@ -25,7 +29,7 @@ pub const Category = extern struct {
 
     child_count_subtree: u32 = 0,
 
-    flags: u32 = 0,
+    link_count_subtree_pending: u32 = 0,
 };
 
 comptime {
@@ -38,6 +42,64 @@ comptime {
     assert(@alignOf(Category) == 8);
     assert(@offsetOf(Category, "id") == 0);
     assert(@offsetOf(Category, "parent_id") == 8);
+    // The two counters took the place of `_pad0` and `flags`, byte for byte.
+    assert(@offsetOf(Category, "link_count_subtree_approved") == 1252);
+    assert(@offsetOf(Category, "link_count_subtree_pending") == 1284);
+}
+
+/// The links of the two stored statuses that one link, or one whole subtree, contributes to
+/// each of its ancestors. Rejected links ride in `link_count_subtree` alone.
+pub const SubtreeStatusCounts = struct {
+    approved: u32 = 0,
+    pending: u32 = 0,
+
+    pub fn of_link(status: u8) SubtreeStatusCounts {
+        const counts: SubtreeStatusCounts = switch (status) {
+            @intFromEnum(LinkStatus.approved) => .{ .approved = 1 },
+            @intFromEnum(LinkStatus.pending) => .{ .pending = 1 },
+            else => .{},
+        };
+        assert(counts.approved + counts.pending <= 1);
+        if (status == @intFromEnum(LinkStatus.approved)) assert(counts.approved == 1);
+        if (status == @intFromEnum(LinkStatus.pending)) assert(counts.pending == 1);
+        return counts;
+    }
+
+    pub fn of_subtree(category: *const Category) SubtreeStatusCounts {
+        const counts: SubtreeStatusCounts = .{
+            .approved = category.link_count_subtree_approved,
+            .pending = category.link_count_subtree_pending,
+        };
+        assert(counts.approved == category.link_count_subtree_approved);
+        assert(counts.pending == category.link_count_subtree_pending);
+        return counts;
+    }
+
+    pub fn add(counts: *SubtreeStatusCounts, other: SubtreeStatusCounts) void {
+        const before = counts.*;
+        counts.approved +|= other.approved;
+        counts.pending +|= other.pending;
+        assert(counts.approved >= before.approved);
+        assert(counts.pending >= before.pending);
+    }
+};
+
+/// The links in a category's subtree with one status. A store whose counters drifted could
+/// hold more approved and pending links than its total; rejected then reads as none rather
+/// than wrapping.
+pub fn link_count_subtree_with_status(category: *const Category, status: LinkStatus) u64 {
+    const approved: u64 = category.link_count_subtree_approved;
+    const pending: u64 = category.link_count_subtree_pending;
+    const count = switch (status) {
+        .approved => approved,
+        .pending => pending,
+        .rejected => category.link_count_subtree -| approved -| pending,
+        _ => unreachable, // The protocol refuses a status byte it does not know.
+    };
+    assert(count <= @max(category.link_count_subtree, approved, pending));
+    if (status == .approved) assert(count == category.link_count_subtree_approved);
+    if (status == .rejected) assert(count + approved + pending >= category.link_count_subtree);
+    return count;
 }
 
 pub const LinkStatus = enum(u8) {
@@ -154,6 +216,8 @@ pub fn stored_vector_prefix(bytes: []const u8) ?StoredVector {
 }
 
 pub fn link_text_fingerprint(link: *const Link) u64 {
+    assert(link.title.len <= @TypeOf(link.title).capacity);
+    assert(link.description.len <= @TypeOf(link.description).capacity);
     var hasher = std.hash.Fnv1a_64.init();
     hasher.update(link.title.slice());
     hasher.update(&.{0});

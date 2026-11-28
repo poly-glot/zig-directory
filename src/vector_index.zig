@@ -363,6 +363,10 @@ test "quantize normalises and scales the largest component to 127" {
     try std.testing.expectEqual(@as(?Quantized, null), quantize(&@as(Embedding, @splat(0))));
     embedding[2] = std.math.nan(f32);
     try std.testing.expectEqual(@as(?Quantized, null), quantize(&embedding));
+
+    // Finite components whose squares overflow would make the inverse norm zero; the guard on
+    // the norm refuses them instead of asserting on a network vector.
+    try std.testing.expectEqual(@as(?Quantized, null), quantize(&@as(Embedding, @splat(3e38))));
 }
 
 // Store three vectors, query along one axis, then remove and re-put rows and check the ranking

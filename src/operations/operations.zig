@@ -57,6 +57,8 @@ pub const search_links_hybrid = search.search_links_hybrid;
 pub const search_categories_hybrid = search.search_categories_hybrid;
 pub const HybridLinks = search.HybridLinks;
 pub const RowSite = search.RowSite;
+pub const QueryTokens = search.QueryTokens;
+pub const query_tokens_max = search.query_tokens_max;
 
 pub const put_link_vectors = vector_operations.put_link_vectors;
 pub const get_link_vector = vector_operations.get_link_vector;

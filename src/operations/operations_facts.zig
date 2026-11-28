@@ -69,8 +69,9 @@ fn check_entity_write(db: *Directory, write: *const EntityWrite) !EntityWriteRes
     return .ok;
 }
 
-/// `all_within_budget` asks for every word like `all`, but never reads a word's postings
-/// past the cap ranked search uses, so it is safe to run beside every search.
+/// No mode reads a word's postings past the cap ranked search uses. `all_within_budget` asks
+/// for every word like `all`, and differs only when every word is too common to read: it
+/// answers empty where `all` refuses the question as too broad.
 pub const WordsMatch = enum(u8) { any = 0, all = 1, all_within_budget = 2 };
 
 pub const LinkQuery = struct {
@@ -228,9 +229,16 @@ pub fn query_links(
     if (!db.facts.ready.load(.acquire)) return not_ready;
 
     var query = request.facts;
+    query.groups_max = facts_index.groups_max_for(db.scratch_pool.slab_bytes);
     var allowed: facts_index.IdSet = .empty;
     if (request.words.len > 0) {
-        allowed = try links_with_words(db, request.words, request.words_match, arena);
+        allowed = try links_with_words(
+            db,
+            request.words,
+            request.words_match,
+            arena,
+            search.postings_per_token_max,
+        );
         query.allowed_ids = &allowed;
     }
     if (request.words.len == 0) assert(query.allowed_ids == null);
@@ -366,57 +374,47 @@ pub fn match_names(
     return true;
 }
 
+/// No word's postings are read past `postings_cap`, the cap ranked search uses. `any` needs
+/// every list whole, so one word over the cap makes the question too broad; `all` drives from
+/// the rarest list and is too broad only when every word is over the cap.
 fn links_with_words(
     db: *Directory,
     words: []const u8,
     match: WordsMatch,
     arena: std.mem.Allocator,
+    postings_cap: usize,
 ) !facts_index.IdSet {
     assert(words.len > 0);
+    assert(postings_cap > 0);
     const tokens = try distinct_tokens(words, arena);
     assert(tokens.len <= query_words_max);
     if (tokens.len == 0) return error.NoSearchableWords;
-    if (match == .all_within_budget) {
-        return links_with_all_words_within_budget(
-            db,
-            tokens,
-            arena,
-            search.postings_per_token_max,
-        );
+    if (match != .any) {
+        const allowed = try links_with_all_words_within_budget(db, tokens, arena, postings_cap);
+        if (allowed) |found| return found;
+        if (match == .all) return error.PostingsCapExceeded;
+        return .empty;
     }
 
     var allowed: facts_index.IdSet = .empty;
-    for (tokens, 0..) |token, i| {
-        const ids = try search.postings_for_token(
-            db.links_index_tree(),
-            token,
-            arena,
-            std.math.maxInt(usize),
-        );
-        if (match == .any or i == 0) {
-            for (ids) |id| try allowed.put(arena, id, {});
-            continue;
-        }
-        var kept: facts_index.IdSet = .empty;
-        for (ids) |id| {
-            if (allowed.contains(id)) try kept.put(arena, id, {});
-        }
-        assert(kept.count() <= allowed.count());
-        allowed = kept;
+    for (tokens) |token| {
+        const tree = db.links_index_tree();
+        const ids = try search.postings_for_token(tree, token, arena, postings_cap);
+        for (ids) |id| try allowed.put(arena, id, {});
     }
     return allowed;
 }
 
 /// The links holding every token, reading no token's postings past `postings_cap`. The
 /// rarest token's links are the candidates; a token too common to read is checked link by
-/// link with a point lookup. When every token is that common the answer is empty: the words
-/// are too broad to count within the budget.
+/// link with a point lookup. When every token is that common there is no list to drive from,
+/// and the answer is null: the words are too broad to count within the budget.
 fn links_with_all_words_within_budget(
     db: *Directory,
     tokens: []const []const u8,
     arena: std.mem.Allocator,
     postings_cap: usize,
-) !facts_index.IdSet {
+) !?facts_index.IdSet {
     assert(tokens.len > 0);
     assert(postings_cap > 0);
     assert(tokens.len <= query_words_max);
@@ -436,8 +434,8 @@ fn links_with_all_words_within_budget(
         if (rarest == null or list.len < lists[rarest.?].?.len) rarest = index;
     }
 
+    const driver = rarest orelse return null;
     var allowed: facts_index.IdSet = .empty;
-    const driver = rarest orelse return allowed;
     for (lists[driver].?) |id| {
         var held = true;
         for (tokens, 0..) |token, index| {
@@ -458,13 +456,7 @@ fn link_has_token(db: *Directory, postings: ?[]const u64, token: []const u8, id:
     assert(token.len >= inverted.MIN_TOKEN_LEN);
     assert(token.len <= inverted.MAX_TOKEN_LEN);
     if (postings) |ids| return std.sort.binarySearch(u64, ids, id, order_u64) != null;
-
-    var key_buffer: [inverted.MAX_TOKEN_LEN + 8]u8 = undefined;
-    @memcpy(key_buffer[0..token.len], token);
-    key_buffer[token.len..][0..8].* = codec.encodeU64(id);
-    var no_value: [0]u8 = .{};
-    const found = try db.links_index_tree().search(key_buffer[0 .. token.len + 8], &no_value);
-    return found != null;
+    return search.tree_has_posting(db.links_index_tree(), token, id);
 }
 
 fn order_u64(context: u64, item: u64) std.math.Order {
@@ -611,12 +603,28 @@ test "words within a budget match every word, by point lookup when a word is too
     const tokens = [_][]const u8{ "common", "rare" };
 
     for ([_]usize{ 100, 2 }) |cap| {
-        const allowed = try links_with_all_words_within_budget(db, &tokens, arena, cap);
+        const allowed = (try links_with_all_words_within_budget(db, &tokens, arena, cap)).?;
         try testing.expectEqual(@as(u32, 2), allowed.count());
         for (both) |id| try testing.expect(allowed.contains(id));
     }
-    const too_broad = try links_with_all_words_within_budget(db, &tokens, arena, 1);
-    try testing.expectEqual(@as(u32, 0), too_broad.count());
+    try testing.expect(try links_with_all_words_within_budget(db, &tokens, arena, 1) == null);
+
+    // Goal: `any` and `all` read no word past the cap either. Method: the same words with a
+    // cap of two; `any` needs the five "common" postings whole and refuses, `all` drives from
+    // "rare" and answers exactly; with a cap of one only the budgeted mode answers, empty.
+    try testing.expectError(
+        error.PostingsCapExceeded,
+        links_with_words(db, "common rare", .any, arena, 2),
+    );
+    const all_words = try links_with_words(db, "common rare", .all, arena, 2);
+    try testing.expectEqual(@as(u32, 2), all_words.count());
+    for (both) |id| try testing.expect(all_words.contains(id));
+    try testing.expectError(
+        error.PostingsCapExceeded,
+        links_with_words(db, "common rare", .all, arena, 1),
+    );
+    const budgeted = try links_with_words(db, "common rare", .all_within_budget, arena, 1);
+    try testing.expectEqual(@as(u32, 0), budgeted.count());
 
     const through_query = try answer_for(db, arena, .{
         .facts = .{ .status = null },

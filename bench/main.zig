@@ -68,7 +68,7 @@ fn print_help() void {
         \\  --warmup-ops N       Discard first N ops from percentile recording (default: 1000)
         \\  --connect-host HOST  (default: 127.0.0.1)
         \\  --port P             (default: 8080)
-        \\  --rss-sample-ms MS   (default: 200, 0 to disable)
+        \\  --rss-sample-ms MS   Only when bench spawns the server (default: 200, 0 to disable)
         \\  --git-rev REV        Override auto-detected git rev
         \\
         \\See bench/README.md for matrix-runner examples.

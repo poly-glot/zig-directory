@@ -23,7 +23,7 @@ const sites = @import("../facts/sites.zig");
 const log = shared.log;
 
 pub const postings_per_token_max: usize = 20_000;
-const query_tokens_max: usize = 32;
+pub const query_tokens_max: usize = 32;
 pub const hybrid_candidates: usize = 200;
 pub const category_candidates: usize = 3;
 const category_nearest: usize = 50;
@@ -44,6 +44,7 @@ pub fn search_categories(
         limit,
         buffer,
         category.get_category,
+        postings_per_token_max,
     );
     assert(hits.len <= limit);
     return hits;
@@ -63,6 +64,7 @@ pub fn search_links(
         limit,
         buffer,
         link_operations.get_link,
+        postings_per_token_max,
     );
     assert(hits.len <= limit);
     return hits;
@@ -83,7 +85,7 @@ pub fn search_categories_ranked(
     );
     defer db.scratch().free(ranked);
 
-    const hits = fetch_in_rank_order(
+    const hits = try fetch_in_rank_order(
         schema.Category,
         db,
         ranked,
@@ -131,27 +133,23 @@ pub fn postings_for_token(
     postings_cap: usize,
 ) ![]u64 {
     assert(token.len >= inverted.MIN_TOKEN_LEN);
-    const key_buffer_len: usize = inverted.MAX_TOKEN_LEN + 8;
-    if (token.len + 8 > key_buffer_len) return &[_]u64{};
-
-    var key_low_buffer: [key_buffer_len]u8 = undefined;
-    var key_high_buffer: [key_buffer_len]u8 = undefined;
-    @memcpy(key_low_buffer[0..token.len], token);
-    @memset(key_low_buffer[token.len..][0..8], 0);
-    @memcpy(key_high_buffer[0..token.len], token);
-    @memset(key_high_buffer[token.len..][0..8], 0xFF);
-
-    var iterator = try tree.rangeScan(
-        key_low_buffer[0 .. token.len + 8],
-        key_high_buffer[0 .. token.len + 8],
-    );
+    assert(postings_cap > 0);
+    if (token.len > inverted.MAX_TOKEN_LEN) return &[_]u64{};
+    const range = TokenRange.init(token);
+    var iterator = try tree.rangeScan(range.low_key(), range.high_key());
     defer iterator.deinit();
 
     var ids: std.ArrayListUnmanaged(u64) = .empty;
     errdefer ids.deinit(allocator);
 
-    while (try iterator.next()) |entry| {
-        if (entry.key.len != token.len + 8) continue;
+    // The range also holds every longer token that starts with this one (`co` reaches `com`,
+    // `community`). The token's own keys sort first: their next byte is the id's top byte,
+    // which is 0 while ids stay below 2^56, and a longer token continues with a letter or a
+    // digit. So the walk ends at the first longer key and never walks more keys than the cap.
+    var walked: usize = 0;
+    while (try iterator.next()) |entry| : (walked += 1) {
+        if (walked > postings_cap) return error.PostingsCapExceeded;
+        if (entry.key.len != token.len + 8) break;
         if (!std.mem.eql(u8, entry.key[0..token.len], token)) break;
         if (ids.items.len == postings_cap) return error.PostingsCapExceeded;
         const id = codec.decodeU64(entry.key[token.len..][0..8]);
@@ -163,12 +161,43 @@ pub fn postings_for_token(
     return try ids.toOwnedSlice(allocator);
 }
 
-const QueryTokens = struct {
+/// The inverted-index keys of a token run from the token followed by eight zero bytes to the
+/// token followed by eight 0xFF bytes; each key is the token followed by a big-endian id.
+const TokenRange = struct {
+    low: [inverted.MAX_TOKEN_LEN + 8]u8,
+    high: [inverted.MAX_TOKEN_LEN + 8]u8,
+    len: u8,
+
+    fn init(token: []const u8) TokenRange {
+        assert(token.len >= inverted.MIN_TOKEN_LEN);
+        assert(token.len <= inverted.MAX_TOKEN_LEN);
+        comptime assert(inverted.MAX_TOKEN_LEN + 8 <= std.math.maxInt(u8));
+        var range: TokenRange = undefined;
+        range.len = @intCast(token.len + 8);
+        @memcpy(range.low[0..token.len], token);
+        @memset(range.low[token.len..][0..8], 0);
+        @memcpy(range.high[0..token.len], token);
+        @memset(range.high[token.len..][0..8], 0xFF);
+        return range;
+    }
+
+    fn low_key(self: *const TokenRange) []const u8 {
+        assert(self.len >= inverted.MIN_TOKEN_LEN + 8);
+        return self.low[0..self.len];
+    }
+
+    fn high_key(self: *const TokenRange) []const u8 {
+        assert(self.len >= inverted.MIN_TOKEN_LEN + 8);
+        return self.high[0..self.len];
+    }
+};
+
+pub const QueryTokens = struct {
     buffers: [query_tokens_max][inverted.MAX_TOKEN_LEN]u8 = undefined,
     lengths: [query_tokens_max]u32 = undefined,
     count: u32 = 0,
 
-    fn init(query: []const u8) QueryTokens {
+    pub fn init(query: []const u8) QueryTokens {
         var self: QueryTokens = .{};
         var token_buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
         var iterator = inverted.TokenIterator.init(query);
@@ -185,7 +214,7 @@ const QueryTokens = struct {
         return self;
     }
 
-    fn get(self: *const QueryTokens, i: usize) []const u8 {
+    pub fn get(self: *const QueryTokens, i: usize) []const u8 {
         assert(i < self.count);
         assert(self.lengths[i] <= inverted.MAX_TOKEN_LEN);
         return self.buffers[i][0..self.lengths[i]];
@@ -382,12 +411,12 @@ fn fetch_in_rank_order(
     limit: u32,
     buffer: []T,
     comptime getter: fn (*Directory, u64) anyerror!?T,
-) []T {
+) ![]T {
     const max = @min(limit, @as(u32, @intCast(buffer.len)));
     var count: u32 = 0;
     for (ranked) |hit| {
         if (count >= max) break;
-        if (getter(db, hit.id) catch null) |item| {
+        if (try getter(db, hit.id)) |item| {
             buffer[count] = item;
             count += 1;
         }
@@ -423,7 +452,7 @@ fn fetch_links(
     site_rows: ?[]RowSite,
 ) ![]schema.Link {
     const rows = site_rows orelse {
-        const hits = fetch_in_rank_order(
+        const hits = try fetch_in_rank_order(
             schema.Link,
             db,
             ranked,
@@ -454,7 +483,7 @@ fn fetch_capped_per_site(
     var count: usize = 0;
     for (ranked) |hit| {
         if (count == max) break;
-        const link = (link_operations.get_link(db, hit.id) catch null) orelse continue;
+        const link = (try link_operations.get_link(db, hit.id)) orelse continue;
 
         const row = &rows[count];
         row.* = .{};
@@ -622,7 +651,7 @@ pub fn search_categories_hybrid(
     else
         null;
     const query_quantized = quantized orelse {
-        const hits = fetch_in_rank_order(
+        const hits = try fetch_in_rank_order(
             schema.Category,
             db,
             ranked,
@@ -643,7 +672,7 @@ pub fn search_categories_hybrid(
     defer db.scratch().free(fused);
     assert(fused.len <= ranked_top.len + nearest.len);
 
-    const hits = fetch_in_rank_order(
+    const hits = try fetch_in_rank_order(
         schema.Category,
         db,
         fused,
@@ -675,31 +704,33 @@ fn search_via_index_tree(
     limit: u32,
     buffer: []T,
     comptime getter: fn (*Directory, u64) anyerror!?T,
+    postings_cap: usize,
 ) ![]T {
+    assert(postings_cap > 0);
     const max = @min(limit, @as(u32, @intCast(buffer.len)));
     if (max == 0) return buffer[0..0];
 
-    var token_buffer: [inverted.MAX_TOKEN_LEN]u8 = undefined;
-    var iterator = inverted.TokenIterator.init(query);
+    const tokens = QueryTokens.init(query);
+    assert(tokens.count <= query_tokens_max);
+    if (tokens.count == 0) return buffer[0..0];
 
+    // A token too common to read within the cap is checked id by id once the other tokens have
+    // narrowed the candidates, so the answer stays the exact AND of the first query_tokens_max
+    // distinct tokens. A query made only of such tokens is too broad to answer.
+    var common: [query_tokens_max]bool = @splat(false);
     var candidates_full: ?[]u64 = null;
     var candidates_len: usize = 0;
     defer if (candidates_full) |candidates| db.scratch().free(candidates);
 
-    var had_any_token = false;
-    while (iterator.next(&token_buffer)) |token| {
-        had_any_token = true;
-        assert(token.len <= inverted.MAX_TOKEN_LEN);
-        const ids = postings_for_token(
-            tree,
-            token,
-            db.scratch(),
-            std.math.maxInt(usize),
-        ) catch |err| {
-            log.err("search_via_index_tree: rangeScan failed for token='{s}': {}", .{ token, err });
-            return err;
-        };
-
+    for (0..tokens.count) |i| {
+        const ids = postings_for_token(tree, tokens.get(i), db.scratch(), postings_cap) catch |err|
+            switch (err) {
+                error.PostingsCapExceeded => {
+                    common[i] = true;
+                    continue;
+                },
+                else => return err,
+            };
         if (candidates_full == null) {
             candidates_full = ids;
             candidates_len = ids.len;
@@ -711,14 +742,16 @@ fn search_via_index_tree(
         candidates_len = search_via_index_tree_intersect(current, ids);
         if (candidates_len == 0) break;
     }
-    if (!had_any_token) assert(candidates_full == null);
-    if (candidates_full) |candidates| assert(candidates_len <= candidates.len);
-    if (!had_any_token or candidates_full == null) return buffer[0..0];
+    const candidates = candidates_full orelse
+        return search_common_tokens(T, db, tree, &tokens, buffer[0..max], getter, postings_cap);
+    assert(candidates_len <= candidates.len);
 
     var count: u32 = 0;
-    for (candidates_full.?[0..candidates_len]) |id| {
+    var lookups_left: usize = postings_cap;
+    for (candidates[0..candidates_len]) |id| {
         if (count >= max) break;
-        if (getter(db, id) catch null) |item| {
+        if (!try holds_common_tokens(tree, &tokens, &common, id, &lookups_left)) continue;
+        if (try getter(db, id)) |item| {
             buffer[count] = item;
             count += 1;
         }
@@ -726,6 +759,77 @@ fn search_via_index_tree(
 
     assert(count <= max);
     return buffer[0..count];
+}
+
+/// Every token is too common to read whole, so the first one's postings are walked in id order
+/// and the rest are checked id by id, until the page is full: the first ids of the AND are the
+/// whole answer to a page. A page that the cap's worth of postings cannot fill is too broad.
+fn search_common_tokens(
+    comptime T: type,
+    db: *Directory,
+    tree: *BPlusTree,
+    tokens: *const QueryTokens,
+    buffer: []T,
+    comptime getter: fn (*Directory, u64) anyerror!?T,
+    postings_cap: usize,
+) ![]T {
+    assert(tokens.count > 0);
+    assert(buffer.len > 0);
+    var checked: [query_tokens_max]bool = @splat(true);
+    checked[0] = false;
+    const token = tokens.get(0);
+    const range = TokenRange.init(token);
+    var iterator = try tree.rangeScan(range.low_key(), range.high_key());
+    defer iterator.deinit();
+
+    var count: usize = 0;
+    var walked: usize = 0;
+    var lookups_left: usize = postings_cap;
+    while (try iterator.next()) |entry| : (walked += 1) {
+        if (entry.key.len != token.len + 8) break;
+        if (walked == postings_cap) return error.PostingsCapExceeded;
+        const id = codec.decodeU64(entry.key[token.len..][0..8]);
+        if (!try holds_common_tokens(tree, tokens, &checked, id, &lookups_left)) continue;
+        const item = (try getter(db, id)) orelse continue;
+        buffer[count] = item;
+        count += 1;
+        if (count == buffer.len) break;
+    }
+    assert(count <= buffer.len);
+    return buffer[0..count];
+}
+
+/// Each common token costs a point lookup per candidate, so up to 31 of them would turn the
+/// cap's worth of candidates into 31 times as many lookups (620,000 took 0.8 s on the 92k store).
+/// The lookups draw on the same budget as the postings, and a page that spends it is too broad.
+fn holds_common_tokens(
+    tree: *BPlusTree,
+    tokens: *const QueryTokens,
+    common: *const [query_tokens_max]bool,
+    id: u64,
+    lookups_left: *usize,
+) !bool {
+    assert(tokens.count <= query_tokens_max);
+    for (0..tokens.count) |i| {
+        if (!common[i]) continue;
+        if (lookups_left.* == 0) return error.PostingsCapExceeded;
+        lookups_left.* -= 1;
+        if (!try tree_has_posting(tree, tokens.get(i), id)) return false;
+    }
+    return true;
+}
+
+/// Whether `id` is listed under `token`, by its key in the inverted index: the token followed
+/// by the id. One point lookup, for a token whose postings are too many to read.
+pub fn tree_has_posting(tree: *BPlusTree, token: []const u8, id: u64) !bool {
+    assert(token.len >= inverted.MIN_TOKEN_LEN);
+    assert(token.len <= inverted.MAX_TOKEN_LEN);
+    var key_buffer: [inverted.MAX_TOKEN_LEN + 8]u8 = undefined;
+    @memcpy(key_buffer[0..token.len], token);
+    key_buffer[token.len..][0..8].* = codec.encodeU64(id);
+    var no_value: [0]u8 = .{};
+    const found = try tree.search(key_buffer[0 .. token.len + 8], &no_value);
+    return found != null;
 }
 
 // Both lists ascend, so one pass keeps the ids they share, in place and still ascending.
@@ -930,6 +1034,160 @@ test "search: token absent from corpus returns empty result set" {
     try std.testing.expectEqual(@as(usize, 0), hits.len);
 }
 
+// Goal: the AND search reads no token's postings past the cap and still answers exactly. A
+// query of only such tokens walks the first one's postings until the page is full, and is too
+// broad when the cap runs out first. Method: a cap of two against `alpha`, held by three
+// links, beside the rarer `beta`, then alone for a page of one and a page of eight.
+test "search: a token past the postings cap is checked per id, and alone it is too broad" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const titles = [_][]const u8{ "alpha beta", "alpha gamma", "alpha beta delta" };
+    var ids: [titles.len]u64 = undefined;
+    for (titles, &ids, 1..) |title, *id, n| {
+        var url_buffer: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "https://example.org/{d}", .{n});
+        id.* = try link_operations.create_link(
+            db,
+            top_id,
+            .{ .url = url, .title = title, .description = "" },
+        );
+    }
+
+    const tree = db.links_index_tree();
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_via_index_tree(
+        schema.Link,
+        db,
+        tree,
+        "alpha beta",
+        8,
+        &buffer,
+        link_operations.get_link,
+        2,
+    );
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(ids[0], hits[0].id);
+    try std.testing.expectEqual(ids[2], hits[1].id);
+
+    const first_page = try search_via_index_tree(
+        schema.Link,
+        db,
+        tree,
+        "alpha alpha",
+        1,
+        &buffer,
+        link_operations.get_link,
+        2,
+    );
+    try std.testing.expectEqual(@as(usize, 1), first_page.len);
+    try std.testing.expectEqual(ids[0], first_page[0].id);
+
+    try std.testing.expectError(error.PostingsCapExceeded, search_via_index_tree(
+        schema.Link,
+        db,
+        tree,
+        "alpha alpha",
+        8,
+        &buffer,
+        link_operations.get_link,
+        2,
+    ));
+}
+
+// Goal: a query of only common tokens pays for its point lookups out of the postings cap, so
+// many common tokens cannot multiply the work the cap allows. Method: three links holding four
+// words, each word over a cap of two, asked for a page of two: two walked postings would cost
+// six lookups, which the cap of two refuses as too broad, and a cap of eight answers.
+test "search: common-token lookups draw on the postings cap" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    for (1..4) |n| {
+        var url_buffer: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "https://example.org/{d}", .{n});
+        _ = try link_operations.create_link(
+            db,
+            top_id,
+            .{ .url = url, .title = "alpha beta gamma delta", .description = "" },
+        );
+    }
+
+    var buffer: [8]schema.Link = undefined;
+    try std.testing.expectError(error.PostingsCapExceeded, search_via_index_tree(
+        schema.Link,
+        db,
+        db.links_index_tree(),
+        "alpha beta gamma delta",
+        2,
+        &buffer,
+        link_operations.get_link,
+        2,
+    ));
+    const hits = try search_via_index_tree(
+        schema.Link,
+        db,
+        db.links_index_tree(),
+        "alpha beta gamma delta",
+        2,
+        &buffer,
+        link_operations.get_link,
+        8,
+    );
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+}
+
+// Goal: the AND search reads the first query_tokens_max distinct tokens and ignores the rest,
+// as the ranked search does. Method: a link holding 32 words, queried for each word twice and
+// then a 33rd word it does not hold.
+test "search: the AND search reads at most query_tokens_max distinct tokens" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    var words_buffer: [query_tokens_max * 4]u8 = undefined;
+    var words: std.Io.Writer = .fixed(&words_buffer);
+    for (0..query_tokens_max) |i| try words.print("w{d:0>2} ", .{i});
+    const description = std.mem.trimEnd(u8, words.buffered(), " ");
+
+    var query_buffer: [query_tokens_max * 8 + 8]u8 = undefined;
+    const query = try std.fmt.bufPrint(&query_buffer, "{s} {s} zzz", .{ description, description });
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const link_id = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.org/1", .title = "words", .description = description },
+    );
+
+    var buffer: [8]schema.Link = undefined;
+    const hits = try search_links(db, query, 8, &buffer);
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqual(link_id, hits[0].id);
+}
+
 // Goal: ranked search is an OR over terms where the exact search is an AND. Method: the same
 // `alpha gamma` query against both searches.
 test "ranked search: a query sharing only some terms still matches" {
@@ -1118,6 +1376,41 @@ test "ranked search: a token past the postings cap contributes nothing" {
     defer allocator.free(ranked);
     try std.testing.expectEqual(@as(usize, 1), ranked.len);
     try std.testing.expectEqual(rare, ranked[0].id);
+}
+
+// Goal: a token's postings walk stops at its own keys, however many longer tokens share its
+// prefix. Method: one link titled `co` and three titled with `co` words, read with a cap of
+// two, which only a walk into the longer tokens' keys would pass.
+test "postings_for_token: the walk ends before the longer tokens that share the prefix" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    var db = try Directory.open_test_instance(allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const top_id = try category.create_category(
+        db,
+        0,
+        .{ .name = "Top", .slug = "top", .description = "" },
+    );
+    const exact = try link_operations.create_link(
+        db,
+        top_id,
+        .{ .url = "https://example.org/1", .title = "co", .description = "" },
+    );
+    for ([_][]const u8{ "cobalt", "coffee", "comet" }, 2..) |title, n| {
+        var url_buffer: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "https://example.org/{d}", .{n});
+        _ = try link_operations.create_link(
+            db,
+            top_id,
+            .{ .url = url, .title = title, .description = "" },
+        );
+    }
+
+    const ids = try postings_for_token(db.links_index_tree(), "co", allocator, 2);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(u64, &.{exact}, ids);
 }
 
 // Goal: the category variant ranks by matched terms too. Method: a `gardening` and a

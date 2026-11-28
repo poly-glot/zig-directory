@@ -14,6 +14,8 @@ const category = @import("operations_category.zig");
 const slug_operations = @import("operations_slug.zig");
 const shared = @import("operations_shared.zig");
 const depth_max = shared.depth_max;
+// Old paths land in these buffers and then in change sets, whose size bound assumes them.
+const path_buffer_len = changeset.path_composed_len_max;
 
 // A token needs `MIN_TOKEN_LEN` characters and a separator, so a field of L bytes holds at
 // most (L + 1) / (MIN_TOKEN_LEN + 1) tokens; summed over the indexed fields that bounds the
@@ -98,11 +100,74 @@ fn own_slug_path(
     allocator: std.mem.Allocator,
 ) ![]const u8 {
     assert(record.id != 0);
-    var path_buffer: [2048]u8 = undefined;
+    try ensure_no_ancestor_repair_queued(db, record);
+    var path_buffer: [path_buffer_len]u8 = undefined;
+    // A category without a path cannot fall back to its bare slug: that key may be another
+    // category's, which the swap would then overwrite. build_slug_path skips empty slugs, so
+    // an empty-slug category would be handed its parent's path.
+    if (record.slug.len == 0) return shared.OperationError.InvalidSlug;
     const path = (try slug_operations.build_slug_path(db, record.id, &path_buffer)) orelse
-        record.slug.slice();
+        return shared.OperationError.InvalidSlug;
     assert(std.mem.endsWith(u8, path, record.slug.slice()));
     return allocator.dupe(u8, path);
+}
+
+// A category stored before slugs were validated may have no path of its own, or only its
+// parent's; it must still be deletable, so the apply step removes this key only when it names
+// the deleted category.
+fn deleted_slug_path(
+    db: *Directory,
+    record: *const schema.Category,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    assert(record.id != 0);
+    try ensure_no_ancestor_repair_queued(db, record);
+    var path_buffer: [path_buffer_len]u8 = undefined;
+    const path = (try slug_operations.build_slug_path(db, record.id, &path_buffer)) orelse "";
+    assert(path.len <= path_buffer.len);
+    return allocator.dupe(u8, path);
+}
+
+// A category stored before slugs were validated can have an empty slug. Its creation indexed it
+// under its parent's path and a slash, or under "" at the root, so that is the key a rename
+// that gives it a slug replaces. Its children's paths were composed without it and cannot be
+// derived from that key, so the rename is refused while it has any.
+fn empty_slug_old_path(
+    db: *Directory,
+    record: *const schema.Category,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    assert(record.id != 0);
+    assert(record.slug.len == 0);
+    try ensure_no_ancestor_repair_queued(db, record);
+    if (record.child_count > 0) return shared.OperationError.InvalidSlug;
+    return child_slug_path(db, record.parent_id, "", allocator);
+}
+
+// While an ancestor's slug-path repair is queued its descendants' rows still carry the old
+// prefix, so a path built from the tree names a row that does not exist: a rename, move or
+// delete would leave the real row, and its subtree's rows, stranded for good. The edit is
+// refused until the worker has finished the task.
+fn ensure_no_ancestor_repair_queued(db: *Directory, record: *const schema.Category) !void {
+    if (record.parent_id == 0) return;
+    if (db.slug_path_repair_queue().entryCount() == 0) return;
+    var ancestor_buffer: [depth_max]u64 = undefined;
+    const ancestors = try category.get_category_path(db, record.parent_id, &ancestor_buffer);
+    assert(ancestors.len <= depth_max);
+
+    const start_key: [8]u8 = @splat(0);
+    var iterator = try db.slug_path_repair_queue().rangeScan(&start_key, null);
+    defer iterator.deinit();
+    while (try iterator.next()) |entry| {
+        if (entry.value.len < @sizeOf(schema.RepairTask)) continue;
+        const task = std.mem.bytesToValue(
+            schema.RepairTask,
+            entry.value[0..@sizeOf(schema.RepairTask)],
+        );
+        if (std.mem.indexOfScalar(u64, ancestors, task.cat_id) != null) {
+            return error.SlugRepairPending;
+        }
+    }
 }
 
 fn child_slug_path(
@@ -112,14 +177,8 @@ fn child_slug_path(
     allocator: std.mem.Allocator,
 ) ![]const u8 {
     assert(slug.len <= shared.slug_len_max);
-    var path_buffer: [2048]u8 = undefined;
-    const path = (try slug_operations.compose_child_slug_path(
-        db,
-        parent_id,
-        slug,
-        &path_buffer,
-    )) orelse
-        slug;
+    var path_buffer: [path_buffer_len]u8 = undefined;
+    const path = try slug_operations.compose_child_slug_path(db, parent_id, slug, &path_buffer);
     assert(std.mem.endsWith(u8, path, slug));
     return allocator.dupe(u8, path);
 }
@@ -156,7 +215,7 @@ pub fn compute_category_insert_change_set(
         };
         if (existing.len != 8) break :blk true;
         const existing_id = codec.decodeU64(existing);
-        var existing_path_buffer: [2048]u8 = undefined;
+        var existing_path_buffer: [path_buffer_len]u8 = undefined;
         const existing_path = (try slug_operations.build_slug_path(
             db,
             existing_id,
@@ -288,14 +347,14 @@ fn collect_descendant_swaps_child(
     allocator: std.mem.Allocator,
 ) !bool {
     assert(ids.child_id != 0);
-    var old_buffer: [2048]u8 = undefined;
+    var old_buffer: [path_buffer_len]u8 = undefined;
     const descendant_old_path = slug_operations.compose_old_descendant_path(
         db,
         old_path,
         .{ .root_id = ids.root_id, .descendant_id = ids.child_id },
         &old_buffer,
     ) catch return false;
-    var new_buffer: [2048]u8 = undefined;
+    var new_buffer: [path_buffer_len]u8 = undefined;
     const descendant_new_path = slug_operations.compose_old_descendant_path(
         db,
         new_path,
@@ -321,7 +380,10 @@ pub fn compute_category_rename_change_set(
     assert(new_category.id == old_category.id);
     assert(new_category.parent_id == old_category.parent_id);
     assert(!new_category.slug.eql(old_category.slug.slice()));
-    const old_path = try own_slug_path(db, old_category, allocator);
+    const old_path = if (old_category.slug.len == 0)
+        try empty_slug_old_path(db, old_category, allocator)
+    else
+        try own_slug_path(db, old_category, allocator);
     const new_path = try child_slug_path(
         db,
         new_category.parent_id,
@@ -367,7 +429,7 @@ pub fn compute_category_delete_change_set(
         .cat = deleted.*,
         .ancestor_updates = ancestor_updates,
         .tokens = try category_tokens(deleted, allocator),
-        .slug_path = try own_slug_path(db, deleted, allocator),
+        .slug_path = try deleted_slug_path(db, deleted, allocator),
     } };
 }
 
@@ -628,8 +690,9 @@ test "compute_category_rename_change_set: > threshold sets above_threshold + pop
     try std.testing.expectEqualStrings("top/old", effect.enqueue.old_slug_prefix);
 }
 
-// Goal: the descendant walk stops at `depth_max` levels without failing the rename. Method: a
-// chain of 70 attempted levels, of which creation refuses all past 64, then the swaps.
+// Goal: the descendant walk covers a chain as deep as creation allows without failing the
+// rename. Method: 70 attempted levels, of which creation refuses all past `depth_max`
+// categories (top and 63 below it), then the swaps.
 test "compute_category_rename_change_set: descendant walk silently caps at depth 64" {
     const allocator = std.testing.allocator;
     var temporary_directory = std.testing.tmpDir(.{});
@@ -660,7 +723,7 @@ test "compute_category_rename_change_set: descendant walk silently caps at depth
     try db.drain_one_memtable(db.memtable_categories_by_id(), db.categories_by_id());
     try db.drain_one_memtable(db.memtable_cat_by_parent(), db.cat_by_parent());
 
-    try std.testing.expectEqual(@as(u32, 64), built);
+    try std.testing.expectEqual(@as(u32, depth_max - 1), built);
 
     const old_top = (try category.get_category(db, top_id)).?;
     var new_top = old_top;

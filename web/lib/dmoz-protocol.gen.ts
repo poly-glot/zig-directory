@@ -121,6 +121,7 @@ export const enum SubStatus {
   AlreadyInProgress = 9,
   DuplicateSlug = 10,
   EmbeddingModelMismatch = 11,
+  TooBroad = 12,
 }
 
 export const STATUS_MSG: Record<number, string> = {
@@ -147,6 +148,7 @@ export const SUB_STATUS_MSG: Record<number, string> = {
   9: "already in progress",
   10: "duplicate slug",
   11: "embedding model mismatch",
+  12: "too broad",
 };
 
 export const CATEGORY_SIZE = 1288;
@@ -191,11 +193,12 @@ export interface Category {
   linkCount: number;
   childCount: number;
   sortOrder: number;
+  linkCountSubtreeApproved: number;
   createdAt: Date;
   updatedAt: Date;
   linkCountSubtree: number;
   childCountSubtree: number;
-  flags: number;
+  linkCountSubtreePending: number;
 }
 
 export interface Link {
@@ -226,12 +229,12 @@ export function readCategory(r: BufferReader): Category {
   const linkCount = r.u32();
   const childCount = r.u32();
   const sortOrder = r.u32();
-  r.skip(4); // _pad0
+  const linkCountSubtreeApproved = r.u32();
   const createdAt = r.timestamp();
   const updatedAt = r.timestamp();
   const linkCountSubtree = r.u64();
   const childCountSubtree = r.u32();
-  const flags = r.u32();
+  const linkCountSubtreePending = r.u32();
   return {
     id,
     parentId,
@@ -241,11 +244,12 @@ export function readCategory(r: BufferReader): Category {
     linkCount,
     childCount,
     sortOrder,
+    linkCountSubtreeApproved,
     createdAt,
     updatedAt,
     linkCountSubtree,
     childCountSubtree,
-    flags,
+    linkCountSubtreePending,
   };
 }
 

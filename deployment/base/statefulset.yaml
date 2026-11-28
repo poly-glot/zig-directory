@@ -67,11 +67,15 @@ spec:
           # The backend speaks a raw binary protocol, not HTTP, so probes use a
           # bare TCP connect. A dead backend stops accepting on 8080 → the probe
           # fails → the pod restarts.
+          # One hour of startup: the first boot on a new store format recounts
+          # every category before the server listens (estimated 10 to 30
+          # minutes on the full store), and a pod killed mid-recount starts it
+          # again from the beginning.
           startupProbe:
             tcpSocket:
               port: 8080
             periodSeconds: 3
-            failureThreshold: 100
+            failureThreshold: 1200
           livenessProbe:
             tcpSocket:
               port: 8080

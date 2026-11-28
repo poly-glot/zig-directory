@@ -132,6 +132,8 @@ pub fn get_link_vector(db: *Directory, link_id: u64) !?schema.StoredVector {
     var buffer: [@sizeOf(schema.LinkVector)]u8 = undefined;
     const bytes = (try db.link_vectors().search(&key, &buffer)) orelse return null;
     const stored = schema.stored_vector_prefix(bytes) orelse return null;
+    // The record is disk input: one that names another link is treated as missing.
+    if (stored.id != link_id) return null;
     assert(stored.id == link_id);
     return stored;
 }
@@ -177,8 +179,10 @@ fn load_link_chunk(db: *Directory, next_id: *u64) !usize {
     var scanned: usize = 0;
     while (scanned < load_chunk) : (scanned += 1) {
         const entry = (try iterator.next()) orelse break;
-        next_id.* = codec.decodeU64(entry.key[0..8]) + 1;
+        const key_id = codec.decodeU64(entry.key[0..8]);
+        next_id.* = key_id + 1;
         const stored = schema.stored_vector_prefix(entry.value) orelse continue;
+        if (stored.id != key_id) continue;
         try index.put_locked(
             db.allocator,
             stored.id,
@@ -205,9 +209,19 @@ fn codes_for(
             bytes[0..@sizeOf(schema.LinkVector)],
         );
         assert(record.vector.id == stored.id);
-        if (record.model_hash == model.hash) return .{ .cell = record.cell, .codes = record.codes };
+        // The cell is disk input too: one past the model's cells is coded again, not trusted.
+        const reusable = record.model_hash == model.hash and record.cell < vector_model.cell_count;
+        if (reusable) return .{ .cell = record.cell, .codes = record.codes };
     }
     return model.encode(stored);
+}
+
+/// A stored category vector is skipped unless it names its own key and has the positive, finite
+/// scale every write gives it; the loader reads disk input and must not assert on it.
+fn stored_vector_usable(stored: *const schema.StoredVector, key_id: u64) bool {
+    if (stored.id != key_id) return false;
+    if (!std.math.isFinite(stored.scale)) return false;
+    return stored.scale > 0;
 }
 
 fn load_category_chunk(db: *Directory, next_id: *u64) !usize {
@@ -223,15 +237,16 @@ fn load_category_chunk(db: *Directory, next_id: *u64) !usize {
     var scanned: usize = 0;
     while (scanned < load_chunk) : (scanned += 1) {
         const entry = (try iterator.next()) orelse break;
-        next_id.* = codec.decodeU64(entry.key[0..8]) + 1;
+        const key_id = codec.decodeU64(entry.key[0..8]);
+        next_id.* = key_id + 1;
         if (entry.value.len != @sizeOf(schema.StoredVector)) continue;
-        try index.put_locked(
-            db.allocator,
-            &std.mem.bytesToValue(
-                schema.StoredVector,
-                entry.value[0..@sizeOf(schema.StoredVector)],
-            ),
+        const stored = std.mem.bytesToValue(
+            schema.StoredVector,
+            entry.value[0..@sizeOf(schema.StoredVector)],
         );
+        if (!stored_vector_usable(&stored, key_id)) continue;
+        assert(stored.scale > 0);
+        try index.put_locked(db.allocator, &stored);
     }
     assert(scanned <= load_chunk);
     if (scanned > 0) assert(next_id.* > start_id);
@@ -601,4 +616,40 @@ test "hybrid search adds a vector-only match, and falls back to keywords for ano
     try testing.expect(!fallback.vector_used);
     try testing.expectEqual(@as(usize, 1), fallback.links.len);
     try testing.expectEqual(keyword_hit, fallback.links[0].id);
+}
+
+// Goal: a stored record's cell is trusted only when it names one of the model's cells; one
+// past them is coded again instead of tripping the index's assertion in the boot loader.
+// Method: a record under the loaded model's hash carrying cell 300.
+test "codes_for codes a record again when its stored cell is past the model's cells" {
+    const model = try vector_model.Model.synthetic(testing.allocator, 7);
+    defer model.deinit(testing.allocator);
+
+    var record: schema.LinkVector = .{ .model_hash = model.hash, .cell = 300 };
+    record.vector = .{ .id = 5, .scale = 1.0 / 127.0 };
+    record.vector.values[0] = 127;
+    const encoded = codes_for(model, std.mem.asBytes(&record), &record.vector);
+    try testing.expect(encoded.cell < vector_model.cell_count);
+    try testing.expectEqual(model.encode(&record.vector).cell, encoded.cell);
+}
+
+// Goal: stored vectors that do not hold up are skipped or read as missing, never asserted on.
+// Method: a link record filed under another link's key, and a category record with a NaN
+// scale, then the read and the category loader.
+test "a stored vector under the wrong key or with a bad scale is skipped, not asserted on" {
+    var temporary_directory = testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+    const db = try Directory.open_test_instance(testing.allocator, &temporary_directory);
+    defer db.deinit_test_instance();
+
+    const misfiled: schema.StoredVector = .{ .id = 6, .scale = 1.0 / 127.0 };
+    const link_key = codec.encodeU64(5);
+    try db.link_vectors().insert(&link_key, std.mem.asBytes(&misfiled));
+    try testing.expect(try get_link_vector(db, 5) == null);
+
+    const unscaled: schema.StoredVector = .{ .id = 3, .scale = std.math.nan(f32) };
+    const category_key = codec.encodeU64(3);
+    try db.category_vectors().insert(&category_key, std.mem.asBytes(&unscaled));
+    try load_category_vector_index(db);
+    try testing.expectEqual(@as(usize, 0), db.category_vector_index.count(db.io));
 }

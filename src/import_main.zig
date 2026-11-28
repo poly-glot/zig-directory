@@ -10,6 +10,7 @@ const operations = @import("operations/operations.zig");
 const schema = @import("schema.zig");
 const vector_model = @import("vector_model.zig");
 const Config = @import("main.zig").Config;
+const resolve_data_dir = @import("main.zig").resolve_data_dir;
 
 const log = std.log.scoped(.dmoz_import);
 
@@ -282,18 +283,8 @@ fn import_links(
 
 // The importer refuses an existing database: it issues ids from a fresh counter and would
 // otherwise interleave them with rows it cannot see.
-fn open_empty_data_dir(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    const cwd = std.Io.Dir.cwd();
-    const path = cwd.realPathFileAlloc(io, data_dir, allocator) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            cwd.createDir(io, data_dir, .default_dir) catch |create_err| switch (create_err) {
-                error.PathAlreadyExists => {},
-                else => return create_err,
-            };
-            break :blk try cwd.realPathFileAlloc(io, data_dir, allocator);
-        },
-        else => return err,
-    };
+fn open_empty_data_dir(io: std.Io, allocator: std.mem.Allocator, data_dir: []const u8) ![:0]u8 {
+    const path = try resolve_data_dir(io, allocator, data_dir);
     errdefer allocator.free(path);
     assert(path.len > 0);
     assert(std.fs.path.isAbsolute(path));
@@ -320,7 +311,9 @@ pub fn main(init: std.process.Init) !void {
     const data_dir_absolute = try open_empty_data_dir(io, allocator, data_dir);
     defer allocator.free(data_dir_absolute);
 
-    var config = Config.from_env(init.environ_map);
+    var rejected_key: []const u8 = "";
+    var config = Config.from_env(init.environ_map, &rejected_key) catch
+        fail("{s} is not a value dmoz_import accepts — fix it or unset it", .{rejected_key});
     config.data_dir = data_dir_absolute;
     config.server = .{
         .cache_size_mb = 64,

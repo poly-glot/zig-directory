@@ -21,7 +21,8 @@ const vector_index = @import("vector_index.zig");
 const ivf_index = @import("ivf_index.zig");
 const vector_model = @import("vector_model.zig");
 const facts_index = @import("facts/facts_index.zig");
-const Config = @import("main.zig").Config;
+const main = @import("main.zig");
+const Config = main.Config;
 
 const log = std.log.scoped(.directory);
 
@@ -95,13 +96,28 @@ pub const schema_v8 = zigstore.schema(.{
     .counters = &v6_counters,
 });
 
-pub const schema = zigstore.schema(.{
+pub const schema_v9 = zigstore.schema(.{
     .magic = schema_v5.magic,
     .format_version = 9,
     .indexes = v8_indexes,
     .memtable_indexes = memtable_indexes,
     .counters = &v6_counters,
 });
+
+// Format 10 adds no tree: it gives meaning to the category record's two spare words, the
+// subtree's approved and pending link counts. An older store holds zeros there, so its header
+// upgrade marks the derived counts stale and the first boot recounts them
+// (`header_upgrade.zig`, `Directory.recover`).
+pub const schema = zigstore.schema(.{
+    .magic = schema_v5.magic,
+    .format_version = 10,
+    .indexes = v8_indexes,
+    .memtable_indexes = memtable_indexes,
+    .counters = &v6_counters,
+});
+
+/// The first format whose category records carry per-status subtree counts.
+pub const format_version_status_counts: u32 = schema.format_version;
 
 pub const Store = zigstore.Engine(schema);
 
@@ -140,6 +156,16 @@ pub const StageClock = struct {
 
 pub const url_bloom_capacity_initial: u64 = 1_000_000;
 pub const derived_counts_version_current: u64 = 1;
+pub const derived_counts_version_stale: u64 = 0;
+// From this value on, derived_counts_version holds the base plus the sequence of the last
+// applied WAL entry (see `Directory.note_counts_applied`).
+const derived_counts_version_applied_base: u64 = 2;
+
+comptime {
+    assert(derived_counts_version_stale < derived_counts_version_current);
+    assert(derived_counts_version_current < derived_counts_version_applied_base);
+}
+
 const memtable_flush_interval_ns: u64 = 5 * std.time.ns_per_ms;
 const test_vector_model_seed: u64 = 0x5EED;
 
@@ -196,6 +222,12 @@ pub const Directory = struct {
 
     op_latency: *[256]histogram.AtomicHistogram,
 
+    // False while the WAL holds entries above the checkpoint that `recover` has not replayed.
+    // Closing such a store must not checkpoint: zigstore starts `last_applied_seq` at the WAL's
+    // last sequence, so a checkpoint would stamp that sequence into the header and truncate
+    // the WAL, and the next boot would silently drop every entry replay never reached.
+    recovered: bool,
+
     pub fn dispatch(
         context: *anyopaque,
         op_byte: u8,
@@ -250,10 +282,14 @@ pub const Directory = struct {
     }
 
     /// One slab per reactor thread, plus one for every thread that may call an operation
-    /// outside a request (the test or import thread), capped by the pool.
+    /// outside a request (the test or import thread). Config refuses a thread count the pool
+    /// cannot cover, so the count is never capped silently into a later "pool exhausted" panic.
     fn scratch_slab_count(config: Config) u32 {
+        comptime assert(main.thread_count_max / 2 + 1 + scratch_slabs_extra <=
+            scratch_memory.slabs_max);
+        assert(config.server.thread_count <= main.thread_count_max);
         const reactors = @max(config.server.thread_count, 1) / 2 + 1;
-        const count = @min(reactors + scratch_slabs_extra, scratch_memory.slabs_max);
+        const count = reactors + scratch_slabs_extra;
         assert(count >= 1);
         assert(count <= scratch_memory.slabs_max);
         return count;
@@ -270,22 +306,14 @@ pub const Directory = struct {
         );
     }
 
+    // No `on_shutdown`: `run` returns once every reactor is joined, and `deinit` then stops the
+    // background workers before it takes the one final checkpoint and writes the derived
+    // snapshot at its sequence. A hook would checkpoint a second time with the workers running.
     pub fn handler() zigstore.Handler {
         comptime assert(binary_protocol.response_reserve >= zigstore.protocol.RESPONSE_HEADER_SIZE);
         return .{
             .process_frames = &Directory.process_frames,
             .header_size = zigstore.protocol.HEADER_SIZE,
-            .on_shutdown = &Directory.checkpoint_on_shutdown,
-        };
-    }
-
-    fn checkpoint_on_shutdown(context: *anyopaque) void {
-        const directory = as_directory(context);
-        _ = directory.checkpoint() catch |err| {
-            log.err(
-                "checkpoint on shutdown failed: {} — recovery will replay on next boot",
-                .{err},
-            );
         };
     }
 
@@ -516,12 +544,19 @@ pub const Directory = struct {
             .links_approved_count = std.atomic.Value(u64).init(store.counter("links_approved").*),
             .links_rejected_count = std.atomic.Value(u64).init(store.counter("links_rejected").*),
             .op_latency = op_latency,
+            .recovered = !wal_tail_pending(store),
         };
 
         if (store.was_empty) self.init_fresh_counters();
         self.init_assert_wiring();
         self.init_assert_distinct();
         return self;
+    }
+
+    fn wal_tail_pending(store: *Store) bool {
+        const wal = if (store.wal_writer) |*writer| writer else return false;
+        assert(wal.getSequence() >= store.header.seq);
+        return wal.getSequence() > store.header.seq;
     }
 
     fn init_op_latency(allocator: std.mem.Allocator) !*[256]histogram.AtomicHistogram {
@@ -563,7 +598,8 @@ pub const Directory = struct {
             assert(schema_v6.format_version == schema_v5.format_version + 1);
             assert(schema_v7.format_version == schema_v6.format_version + 1);
             assert(schema_v8.format_version == schema_v7.format_version + 1);
-            assert(schema.format_version == schema_v8.format_version + 1);
+            assert(schema_v9.format_version == schema_v8.format_version + 1);
+            assert(schema.format_version == schema_v9.format_version + 1);
             assert(v6_indexes.len == v5_indexes.len + 1);
             assert(v7_indexes.len == v6_indexes.len + 1);
             assert(v8_indexes.len == v7_indexes.len + 1);
@@ -906,6 +942,8 @@ pub const Directory = struct {
         allocator: std.mem.Allocator,
         change_set: changeset.ChangeSet,
     ) anyerror![]u8 {
+        // The engine calls this before the WAL append: the last point a refusal is an error.
+        try changeset.ensure_keys_fit(&change_set);
         const bytes = try changeset.encode(allocator, change_set);
         assert(bytes.len >= 2);
         assert(bytes[0] == changeset.schema_version);
@@ -925,6 +963,8 @@ pub const Directory = struct {
             );
             @panic("changeset apply failed after WAL append");
         };
+        // The engine applies under apply_mutex in sequence order, so this entry is the next one.
+        directory.note_counts_applied(directory.store.last_applied_seq + 1);
         directory.sync_persisted_counters();
     }
 
@@ -941,7 +981,14 @@ pub const Directory = struct {
     }
 
     pub fn deinit(self: *Directory) void {
-        self.shutdown(true);
+        if (!self.recovered) {
+            log.warn(
+                "closing without a checkpoint: recovery did not complete, " ++
+                    "so the WAL is kept whole for the next boot",
+                .{},
+            );
+        }
+        self.shutdown(self.recovered);
     }
 
     pub fn deinit_crash_test_instance(self: *Directory) void {
@@ -1015,6 +1062,10 @@ pub const Directory = struct {
 
     pub fn recover(self: *Directory) !void {
         self.assert_background_idle();
+        if (self.derived_counts_written_ahead()) {
+            log.info("recover: the pressure valve wrote counts past the checkpoint", .{});
+            self.store.counter("derived_counts_version").* = derived_counts_version_stale;
+        }
         // Before replay: the snapshot stands at the superblock's sequence, and the tail above
         // it is applied into the restored indexes by the same path that built them.
         self.derived_restored = @import("derived_snapshot.zig").restore(self);
@@ -1024,6 +1075,7 @@ pub const Directory = struct {
             .bootstrap = &bootstrap_roots,
         });
         assert(self.derived_counts_checkpointed());
+        self.recovered = true;
 
         log.info("recover: complete; ready to listen", .{});
     }
@@ -1031,8 +1083,31 @@ pub const Directory = struct {
     fn apply_entry(context: *anyopaque, entry: zigstore.ReplayEntry) anyerror!void {
         const self = as_directory(context);
         assert(entry.sequence > self.store.header.seq);
+        self.note_counts_applied(entry.sequence);
         var applier = wal_apply.WalApplier{ .db = self };
         try applier.apply(entry);
+    }
+
+    // The pressure valve writes dirty pages and the live header to store.dat without advancing
+    // header.seq, so a crash after it replays entries whose count deltas are already on disk:
+    // index writes converge when they land twice, count deltas double. Every applied entry
+    // therefore records its sequence in derived_counts_version, which the valve writes with
+    // the pages. A header whose recorded sequence is above its own header.seq was written
+    // ahead and its counts are recounted on boot; a checkpoint writes both at one sequence, so
+    // a crash with no valve flush replays without a recount. Both writers hold apply_mutex.
+    // A recount that is owed stays owed until it has run.
+    fn note_counts_applied(self: *Directory, seq: u64) void {
+        assert(seq > self.store.header.seq);
+        const version = self.store.counter("derived_counts_version");
+        if (version.* == derived_counts_version_stale) return;
+        version.* = derived_counts_version_applied_base +| seq;
+        assert(self.derived_counts_written_ahead());
+    }
+
+    fn derived_counts_written_ahead(self: *Directory) bool {
+        const version = self.store.counter("derived_counts_version").*;
+        if (version < derived_counts_version_applied_base) return false;
+        return version - derived_counts_version_applied_base > self.store.header.seq;
     }
 
     fn restore_derived_counts(context: *anyopaque) anyerror!void {
@@ -1050,7 +1125,7 @@ pub const Directory = struct {
     }
 
     pub fn derived_counts_checkpointed(self: *Directory) bool {
-        return self.store.counter("derived_counts_version").* == derived_counts_version_current;
+        return self.store.counter("derived_counts_version").* != derived_counts_version_stale;
     }
 
     fn recount_derived_counts(self: *Directory) !void {
@@ -1133,6 +1208,7 @@ pub const Directory = struct {
     }
 
     pub fn checkpoint(self: *Directory) !u64 {
+        assert(self.recovered);
         self.sync_persisted_counters();
         const seq = try self.store.checkpoint();
         assert(self.store.header.seq == seq);
@@ -1462,5 +1538,147 @@ test "derived snapshot: a truncated file is ignored and the indexes load by scan
         try std.testing.expectEqual(@as(usize, 0), directory.facts.links.count());
         try load_every_index(directory);
         try std.testing.expectEqual(@as(usize, 2), directory.facts.link_count(directory.io));
+    }
+}
+
+// Goal: a store closed before its WAL tail was replayed keeps that tail, so an acknowledged
+// write survives a boot whose recovery failed and the restart that follows. Method: write two
+// acknowledged links and crash; reopen and close without a completed recover, as main does
+// when replay fails; reopen once more and recover: both links are there.
+test "a close before recovery completes keeps the WAL tail for the next boot" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    var links: [2]u64 = undefined;
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_crash_test_instance();
+        try directory.recover();
+        _ = try seed_two_links(directory, &links);
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try std.testing.expect(!directory.recovered);
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        try std.testing.expect((try link_operations.get_link(directory, links[0])) != null);
+        try std.testing.expect((try link_operations.get_link(directory, links[1])) != null);
+    }
+}
+
+// Goal: a crash after the pressure valve flushed pages replays to exact counts, not doubled
+// ones. Method: checkpoint, add a link, drain and pull the valve (pages and counters written,
+// header.seq unchanged), crash; reopen: the replayed insert must not count the link twice.
+test "a crash after a pressure flush replays to exact counts" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    var links: [2]u64 = undefined;
+    var arts: u64 = 0;
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_crash_test_instance();
+        try directory.recover();
+        arts = try seed_two_links(directory, &links);
+        _ = try directory.checkpoint();
+        _ = try link_operations.create_link(
+            directory,
+            arts,
+            .{ .url = "http://three.tripod.com/", .title = "Three", .description = "" },
+        );
+        try directory.drain_all_memtables();
+        try directory.store.flushPages();
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        const category = (try category_operations.get_category(directory, arts)).?;
+        const top = (try category_operations.get_category(directory, category.parent_id)).?;
+        try std.testing.expectEqual(@as(u32, 3), category.link_count);
+        try std.testing.expectEqual(@as(u64, 3), category.link_count_subtree);
+        try std.testing.expectEqual(@as(u64, 3), top.link_count_subtree);
+        try std.testing.expectEqual(@as(u64, 3), directory.links_approved_count.load(.monotonic));
+    }
+}
+
+// Goal: a crash with no pressure flush replays onto the checkpoint without the full recount,
+// which on the production store blocks boot for minutes. Method: plant a count the indexes
+// contradict, checkpoint, add a link, crash with nothing flushed; the reopened store must keep
+// the planted count plus the replayed delta, which a recount from the indexes would erase.
+test "a crash with no pressure flush replays without recounting" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    const approved_planted: u64 = 10;
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_crash_test_instance();
+        try directory.recover();
+        var links: [2]u64 = undefined;
+        const arts = try seed_two_links(directory, &links);
+        directory.links_approved_count.store(approved_planted, .monotonic);
+        _ = try directory.checkpoint();
+        _ = try link_operations.create_link(
+            directory,
+            arts,
+            .{ .url = "http://three.tripod.com/", .title = "Three", .description = "" },
+        );
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try std.testing.expect(!directory.derived_counts_written_ahead());
+        try directory.recover();
+        try std.testing.expectEqual(
+            approved_planted + 1,
+            directory.links_approved_count.load(.monotonic),
+        );
+    }
+}
+
+// Goal: a clean stop takes dmozdb's final checkpoint once, after the reactors and the workers
+// have stopped. Method: `run` would call a handler hook after joining the reactors but before
+// `deinit` stops the workers, so the handler must declare none and leave the checkpoint to
+// `deinit`.
+test "the handler leaves the final checkpoint to deinit" {
+    try std.testing.expect(Directory.handler().on_shutdown == null);
+}
+
+// Goal: a change set carrying a slug path over the engine's key limit is refused before the WAL
+// append, so it can neither abort the process at apply nor fail every replay after it. Method:
+// commit a repair chunk whose new path is one byte over, expect PathTooLong with the WAL
+// sequence unchanged, then reopen the store and recover it.
+test "commit refuses a slug path over MAX_KEY_LEN before the WAL append" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
+        const sequence_before = directory.store.wal_writer.?.getSequence();
+        const long_path: [zigstore.MAX_KEY_LEN + 1]u8 = @splat('p');
+        const swaps = [_]changeset.SlugPathSwap{
+            .{ .old_path = "top/old", .new_path = &long_path, .cat_id = 2 },
+        };
+        try std.testing.expectError(
+            error.PathTooLong,
+            directory.commit(.{ .slug_path_repair_chunk = .{ .task_seq = 1, .swaps = &swaps } }),
+        );
+        try std.testing.expectEqual(sequence_before, directory.store.wal_writer.?.getSequence());
+    }
+    {
+        var directory = try Directory.open_test_instance(allocator, &temporary_directory);
+        defer directory.deinit_test_instance();
+        try directory.recover();
     }
 }
