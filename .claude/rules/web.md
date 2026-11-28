@@ -21,3 +21,13 @@ The stack version lives in **`web/deno.json`**: currently `@fresh/core@^2.3.3`, 
 ## Verify
 
 Run `cd web && deno task check` (fmt check, lint, type-check). For any user-visible change, `curl` the route and run the Playwright suite. Green specs don't catch CSS or visual-width changes, so confirm the rendered result yourself. See the verify section of the root [CLAUDE.md](../../CLAUDE.md).
+
+## Request guards (`web/main.ts`)
+
+Four root pieces run around every route. Their reasons live here, not in the code.
+
+- DO: **Keep the body cap in `lib/body-limit.ts`.** `REQUEST_BODY_MAX_BYTES` is 64 KiB: the largest legitimate body is a form of a few hundred bytes or a bulk-action list of at most 200 ids. Over it answers 413 before a route calls `formData()` or `json()`. A body with no `Content-Length` is counted, not trusted.
+- DO: **Set browser headers only in `lib/security-headers.ts`.** The CSP is applied in production builds only, because the vite dev server injects un-nonced styles. It uses the nonce Fresh renders into its inline scripts and styles, so there is no `unsafe-inline`. It deliberately sets no `form-action`: the OAuth consent form posts to this origin and then redirects to the client's `redirect_uri`, and Chromium enforces `form-action` on that redirect. Headers are rebuilt onto a new `Response` because `Response.redirect()` headers are immutable.
+- NEVER: **Add `style=` or an inline `<script>` to a page.** Both are blocked in production by that policy.
+- DO: **List calls default to approved links.** The `list*` methods of `DmozClient` send `approved` unless the caller passes `status`, and admin, backfill and dashboard callers opt out with `"any"` or an explicit status. A new public list call is therefore safe by default.
+- DO: **Keep `PublicApp` as the app class.** Fresh decodes route params with `decodeURI` before any middleware runs, so `/category/%FF` throws a `URIError` out of `handler()`. `PublicApp` turns that into a 400 with the security headers. Reject a bad id or cursor with a 400 and its reason; never clamp or coerce it (`parseEntityId`, `pageSize` and `afterCursor` return `undefined` for that).

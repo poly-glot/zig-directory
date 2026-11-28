@@ -1,54 +1,116 @@
 # zig-directory
 
-A DMOZ-inspired web directory server, `dmozdb`, written in Zig. The storage engine (paged file, B+Trees, page cache,
-WAL, snapshot, epoll reactor, protocol framing) is the external library [zigstore](https://github.com/poly-glot/zigstore);
-this repository holds the directory schema, operations, ChangeSet apply logic, verifier, repair worker and the binary
-protocol op handlers. Binary-only TCP protocol processed inline on the epoll thread (Redis model).
+zig-directory is a web directory in the style of DMOZ. Categories nest, links sit inside them, and you can browse,
+search and submit. It is three programs. `dmozdb` is the database, written in Zig. The website is a Deno and Fresh app
+that talks to `dmozdb`. The MCP server lets AI clients use the directory through the website's API. Only the website
+and the MCP server are meant to face the internet.
 
----
+The live site is [directory.junaid.guru](https://directory.junaid.guru). The sample store in this repository,
+`data/store.dat.zip`, holds 92,001 links in 59,218 categories, so you can try the code on a realistic amount of data.
 
-## Table of Contents
+## What is interesting about it
 
-- [Features](#features)
-- [Architecture](#architecture)
-  - [System Overview](#system-overview)
-  - [Engine](#engine)
-  - [Storage Layout](#storage-layout)
-  - [Network Layer](#network-layer)
-  - [Durability](#durability)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Build from Source](#build-from-source)
-  - [Run with Docker](#run-with-docker)
-  - [Development Container](#development-container)
-- [Configuration](#configuration)
-- [Binary Protocol Reference](#binary-protocol-reference)
-  - [Wire Format](#wire-format)
-  - [Op Codes](#op-codes)
-  - [Status Codes](#status-codes)
-  - [Sub-Status Codes](#sub-status-codes)
-  - [CRUD Operations](#crud-operations)
-  - [Query Operations](#query-operations)
-  - [Update Operations](#update-operations)
-  - [Moderation Operations](#moderation-operations)
-  - [System Operations](#system-operations)
-- [Testing](#testing)
-  - [Unit and Integration Tests](#unit-and-integration-tests)
-  - [Load Testing](#load-testing)
-- [Kubernetes Deployment](#kubernetes-deployment)
-- [Project Structure](#project-structure)
-- [Architecture Deep Dive](#architecture-deep-dive)
-  - [B+Tree Index Engine](#btree-index-engine)
-  - [Page Cache (Buffer Pool)](#page-cache-buffer-pool)
-  - [Write-Ahead Log](#write-ahead-log)
-  - [Slug Path Resolution](#slug-path-resolution)
-  - [Slug-Path Repair Queue](#slug-path-repair-queue)
-  - [Connection State Machine](#connection-state-machine)
-  - [Event Loop](#event-loop)
-  - [Link Insert Path](#link-insert-path)
-  - [Search](#search)
-- [Operational Guide](#operational-guide)
-- [Contributing](#contributing)
+- **A database written for one job.** `dmozdb` has no query language. It has 38 binary operations plus ping, each
+  written for something the directory does: browse a category, list every link under it, search, count.
+- **An acknowledged write is on disk.** A write gets its answer only after the log has been `fdatasync`ed. Writes from
+  many connections share one sync (group commit).
+- **Checkpoints survive a crash.** Pages go to a journal first and then into the data file. A crash between the two
+  steps is repaired on the next start.
+- **Memory is reserved at start-up.** Each reactor thread has a scratch slab for requests. A request that needs more
+  than its slab fails with a protocol error and the server does not grow.
+- **Hybrid search.** Keyword postings and int8 vectors are combined with reciprocal rank fusion. The website computes
+  the embeddings, and `dmozdb` never runs a model.
+- **Graph questions.** An in-memory facts index answers questions such as "how many sites are hosted on tripod.com".
+- **TigerStyle, checked by a program.** `src/tidy.zig` enforces line and function length, naming, bounded loops and
+  banned patterns, and it runs inside `zig build test`.
+
+The storage engine (paged file, B+Trees, page cache, write-ahead log, epoll server) is a separate library,
+[zigstore](https://github.com/poly-glot/zigstore). This repository holds the directory schema, the operations, the
+background workers and the protocol handlers.
+
+## Status
+
+- One author. This is a personal project, not a team product, and nobody is on call for it.
+- Linux only. The server uses epoll and `O_DIRECT`. It compiles on macOS but crashes at the first Linux-only system
+  call, so it does not run on macOS or Windows. Use the [Dev Container](#macos-and-windows) there.
+- Built with AI assistance. A lot of the code was written with Claude Code, under the rules in
+  [`.claude/`](.claude/): a project contract in [`CLAUDE.md`](CLAUDE.md), rule files in
+  [`.claude/rules/`](.claude/rules/) and hooks that run the test gate before a session may finish. Every change still
+  has to pass the same gates a person's would (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+- Version 0.6.0, not tagged. There is no stability promise for the wire protocol or the on-disk format. The store
+  carries a format version and upgrades older ones when it starts.
+- There is no authentication in `dmozdb` itself. Read [SECURITY.md](SECURITY.md) before you expose anything.
+
+## Quickstart
+
+You need a Linux machine with [Zig 0.16.0](https://ziglang.org/download/), `unzip` and `bash`. This builds the
+server, unpacks the sample store, starts the server and sends it a ping and a stats request.
+
+```bash
+git clone https://github.com/poly-glot/zig-directory.git
+cd zig-directory
+zig build -Doptimize=ReleaseSafe
+
+export DMOZDB_DATA_DIR=/tmp/dmozdb-data
+mkdir -p "$DMOZDB_DATA_DIR"
+unzip -q data/store.dat.zip -d "$DMOZDB_DATA_DIR"
+export DMOZDB_VECTOR_MODEL="$PWD/models/vector_model.bin"
+./zig-out/bin/dmozdb &
+sleep 2
+```
+
+Three things trip people up. The data directory must be an absolute path. The server refuses to start without
+`DMOZDB_VECTOR_MODEL`. The sample store is 506 MB once unzipped.
+
+The server listens on `127.0.0.1:8080`. Send it a ping (op 255) and a stats request (op 15) with bash alone:
+
+```bash
+exec 3<>/dev/tcp/127.0.0.1/8080
+printf '\x08\x00\x00\x00\xff\x00\x00\x00' >&3
+head -c 10 <&3 | od -An -tx1
+printf '\x08\x00\x00\x00\x0f\x00\x00\x00' >&3
+head -c 58 <&3 | tail -c 48 | od -An -tu8
+exec 3>&-
+```
+
+The first command prints the 10-byte response header of the ping. The second prints six unsigned 64-bit numbers:
+categories, links, pages, cache hits, cache misses and pending WAL entries. The frame layout is in the
+[protocol reference](docs/protocol.md#wire-format).
+
+Stop the server with `SIGTERM`. It drains its queues and runs a final checkpoint before it exits.
+
+```bash
+kill -TERM $(pidof dmozdb)
+```
+
+### macOS and Windows
+
+`dmozdb` does not run natively there. The repository has a [Dev Container](.devcontainer/devcontainer.json) for VS
+Code and GitHub Codespaces: Ubuntu 24.04 with Zig 0.16.0 and ZLS installed. Open the folder in it, then follow the
+quickstart above inside the container. Docker Desktop is enough on macOS and Windows.
+
+The Dev Container bind-mounts `~/.claude` from your home directory and will not start if that directory does not exist,
+so run `mkdir -p ~/.claude` first. You can also build the backend image yourself, see
+[Run with Docker](#run-with-docker).
+
+### The website
+
+The website is optional and needs [Deno](https://deno.com). It reads `DMOZDB_HOST` and `DMOZDB_PORT` to find the
+server, and it needs `DMOZDB_HOST=127.0.0.1`: without it, IPv6 resolution gives "Directory service unavailable". See
+[`web/README.md`](web/README.md) for the rest of its setup.
+
+## Where to read more
+
+| Document | What is in it |
+|----------|---------------|
+| [docs/protocol.md](docs/protocol.md) | The binary protocol: wire format, every op, status and sub-status codes |
+| [docs/architecture.md](docs/architecture.md) | B+Tree, page cache, WAL, slug paths and repair, event loop, insert path, search, and the reasons behind the design |
+| [docs/operations.md](docs/operations.md) | Data files, monitoring, shutdown, backup and the Kubernetes deployment |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to build, test and change the code |
+| [SECURITY.md](SECURITY.md) | The threat model and how to report a problem privately |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, by version |
+| [NOTICE.md](NOTICE.md) | Third-party data and models, and their licences |
+| [bench/README.md](bench/README.md) | The benchmark tool |
 
 ---
 
@@ -56,7 +118,7 @@ protocol op handlers. Binary-only TCP protocol processed inline on the epoll thr
 
 - **zigstore engine**: 16 KB paged file, B+Trees, sharded LRU page cache with free-list management
 - **Write-Ahead Log (WAL)** with group commit; a write is acknowledged only after `fdatasync`
-- **Binary TCP protocol** with 32 ops + ping, processed inline on the epoll thread
+- **Binary TCP protocol** with 38 ops + ping, processed inline on the epoll thread
 - **Multi-reactor epoll** with edge-triggered non-blocking I/O and `SO_REUSEPORT`
 - **Redis-style two-pass event loop**: read all, then write all
 - **4,096 concurrent connections** per reactor with a per-connection state machine
@@ -81,7 +143,7 @@ protocol op handlers. Binary-only TCP protocol processed inline on the epoll thr
 
 ### Engine
 
-`dmozdb` is built on **zigstore** (`github.com/poly-glot/zigstore`, pinned in `build.zig.zon`, currently `v3.0.0`). The
+`dmozdb` is built on **zigstore** (`github.com/poly-glot/zigstore`, pinned in `build.zig.zon`, currently `v4.0.0`). The
 library owns the generic machinery:
 
 | zigstore module                      | Responsibility                                                            |
@@ -107,13 +169,14 @@ worker and the binary-protocol op handlers.
 
 The store lives in `DMOZDB_DATA_DIR` as `store.dat` (16 KB pages), `wal.bin` and `snapshot.meta`:
 
-- **Page 0**: file header (magic `DMOZ` / `0x444D4F5A`, `format_version` 7, a root page + entry count per index, the
-  three ID counters `next_category_id`, `next_link_id`, `next_repair_seq`, and the `embedding_model` id). A format 5
-  or 6 header is rewritten to format 7 at boot, one format at a time; data pages are untouched
+- **Page 0**: file header (magic `DMOZ` / `0x444D4F5A`, `format_version` 10, a root page + entry count per index, the
+  three ID counters `next_category_id`, `next_link_id`, `next_repair_seq`, and the `embedding_model` id). A format 5 to
+  9 header is rewritten to format 10 at boot, one format at a time; data pages are untouched, and the step to format 10
+  recounts every category once before the server listens
 - **Pages 1+**: B+Tree nodes. Every root is allocated lazily on first insert and recorded in the header, so no page
   number is fixed beyond page 0
 
-Thirteen B+Trees back the read and write paths; the first six are also fronted by a memtable:
+Fourteen B+Trees back the read and write paths; the first six are also fronted by a memtable:
 
 | Index                       | Key                       | Value                     | Memtable | Purpose                                            |
 |-----------------------------|---------------------------|---------------------------|----------|----------------------------------------------------|
@@ -128,8 +191,9 @@ Thirteen B+Trees back the read and write paths; the first six are also fronted b
 | `categories_index_tree`     | token ‖ category ID (BE)  | (empty)                   | no       | Posting list for category text search              |
 | `links_index_tree`          | token ‖ link ID (BE)      | (empty)                   | no       | Posting list for link text search                  |
 | `slug_path_repair_queue`    | repair_seq (BE)           | RepairTask (2,080 bytes)  | no       | Pending descendant slug-path cleanups              |
-| `link_vectors`              | link ID                   | LinkVector (400 bytes)    | no       | int8 embedding per link for hybrid search          |
+| `link_vectors`              | link ID                   | LinkVector (512 bytes)    | no       | int8 embedding per link for hybrid search          |
 | `link_entities`             | link ID                   | Entity facts (<= 1,062 B) | no       | Places, religions, people and orgs a link names    |
+| `category_vectors`          | category ID               | StoredVector (400 bytes)  | no       | int8 embedding per category for `neighbours`       |
 
 ### Network Layer
 
@@ -145,7 +209,7 @@ Thirteen B+Trees back the read and write paths; the first six are also fronted b
 
 Writes follow the WAL-first protocol via the ChangeSet pipeline:
 
-1. **Compute**: `operations/operations_changeset_compute.zig` builds a typed `ChangeSet` describing every on-disk effect
+1. **Compute**: `src/operations/operations_changeset_compute.zig` builds a typed `ChangeSet` describing every on-disk effect
    of the mutation (primary record, secondary indexes, ancestor count cascades, token entries).
 2. **Commit**: `db.commit(cs)` calls `zigstore.commitSeq`, which encodes the ChangeSet, appends it to the WAL as op
    `100` (CRC32 + monotonic sequence) and applies it under the engine's apply mutex in sequence order. Inside a request,
@@ -153,7 +217,7 @@ Writes follow the WAL-first protocol via the ChangeSet pipeline:
    then waits in `awaitDurable` for the highest sequence the request wrote before the response leaves. **The ack is the
    fsync**: no `ok` for a write is sent until that entry, and every entry before it, is on disk. A commit made outside
    a request (tests, the repair worker) waits for its own entry before returning.
-3. **Apply**: `apply/*.zig` walks the ChangeSet variants. Effects on the six memtable-backed indexes go to that index's
+3. **Apply**: `src/apply/*.zig` walks the ChangeSet variants. Effects on the six memtable-backed indexes go to that index's
    32-shard memtable; token entries and repair-queue writes go straight to their B+Trees; ancestor counts are rewritten
    synchronously in the same apply.
 4. **Background drain**: the memtable flusher worker drains memtables into the B+Trees every 5 ms. Dirty pages stay in
@@ -180,39 +244,24 @@ operators; the WAL sequence resumes from the superblock. A WAL that fails to ope
 (further commits are refused and the process restarts), and a WAL with valid records more than one batch beyond a corrupt
 record all refuse to start rather than serve or silently drop data.
 
+The [architecture notes](docs/architecture.md) go deeper: the B+Tree and page cache, the write-ahead log, slug-path
+resolution and repair, the connection state machine and event loop, the link insert path and search, and the reasons
+behind each design decision.
+
 ---
 
-## Getting Started
+## Other ways to build and run
 
-### Prerequisites
-
-- **Zig 0.16.0**: [install guide](https://ziglang.org/download/)
-- **Docker** (optional, for containerized deployment)
-
-### Build from Source
+### Build options
 
 ```bash
-# Clone the repository
-git clone <repo-url>
-cd zig-directory
-
-# Build the server (debug); produces zig-out/bin/dmozdb only
-zig build
-
-# Build the server plus the dev tools zig-out/bin/bench and zig-out/bin/dmoz_import
-zig build -Dtools=true
-
-# Build (optimized release)
-zig build -Doptimize=ReleaseSafe
-
-# Run tests
-zig build test
-
-# Run the server
-DMOZDB_PORT=8080 DMOZDB_DATA_DIR=./data ./zig-out/bin/dmozdb
+zig build                         # debug; produces zig-out/bin/dmozdb only
+zig build -Dtools=true            # also zig-out/bin/bench and zig-out/bin/dmoz_import
+zig build -Doptimize=ReleaseSafe  # optimised, every assertion kept
+zig build test                    # the test suite and the tidy checker
 ```
 
-`bench` and `dmoz_import` are always compiled `ReleaseFast` regardless of `-Doptimize`. CI runs both `zig build test`
+`bench` is always compiled `ReleaseFast` regardless of `-Doptimize`, so its numbers stay comparable. `dmoz_import` writes the store the server opens, so it follows `-Doptimize` and builds `ReleaseSafe` when none is given. CI runs both `zig build test`
 and `zig build -Dtools=true`.
 
 ### Run with Docker
@@ -227,6 +276,7 @@ docker build -f Dockerfile.backend -t dmozdb-backend:latest .
 docker run -d \
   --name dmozdb \
   -p 8080:8080 \
+  -e DMOZDB_TRUSTED=172.16.0.0/12 \
   -v dmozdb-data:/var/lib/dmozdb \
   dmozdb-backend:latest
 
@@ -242,7 +292,17 @@ docker run -d \
   dmozdb-web:latest
 ```
 
-### Development Container
+The image binds `0.0.0.0` and trusts only loopback unless `DMOZDB_TRUSTED` says otherwise (see
+[Protected mode](docs/architecture.md#protected-mode)). Connections published through `-p` arrive from the Docker
+network, not from loopback, so without `DMOZDB_TRUSTED` the server drops every one of them and logs `Protected mode:
+rejected connection from ...`. `172.16.0.0/12` covers the default bridge network. If the log still shows rejections,
+trust the address it names. The web container reaches the backend through `host.docker.internal`, which is not
+loopback either, so the `DMOZDB_TRUSTED` value on the backend has to cover that path as well.
+
+The data volume starts empty, so the container starts with an empty store. To serve the sample store, unzip
+`data/store.dat.zip` into the volume first.
+
+### Dev Container
 
 The project includes a full [Dev Container](.devcontainer/devcontainer.json) configuration for VS Code and GitHub Codespaces:
 
@@ -261,6 +321,9 @@ The project includes a full [Dev Container](.devcontainer/devcontainer.json) con
 | `dbw`   | `docker build -f Dockerfile.web -t dmozdb-web .`         | Build web image         |
 | `dr`    | `docker run --rm -p 8080:8080 dmozdb-backend`            | Run backend container   |
 
+The `dr` alias does not set `DMOZDB_TRUSTED`, so the server rejects every client outside the container, as described
+under [Run with Docker](#run-with-docker). Use the full `docker run` line from there when you need to reach it.
+
 ---
 
 ## Configuration
@@ -273,374 +336,33 @@ are read by `zigstore.ServerConfig.fromEnv("DMOZDB_")`; the rest by `src/main.zi
 | `DMOZDB_PORT`                             | u16    | `8080`            | Binary protocol listen port                                                 |
 | `DMOZDB_BIND`                             | IPv4   | `127.0.0.1`       | Address to bind the listen socket                                           |
 | `DMOZDB_TRUSTED`                          | string | (none)            | Comma-separated IPv4 addresses and/or CIDRs (`10.0.0.5,10.244.0.0/16`) allowed to connect |
-| `DMOZDB_CACHE_SIZE_MB`                    | u32    | `256`             | Page cache size in megabytes                                                |
+| `DMOZDB_CACHE_SIZE_MB`                    | u32    | `256`             | Page cache size in megabytes (1–67108863, the engine's u32 frame count)     |
 | `DMOZDB_THREAD_COUNT`                     | u32    | auto              | 0 = CPU count (capped at 32); the server runs `max(n / 2, 1)` reactors      |
 | `DMOZDB_SNAPSHOT_INTERVAL_S`              | u32    | `300`             | Seconds between periodic checkpoints (drain, journal, `wal.bin` truncate)   |
 | `DMOZDB_WAL_SYNC_INTERVAL_MS`             | u32    | `50`              | Parsed, currently unused: the WAL flusher timer is a fixed 2 ms             |
 | `DMOZDB_WAL_BATCH_SIZE`                   | u32    | `256`             | WAL entries that trigger an immediate group flush                           |
 | `DMOZDB_DATA_DIR`                         | string | `/var/lib/dmozdb` | Directory for `store.dat`, `wal.bin`, `snapshot.meta`                       |
-| `DMOZDB_RENAME_INLINE_THRESHOLD`          | u32    | `5000`            | Subtree size at which rename/move flips from in-line strict to queued async repair |
+| `DMOZDB_RENAME_INLINE_THRESHOLD`          | u32    | `5000`            | Subtree size at which rename/move flips from in-line strict to queued async repair (at most 7224, so the swaps fit one WAL record) |
 | `DMOZDB_REPAIR_WORKER_INTERVAL_MS`        | u32    | `1000`            | Repair-worker tick interval (ms)                                            |
-| `DMOZDB_REPAIR_WORKER_CHUNK_SIZE`         | u32    | `10000`           | Descendants processed per worker chunk                                      |
+| `DMOZDB_REPAIR_WORKER_CHUNK_SIZE`         | u32    | `1000`            | Descendants visited per worker chunk, each under the write lock (~45 ms); at most 7224 |
 | `DMOZDB_VERIFIER_INTERVAL_S`              | u32    | `300`             | Seconds between background verifier runs                                    |
 | `DMOZDB_SCRATCH_SLAB_MB`                  | u32    | `32`              | Request scratch slab per reactor thread, MiB (1–1024); a request that outgrows it fails |
+| `DMOZDB_VECTOR_MODEL`                     | string | `/usr/local/share/dmozdb/vector_model.bin` | Vector model loaded at boot; the server refuses to start without it |
 
 ---
 
-## Binary Protocol Reference
+## Binary protocol
 
-### Wire Format
+`dmozdb` speaks one binary protocol over TCP: an 8-byte request header, a 10-byte response header, and 38 ops plus
+ping. The web tier calls it through a generated TypeScript client. The [protocol reference](docs/protocol.md) has the
+wire format, every op with its payload layout, and the status and sub-status codes.
 
-<p align="center">
-  <img src="diagrams/05-binary-wire-format.svg" alt="Binary Wire Format" />
-</p>
+## Operating it
 
-> Diagram source: [`diagrams/05-binary-wire-format.mmd`](diagrams/05-binary-wire-format.mmd)
-
-Requests carry an 8-byte header, responses a 10-byte header. All integers are little-endian. `len` includes the header.
-Multiple frames can be pipelined on the same persistent TCP connection.
-
-```
-Request:  [u32 len][u8 op][u8 reserved][u16 count][payload...]
-Response: [u32 len][u8 op][u8 status][u8 sub_status][u8 pad][u16 count][payload...]
-```
-
-`count` is the number of items in a batch request, and the number of rows in a list response.
-
-### Op Codes
-
-| Code   | Op                        | Batch   | Description                                                              |
-|--------|---------------------------|---------|--------------------------------------------------------------------------|
-| 1      | `create_link`             | yes     | Create links (count items)                                               |
-| 2      | `create_category`         | yes     | Create categories (count items)                                          |
-| 3      | `get_link`                | no      | Get link by ID                                                           |
-| 4      | `get_category`            | no      | Get category by ID                                                       |
-| 5      | `delete_link`             | no      | Delete link by ID                                                        |
-| 6      | `delete_category`         | no      | Delete category by ID                                                    |
-| 7      | `update_category`         | no      | Update category fields (bitmask)                                         |
-| 8      | `move_category`           | no      | Move category to new parent                                              |
-| 9      | `update_link`             | no      | Update link fields (bitmask)                                             |
-| 10     | `list_root_categories`    | no      | List root categories with pagination                                     |
-| 11     | `browse_path`             | no      | Resolve a slug path: category, ancestors, children, subtree link count   |
-| 12     | `list_children`           | no      | List child categories with pagination                                    |
-| 13     | `list_links`              | no      | List links in a category; optional status filter and cursor              |
-| 14     | `search`                  | no      | Full-text search categories and links                                    |
-| 15     | `stats`                   | no      | Database statistics                                                      |
-| 16     | `list_all_links`          | no      | List links across all categories; optional status filter and cursor      |
-| 17     | `list_subtree_links`      | no      | List links in a subtree (transitive over all descendants) with pagination |
-| 18     | `index_health`            | no      | Verifier snapshot + slug-path repair queue depth + worker counters        |
-| 19     | `run_verifier`            | no      | Run the verifier inline, then return the `index_health` frame            |
-| 20     | `rebuild_index`           | no      | Rebuild the category and link secondary indexes, drain the repair queue  |
-| 22     | `snapshot`                | no      | Checkpoint (journaled page + header flush, WAL truncate), write `snapshot.meta` |
-| 23     | `op_latency_stats`        | no      | Per-op latency percentiles since boot                                    |
-| 24     | `bulk_import`             | yes     | Insert up to 50,000 links from one frame (importer path)                 |
-| 25     | `create_submission`       | no      | Create a link with status `pending` and a submitter ID                   |
-| 26     | `update_link_status`      | no      | Set one link's status                                                    |
-| 27     | `list_links_by_submitter` | no      | List a submitter's links; optional status filter and cursor              |
-| 28     | `move_link`               | no      | Move a link to another category                                          |
-| 29     | `get_categories_by_ids`   | no      | Fetch up to 200 categories by ID                                         |
-| 30     | `breadcrumbs_by_ids`      | no      | Ancestor chains (id, name, slug) for up to 200 categories                |
-| 34     | `bulk_update_link_status` | no      | Set status on up to 200 links, per-item result codes                     |
-| 35     | `bulk_delete_links`       | no      | Delete up to 200 links, per-item result codes                            |
-| 36     | `counts_by_status`        | no      | Link counts per status                                                   |
-| 37     | `put_link_vectors`        | no      | Store up to 32 link embeddings, per-item result codes                    |
-| 38     | `query_links`             | no      | Count, filter and group links by domain, site, country, category, words  |
-| 39     | `put_link_entities`       | no      | Store up to 64 link entity records, per-item result codes                |
-| 40     | `match_names`             | no      | Per phrase: the largest category with that name, and whether links name it |
-| 255    | `ping`                    | no      | Ping/pong                                                                |
-
-Codes 21 and 31–33 are unassigned.
-
-### Status Codes
-
-| Code   | Status               | Meaning                              |
-|--------|----------------------|--------------------------------------|
-| 0      | `ok`                 | Success                              |
-| 1      | `not_found`          | Resource not found                   |
-| 2      | `duplicate`          | Duplicate URL                        |
-| 3      | `invalid`            | Invalid request payload              |
-| 4      | `err`                | Internal error                       |
-| 5      | `category_not_found` | Category does not exist              |
-| 6      | `has_children`       | Cannot delete: category has children |
-| 7      | `circular`           | Circular hierarchy detected          |
-
-### Sub-Status Codes
-
-`sub_status` refines `status`; it is `none` unless listed here.
-
-| Code   | Sub-status            | Paired with          | Meaning                                              |
-|--------|-----------------------|----------------------|------------------------------------------------------|
-| 0      | `none`                | any                  | No refinement                                        |
-| 1      | `field_too_long`      | `invalid`            | A string exceeds its `FixedString` capacity, or a `bulk_import` frame exceeds its caps |
-| 2      | `invalid_slug`        | `invalid`            | Slug fails validation                                |
-| 3      | `buffer_too_small`    | `invalid`            | Response would not fit the connection buffer         |
-| 4      | `path_too_deep`       | `invalid`            | Category depth limit exceeded                        |
-| 5      | `unsupported_order`   | `invalid`            | `list_subtree_links` order code other than 0, or an unknown link status byte |
-| 6      | `parent_not_found`    | `category_not_found` | Parent category missing on create/move               |
-| 7      | `duplicate_url`       | `duplicate`          | URL already stored                                   |
-| 8      | `offset_too_large`    | `invalid`            | `list_subtree_links` offset above 5000               |
-| 9      | `already_in_progress` | `err`                | A snapshot is already running                        |
-| 10     | `duplicate_slug`      | `duplicate`          | A sibling category already has that slug (create, rename, or move) |
-| 11     | `embedding_model_mismatch` | `invalid`       | `put_link_vectors` model differs from the one the store already holds |
-
-### CRUD Operations
-
-**Create link (op=1, batch)**
-```
-Request payload per item:
-  [u64 category_id][u16 url_len][url][u16 title_len][title][u16 desc_len][desc]
-
-Response per item (count = items written):
-  [u8 status][u8 sub_status][u64 link_id]
-```
-
-**Create category (op=2, batch)**: same layout with `[u64 parent_id][name][slug][desc]`.
-
-**Get link/category (op=3/4)**
-```
-Request:  [u64 id]
-Response: [full extern struct bytes]   (Link=1888B, Category=1288B)
-```
-
-**Get categories by IDs (op=29)**
-```
-Request:  [u16 n (<= 200)][n x u64 id]
-Response: header (count=found) + [found x Category struct bytes]   (missing IDs are skipped)
-```
-
-**Delete link/category (op=5/6)**
-```
-Request:  [u64 id]
-Response: header only (status in header)
-```
-
-### Query Operations
-
-**List root categories (op=10)**
-```
-Request:  [u32 offset][u32 limit]
-Response: header (count=N) + [N x Category struct bytes]
-```
-
-**List children (op=12)**
-```
-Request:  [u64 parent_id][u32 offset][u32 limit]
-Response: header (count=N) + [N x Category struct bytes]
-```
-
-**List links (op=13)**, **list all links (op=16)**, **list links by submitter (op=27)**
-```
-Request (op=13): [u64 category_id][u32 offset][u32 limit][extras]
-Request (op=16): [u32 offset][u32 limit][extras]
-Request (op=27): [u64 submitter_id][u32 offset][u32 limit][extras]
-
-extras, optional trailing bytes:
-  (none)                      no status filter, offset pagination
-  [u8 status]                 filter by status 0=pending 1=approved 2=rejected
-  [u8 status][u64 after_id]   status 0xFF = no filter; after_id > 0 = cursor pagination
-
-Response: header (count=N) + [N x Link struct bytes][u64 next_after_id]
-```
-
-`limit` is capped by a 128 KiB row budget: 69 links per page (100 for category lists). `next_after_id` is 0 when
-there is no further page.
-
-**List subtree links (op=17)**
-```
-Request:  [u64 category_id][u8 order_code (must be 0)][u32 offset (<= 5000)][u32 limit][extras as above]
-Response: [u32 written][written x Link struct bytes][u64 total][u64 next_after_id]   (header count=0)
-```
-
-`limit` 0 means 50; the maximum is 100. `total` is the subtree link count under the status filter.
-
-**Browse path (op=11)**
-```
-Request:  [u16 path_len][path]   e.g. "top/computers/programming"
-Response: [Category bytes][u16 ancestor_count][ancestors...][u16 child_count][children (<= 100)...][u64 total_links]
-```
-
-Ancestors are ordered root-first. `total_links` is the transitive link count of the subtree.
-
-**Breadcrumbs by IDs (op=30)**
-```
-Request:  [u16 n (<= 200)][n x u64 id]
-Response: header (count=n) + per id: [u16 crumb_count][crumb_count x ([u64 id][66B name][130B slug])]
-```
-
-Each crumb list runs root-first and ends with the category itself; an unknown ID yields `crumb_count=0`.
-
-**Search (op=14)**
-```
-Request:  [u16 query_len (>= 2)][query][u32 limit][optional u8 scope: 0=both 1=links_only 2=categories_only]
-          [optional u8 mode: 0=all_terms 1=ranked 2=hybrid][hybrid only: u64 model][384 x f32 LE query embedding]
-          [optional u8 cap_per_site: 0 or 1, ranked and hybrid only]
-Response: [u16 cat_count][categories...][u16 link_count][link_count x ([Link bytes][u8 match_field]
-          [cap_per_site = 1 only: u16 len][site][u16 more])][hybrid only: u8 vector_used]
-```
-
-`limit` is capped at 50 per kind. `match_field` is 0=title, 1=url, 2=description, 3=semantic (found by the vector half
-only). An absent mode byte means `all_terms`. `vector_used` is 0 when the server answered from keywords alone.
-`cap_per_site` = 1 keeps at most two links from one site, with sites decided as for `query_links`, so
-`members.tripod.com/~a` and `members.tripod.com/~b` are two sites. The last row kept for a site gives in `more` how
-many of its links the cap passed over before the page filled.
-
-**Put link vectors (op=37)**
-```
-Request:  [u64 model][u16 count (1..32)][count x ([u64 link_id][u64 text_fingerprint][384 x f32 LE])]
-Response: [u16 ok][u16 err][(ok + err) x ([u64 link_id][u8 code])]
-```
-
-`text_fingerprint` is FNV-1a 64 over `title ++ 0x00 ++ description`. Codes: 0=ok, 1=not_found, 2=stale_text (the
-link's text changed since it was embedded), 3=invalid_vector (non-finite or zero). The server L2-normalises and
-quantises to int8. A `model` of 0, or one different from the stored model, is refused for the whole frame.
-
-**Query links (op=38)**
-```
-Request:  [u64 category_id (0 = all)][u16 len][domain suffix][u16 len][ISO country or empty]
-          [u64 options][u16 len][words][u16 len][entity name or empty][u64 after_id]
-Options:  bits 0-3 country edges (1 ccTLD, 2 category, 4 entity; 0 all), bit 4 hosted sites only,
-          bit 5 all words, bits 6-9 group by (0 none, 1 domain, 2 site, 3 host, 4 branch, 5 country,
-          6 religion, 7 person, 8 organisation), bits 10-17 status (0xFF any), bits 18-25 group limit (<= 50),
-          bits 26-33 page limit (<= 50), bits 34-49 religions (one bit each; 0 any),
-          bit 50 subdomain sites only (a whole host on a hosting platform, not a path site)
-Response: [u8 ready][u64 links][u64 sites][u64 hosts][u64 domains]
-          [u16 group_count][group_count x ([u16 len][label][u64 branch_id][u64 links][u64 sites])]
-          [u16 link_count][link_count x ([Link bytes][u16 len][site][2 ccTLD country][2 category country]
-                                         [u16 religions][u8 n][n x 2 entity country])]
-          [u64 next_after_id]
-```
-
-`ready` is 0 until the facts index has loaded after boot. A domain suffix matches whole labels, so `tripod.com`
-covers every `*.tripod.com` host and never `nottripod.com`. Words use the search postings; a value with no
-searchable word is `invalid`. Religion bits follow islam, christianity, judaism, hinduism, buddhism, sikhism, taoism,
-jainism, bahai, shinto, paganism (`RELIGIONS` in the generated client). An entity name matches a whole person or
-organisation name the link carries, ignoring ASCII case.
-
-**Put link entities (op=39)**
-```
-Request:  [u16 count (1..64)][count x ([u64 link_id][u64 text_fingerprint][u16 len][record])]
-Record:   [u8 version = 1][u16 religions][u8 n (<= 8)][n x 2 ISO country]
-          [u8 n (<= 8)][n x ([u8 len (1..64)][UTF-8 person])][u8 n (<= 8)][n x ([u8 len (1..64)][UTF-8 org])]
-Response: [u16 ok][u16 err][(ok + err) x ([u64 link_id][u8 code])]
-```
-
-Codes: 0=ok, 1=not_found, 2=stale_text, 3=invalid_facts (the record does not decode, or names an unknown religion
-or an unassigned country). A put replaces the link's record. `text_fingerprint` is the same FNV-1a 64 as op 37.
-
-**Match names (op=40)**
-```
-Request:  [u16 count (1..32)][count x ([u16 len (1..128)][phrase])]
-Response: [u8 ready][u16 count][count x ([u64 category_id][u8 names_someone])]
-```
-
-A phrase matches a category whose name has the same words in any case, with a final `s` dropped from words longer
-than three letters, so `art` finds `Arts` and `kids and teens` finds `Kids_and_Teens`. Of several such categories
-the one with the most links in its subtree wins; `category_id` is 0 when none matches. `names_someone` is 1 when
-some link's entity record names a person or organisation with exactly this name in any case. `ready` is 0, with no
-rows, until the facts index has loaded.
-
-### Update Operations
-
-Update ops use a **bitmask byte** to indicate which fields are present.
-
-**Update category (op=7)**
-```
-Request:  [u64 id][u8 bitmask][...present fields...]
-
-Bitmask bits:
-  0x01 = name    -> [u16 len][bytes]
-  0x02 = slug    -> [u16 len][bytes]
-  0x04 = desc    -> [u16 len][bytes]
-```
-
-**Update link (op=9)**: same pattern with `0x01=url`, `0x02=title`, `0x04=desc`.
-
-**Move category (op=8)**
-```
-Request:  [u64 category_id][u64 new_parent_id]
-```
-
-**Move link (op=28)**
-```
-Request:  [u64 link_id][u64 new_category_id]
-```
-
-### Moderation Operations
-
-Link status is a `u8`: `0=pending`, `1=approved`, `2=rejected`. `create_link` stores `approved`.
-
-**Create submission (op=25)**
-```
-Request:  [u64 category_id][u16 url_len][url][u16 title_len][title][u16 desc_len][desc][u64 submitter_id]
-Response: header (count=1) + [u8 status][u8 sub_status][u64 link_id]
-```
-
-**Update link status (op=26)**
-```
-Request:  [u64 link_id][u8 status]
-```
-
-**Bulk update link status (op=34)** and **bulk delete links (op=35)**
-```
-Request (op=34): [u8 status][u16 n (<= 200)][n x u64 link_id]
-Request (op=35): [u16 n (<= 200)][n x u64 link_id]
-Response: [u16 ok_count][u16 err_count][n x ([u64 link_id][u8 code])]
-
-code: 0=ok 1=not_found 2=already_in_state 3=invalid_transition
-```
-
-**Counts by status (op=36)**
-```
-Response: [u64 pending][u64 approved][u64 rejected]
-```
-
-### System Operations
-
-**Stats (op=15)**
-```
-Response: [u64 category_count][u64 link_count][u64 page_count]
-          [u64 cache_hits][u64 cache_misses][u64 wal_pending]
-```
-
-**Index health (op=18)**
-```
-Response: header + state snapshot + repair-queue surface
-  [i64 last_run_at][u8 index_count][N x (u8 name_len, name, u64 expected, u64 observed, u32 drift_bp)]
-  [u64 slug_path_repair_queue_depth]
-  [i64 slug_path_repair_worker_last_tick_ms]
-  [u64 slug_path_repair_worker_tasks_processed]
-  [u64 slug_path_repair_worker_chunks_processed]
-```
-
-**Run verifier (op=19)**: runs `verifier.runOnce` inline on the reactor thread and returns the refreshed `index_health`
-frame. A failure is logged and the previous snapshot is returned.
-
-**Rebuild index (op=20)**
-```
-Response: [u64 categories_rebuilt][u64 links_rebuilt][u64 queue_entries_drained]
-```
-
-**Snapshot (op=22)**
-```
-Response: [u64 wal_sequence][u64 duration_ms]
-```
-
-Returns `err` / `already_in_progress` if another snapshot is running.
-
-**Op latency stats (op=23)**
-```
-Response: [u8 n][n x ([u8 op][u64 p50][u64 p95][u64 p99][u64 p99_9][u64 max][u64 mean][u64 samples])]
-```
-
-Latencies are nanoseconds; ops with no samples are omitted.
-
-**Bulk import (op=24)**
-```
-Request:  count items in the create_link layout; payload <= 60 KiB, count <= 50,000
-Response: [u64 inserted][u64 duplicates][u64 errors][u64 first_id][u64 last_id][u64 elapsed_ms]
-```
-
-**Ping (op=255)**: empty request, empty response with `status=ok`.
+The server keeps `store.dat`, `wal.bin`, `checkpoint.journal`, `snapshot.meta` and `derived.snap` in its data
+directory, shuts down with a final checkpoint, and has no online backup. The [operations guide](docs/operations.md)
+covers those files, the metrics to watch, graceful shutdown, backup, and the Kubernetes deployment that runs the live
+site.
 
 ---
 
@@ -670,99 +392,62 @@ This compiles the test graph rooted at `src/main.zig`, which pulls in every modu
 The engine's own tests (page format, B+Tree, page cache, free list, WAL, connection, framing) live and run in the
 zigstore repository.
 
-### Load Testing
-
-The `bench` harness (in `bench/`) covers eight workloads with p50 / p95 / p99 / p99.9 latency percentiles, throughput,
-and RSS sampling, emitted as JSON Lines for cross-run comparison. It runs unconstrained or under cgroup-enforced
-1 CPU / 2 GB and 2 CPU / 4 GB profiles via `systemd-run` wrappers.
-
-```bash
-zig build -Dtools=true
-
-# 1. Start the server, seed a deterministic fixture
-mkdir -p /tmp/bench-data
-DMOZDB_DATA_DIR=/tmp/bench-data ./zig-out/bin/dmozdb &
-./zig-out/bin/bench seed --data-dir /tmp/bench-data --categories 1000 --links 100000
-
-# 2. Run a write hammer
-./zig-out/bin/bench create_link --workers 4 --batch 10 --ops-per-worker 20000 --output bench.jsonl
-
-# 3. Run a constrained read sweep
-./bench/run-constrained.sh 1cpu2gb -- get_link \
-  --data-dir /tmp/bench-data --workers 4 --ops-per-worker 5000 --output bench.jsonl
-
-# 4. Inspect
-jq '[.profile, .workload, .latency_ns.p50, .latency_ns.p99, .ops_per_sec] | @tsv' bench.jsonl
-```
-
-Subcommands: `seed`, `create_link`, `bulk_import`, `get_link`, `browse --kind {path|children|subtree-links}`,
-`search --target {links|categories}`, `mixed --read-pct PCT`, `cold --kind {cache|boot} --server-cmd CMD`. See
-[`bench/README.md`](bench/README.md) for the full reference, the matrix-runner example, and the JSON Lines schema.
 
 ---
 
-## Kubernetes Deployment
+## Performance
 
-The live deployment is `deployment/`, applied with kustomize.
+The repository backs a few measured numbers, and this section holds only those. They come from the benchmark client
+in [`bench/`](bench/README.md). It covers eight workloads and reports p50, p95, p99 and p99.9 latency, throughput and
+server memory (RSS) as JSON Lines, which makes runs comparable. The full matrix, with the capture environment, is in
+[`bench/baseline-2026-10-17-summary.md`](bench/baseline-2026-10-17-summary.md) and the raw records sit next to it.
 
-```bash
-kubectl apply -k deployment/overlays/main
-```
+| Workload (4 clients) | Recorded baseline | Reproduced on 2026-11-28 |
+|----------------------|-------------------|--------------------------|
+| `get_link` | 151,515 ops/s, p50 22 µs, p99 46 µs | 121,212 ops/s, p50 9 µs, p99 128 µs |
+| `browse --kind path` | 74,626 ops/s, p50 38 µs, p99 83 µs | 16,949 ops/s, p50 145 µs, p99 266 µs |
+| `search --target links` | 85,836 ops/s, p50 40 µs, p99 79 µs | 18,281 ops/s, p50 184 µs, p99 573 µs |
+| `create_link` (10 links a frame) | 4,278 links/s, p50 6,225 µs, p99 20,971 µs | 17,035 links/s, p50 1,556 µs, p99 6,357 µs |
 
-`.github/workflows/cd.yaml` does this on every push to `main`, rewriting each
-image tag to the built commit SHA first. Three workloads come out of it: the
-Zig backend (StatefulSet), the Deno/Fresh frontend (Deployment + HPA) and the
-MCP server (Deployment), behind one Traefik Ingress on
-`directory.junaid.guru`, with `/mcp` and `/.well-known/oauth-protected-resource`
-routed to the MCP service and everything else to the frontend.
+Read the two columns with their environments in mind.
 
-### Secrets, which must exist before the first apply
+- The recorded baseline is from 2026-10-17 on a Docker Desktop VM (aarch64, 4 CPUs), with the server built
+  `ReleaseFast` and a fixture of 1,000 categories and 50,000 links. The server and the client shared one container.
+- The reproduction ran on 2026-11-28 in a Linux container limited to 2 CPUs and 5 GB, with the server built
+  `ReleaseSafe` (production keeps every assertion) and the same fixture. The server and the client shared the container.
+  Most read rates are lower than the baseline, with half the CPUs and the assertions on. Two runs a few minutes apart
+  gave 78,740 and 121,212 `get_link` ops/s on this host, so treat any single run as a rough figure. Measure on your own
+  hardware before you trust any of these numbers.
+- Write rates follow the disk. A write is acknowledged only after `fdatasync`, so `create_link` is limited by the
+  latency of the disk it runs on and not by the CPU. The baseline summary puts a real insert at about 300 µs on its
+  disk. The reproduction's disk is quicker than the baseline's, which is why `create_link` is higher there.
+- Two bench "writes" are really refused duplicates, so the `mixed` rows in the baseline measure reads plus duplicate
+  checks. The summary explains this.
 
-Two Secrets are referenced by the manifests and created by nobody: not by
-kustomize, not by CD. A missing one does not fail the deploy: `kubectl apply`
-succeeds, the workflow goes green, and the pod sits in
-`CreateContainerConfigError` until someone looks. Create both in the namespace
-before the first rollout.
-
-```bash
-kubectl create namespace dmozdb
-
-# Deno KV access token, shared by the denokv StatefulSet and the frontend.
-kubectl create secret generic denokv-auth -n dmozdb \
-  --from-literal=token="$(openssl rand -hex 32)"
-
-# RS256 keypair the frontend signs MCP access tokens with, and verifies them
-# against. The MCP server never sees it: it fetches the public half from the
-# frontend's JWKS endpoint. Generate a keypair that is not the one in web/.env.
-cd web && deno run -A scripts/generate-jwt-keypair.ts
-```
-
-That script prints the two values in `.env` form. For the cluster, write each
-to a file and load it as a key: `private-key-pem` tolerates real newlines, and
-`public-key-jwk` is the JSON object:
+To reproduce, build the tools and run the same four workloads against a fresh data directory:
 
 ```bash
-kubectl create secret generic mcp-jwt-signing-key -n dmozdb \
-  --from-file=private-key-pem=./private-key-pem \
-  --from-file=public-key-jwk=./public-key-jwk
+zig build -Dtools=true -Doptimize=ReleaseSafe
+export DMOZDB_DATA_DIR=/tmp/bench-data DMOZDB_VECTOR_MODEL="$PWD/models/vector_model.bin"
+mkdir -p "$DMOZDB_DATA_DIR"
+./zig-out/bin/dmozdb &
+sleep 3
+
+./zig-out/bin/bench seed --data-dir "$DMOZDB_DATA_DIR" --categories 1000 --links 50000 --output bench.jsonl
+./zig-out/bin/bench get_link --data-dir "$DMOZDB_DATA_DIR" --workers 4 --ops-per-worker 5000 --output bench.jsonl
+./zig-out/bin/bench browse --kind path --data-dir "$DMOZDB_DATA_DIR" --workers 4 --ops-per-worker 5000 --output bench.jsonl
+./zig-out/bin/bench search --target links --data-dir "$DMOZDB_DATA_DIR" --workers 4 --ops-per-worker 5000 --output bench.jsonl
+./zig-out/bin/bench create_link --workers 4 --batch 10 --ops-per-worker 5000 --output bench.jsonl
+
+jq -r '[.workload, .latency_ns.p50, .latency_ns.p99, .ops_per_sec] | @tsv' bench.jsonl
+kill -TERM $(pidof dmozdb)
 ```
 
-Rotating the keypair invalidates every access token already issued, which is
-usually what you want and never silent: clients get a `401 invalid_token` and
-re-run their sign-in.
-
-The image-pull Secret (`ocirsecret`) is the exception: CD copies it into the
-namespace itself on every run.
-
-### What the manifests provide
-
-- **StatefulSet**: 10Gi persistent volume at `/var/lib/dmozdb`, 512Mi-2Gi RAM,
-  250m-1500m CPU
-- **Frontend**: 2-4 replicas via HPA at 70% CPU, readiness gated on backend
-  reachability
-- **MCP**: one replica deliberately; the transport is session-oriented with no
-  shared session store, so a second would strand sessions that do not land back
-  on their own pod
+Latencies are in nanoseconds. The subcommands are `seed`, `create_link`, `bulk_import`, `get_link`,
+`browse --kind {path|children|subtree-links}`, `search --target {links|categories}`, `mixed --read-pct PCT` and
+`cold --kind {cache|boot} --server-cmd CMD`. The tool runs unconstrained or under cgroup limits of 1 CPU and 2 GB or
+2 CPUs and 4 GB, through the `systemd-run` wrappers `bench/run-constrained.sh` and `bench/run-server-constrained.sh`.
+[`bench/README.md`](bench/README.md) lists every option, the matrix-runner example and the JSON Lines schema.
 
 ---
 
@@ -778,17 +463,23 @@ zig-directory/
 │   ├── changeset.zig                     Typed ChangeSet effects + encoder/decoder (WAL op 100)
 │   ├── subtree.zig                       Descendant collection and cache for browse_path / list_subtree_links
 │   ├── verifier.zig                      Background invariant verifier (warn-only)
-│   ├── header_upgrade.zig                Boot-time store.dat header rewrite, format 5 → 6 → 7
+│   ├── header_upgrade.zig                Boot-time store.dat header rewrite, format 5 → 6 → 7 → 8 → 9
 │   ├── ranking.zig                       Scored ids, bounded top-k, reciprocal rank fusion
 │   ├── vector_index.zig                  In-memory int8 link-vector matrix and nearest scan
+│   ├── ivf_index.zig                     IVF-PQ index over link vectors: cell codes in blocks, nearest scan
+│   ├── vector_model.zig                  Product-quantization model file: IVF centroids and codebooks
+│   ├── derived_snapshot.zig              derived.snap: facts index, URL bloom and vector indexes restored at boot
+│   ├── scratch.zig                       Per-thread request scratch slabs, reserved once at startup
+│   ├── tidy.zig                          TigerStyle checker, run by zig build test
 │   ├── facts/
 │   │   ├── facts_index.zig               In-memory link and category facts, kept in step by the apply path
+│   │   ├── adjacency.zig                 Link ids grouped by category, domain or entity: the facts index adjacency
 │   │   ├── url_facts.zig                 Host, registrable domain, label-boundary suffixes, ccTLD country
 │   │   ├── sites.zig                     Site identity on hosting platforms
 │   │   ├── entities.zig                  Entity record format: religions, countries, people, organisations
 │   │   ├── countries.zig, countries.tsv  ISO 3166 names and aliases
 │   ├── e2e_test.zig                      End-to-end tests against a temp data dir
-│   ├── test_support.zig                  Test-only fixtures: category/link builders, isPresent, tokenKey
+│   ├── test_support.zig                  Test-only fixtures: category/link builders, is_present, token_key
 │   ├── gen_client_ts.zig                 Driver for `zig build gen-client-ts`
 │   ├── import_main.zig                   dmoz_import: TSV importer (snapshot + WAL truncate at the end)
 │   ├── apply/
@@ -836,476 +527,9 @@ zig-directory/
 
 ---
 
-## Architecture Deep Dive
-
-### B+Tree Index Engine
-
-The B+Tree implementation (`btree/` in zigstore) is the core of the storage engine.
-
-**Page layout** (16,384 bytes per page):
-
-<p align="center">
-  <img src="diagrams/02-btree-page-layout.svg" alt="B+Tree Page Layout" />
-</p>
-
-Key properties:
-
-- **Leaf nodes** store key-value pairs directly; linked via `right_sibling` for efficient range scans
-- **Internal nodes** store keys with child page pointers for tree navigation
-- **Max tree depth**: 32 levels
-- **Keys**: variable-length byte slices, compared lexicographically
-- **Composite keys** use big-endian encoding to preserve sort order (e.g., `parent_id ++ child_id`)
-- **Page types**: leaf (0), internal (1), overflow (2), free (3)
-
-### Page Cache (Buffer Pool)
-
-The page cache (`page_cache.zig` in zigstore) keeps frequently accessed pages in memory:
-
-- **Configurable size**: default 256 MB = 16,384 pages
-- **Eviction policy**: LRU per shard with pin counting; pinned pages cannot be evicted
-- **No-steal dirty tracking**: pages fetched for mutation are marked dirty and never evicted; they reach `store.dat`
-  only through a checkpoint (journal, then in place), and a pressure valve checkpoints early once half the cache is dirty
-- **Thread-safe**: 64 shards keyed by page ID, each behind its own `std.Thread.Mutex`
-- **Atomic stats**: `hit_count` and `miss_count` use `std.atomic.Value` for lock-free reads
-
-### Write-Ahead Log
-
-The WAL (`wal.zig` in zigstore) provides crash recovery with group commit batching.
-
-**Entry format** (24-byte header + variable-length data):
-
-<p align="center">
-  <img src="diagrams/03-wal-entry-format.svg" alt="WAL Entry Format" />
-</p>
-
-```
-[u64 sequence][u8 op_code][3B pad][u32 data_len][u32 crc32(data)][4B pad][data...]
-```
-
-dmozdb writes a single WAL op code, `100`, whose data is an encoded `ChangeSet`. The ChangeSet carries its own effect
-tags (`link_inserted`, `link_deleted`, `link_text_updated`, `link_recategorized`, `category_inserted`,
-`category_deleted`, `category_text_updated`, `category_renamed`, `category_moved`, `slug_path_repair_chunk`,
-`slug_path_repair_complete`), so replay and live apply share one decoder and one `apply()`.
-
-**Group commit**: the flusher thread wakes when the batch reaches `DMOZDB_WAL_BATCH_SIZE` (default 256) or after a
-fixed 2 ms, writes every pending entry and issues one `fdatasync`. A request waits once, after all its writes, for the
-highest sequence it wrote to pass that fsync, so the items of a batch frame and the writes of concurrent connections
-share fsyncs. If an fsync fails, `fsync_failed` is set and stays set: every later commit is refused
-with `error.WalFlushFailed` before it is appended, and `Directory.commit` aborts the process on it, because the entry
-whose fsync failed is already applied in memory and only a restart makes what is served match what is durable.
-
-**Recovery scan**: on open the WAL is scanned for the last valid record. A torn tail of at most one group-commit batch
-is trimmed; valid records more than one batch beyond a corrupt record mean the damage is not a torn write, so the store
-refuses to start (`error.WalCorrupt`) instead of silently discarding them.
-
-### Slug Path Resolution
-
-Category slugs form a hierarchical namespace (e.g., `computers/programming/zig`). Path lookups are served by two B+Trees populated atomically on every category mutation:
-
-- **`categories_by_slug_path`** maps the full hierarchical path → cat_id. Used by `browse_path` and `resolveSlugPath`. Maintained inline by every category create/delete/rename/move.
-- **`categories_by_slug_only`** maps a leaf slug → the shallowest cat_id holding that slug. Used as a single-segment fallback for short URLs.
-
-A `resolveSlugPath` lookup is one B+Tree search in steady state. During the post-rename/move repair window (when `slug_path_repair_queue.entry_count > 0`), the resolver also walks the resolved cat's parent chain to confirm the canonical path matches the queried path; see [Slug-Path Repair Queue](#slug-path-repair-queue).
-
-### Slug-Path Repair Queue
-
-A **rename or move of a non-leaf category** invalidates every descendant's stored full slug path. For small subtrees the rewrite is cheap and happens atomically inside the rename's ChangeSet apply. For large subtrees (e.g. `Top/Regional` with 10⁵ descendants) the in-line rewrite would hold the apply mutex for seconds; the database instead defers the cleanup to a dedicated background worker.
-
-**Threshold.** `DMOZDB_RENAME_INLINE_THRESHOLD` (default 5000) selects between the two paths. The compute step walks descendants depth-first, capped at `threshold + 1`, to detect breach without scanning the entire subtree.
-
-**Below threshold (atomic).** The rename/move ChangeSet carries a list of `(old_path, new_path, cat_id)` swaps. `applyCategoryRenamed` / `applyCategoryMoved` delete-then-insert each pair on `categories_by_slug_path` in the same `db.commit()` as the primary record update. No queue write.
-
-**Above threshold (queued).** The ChangeSet carries an `EnqueueOnApply` payload with a fresh `repair_seq`. Apply writes a `RepairTask` record (2,080 bytes: `cat_id`, op, timestamp, old slug prefix) to `slug_path_repair_queue` keyed by big-endian seq. The renamed cat itself is updated atomically; its descendants stay stale until the worker drains them.
-
-**Repair worker (`src/repair/repair_worker.zig`).** Started by `Directory.start_background_threads()`. Each tick (`DMOZDB_REPAIR_WORKER_INTERVAL_MS`, default 1 s) it pops the min-key task, walks the cat's descendants via `cat_by_parent`, and emits chunked `slug_path_repair_chunk` ChangeSets (`DMOZDB_REPAIR_WORKER_CHUNK_SIZE` descendants per chunk, default 10000) until the walk completes. Each chunk is its own `db.commit()`, so progress is WAL-durable. After the final chunk, a `slug_path_repair_complete` removes the queue entry. Crash mid-walk is idempotent: the queue entry survives until the final commit, and chunk emission checks the old path still exists before scheduling a swap.
-
-**Read-side validation.** `resolveSlugPath` short-circuits when `slug_path_repair_queue.entry_count == 0`, so there is no extra cost in steady state. When the queue is non-empty, every resolve walks the resolved cat's parent chain and confirms its current canonical path matches the query; mismatch returns `not_found`. Stale paths are hidden from clients during the window, never returning a wrong cat_id.
-
-**Operator visibility.** Op 18 `index_health` response includes the queue depth, worker last-tick timestamp, total tasks processed, and total chunks processed. The worker logs at `info` per task and at `warn` when queue depth crosses 100 / 1 000 / 10 000.
-
-### Connection State Machine
-
-Each of the 4,096 connection slots (`connection.zig` in zigstore) progresses through phases:
-
-<p align="center">
-  <img src="diagrams/04-connection-state-machine.svg" alt="Connection State Machine" />
-</p>
-
-> Diagram source: [`diagrams/04-connection-state-machine.mmd`](diagrams/04-connection-state-machine.mmd)
-
-- **reading_request**: edge-triggered `EPOLLIN` drains all available data into the 64 KiB request buffer
-- **writing_response**: response is flushed to the socket; on completion, transitions back to `reading_request` (persistent connections keep their buffer)
-- **closing**: socket is removed from epoll and closed; the slot is reset to `empty`
-
-Binary connections are persistent: after writing a response, the connection loops back to reading without releasing its buffer or re-arming epoll.
-
-### Event Loop
-
-The epoll event loop uses a two-pass design inspired by Redis:
-
-<p align="center">
-  <img src="diagrams/06-event-loop.svg" alt="Two-Pass Event Loop" />
-</p>
-
-> Diagram source: [`diagrams/06-event-loop.mmd`](diagrams/06-event-loop.mmd)
-
-**Pass 1 (read)**: Process all readable events: accept connections, read data, parse and execute binary protocol frames inline. Connections with pending responses are queued but not written yet.
-
-**Pass 2 (write)**: Flush all pending responses in one batch. Most writes complete inline (TCP send buffer is rarely full for small response frames). If `write()` returns `WouldBlock`, the connection is armed for `EPOLLOUT` to retry later.
-
-This eliminates the per-request `epoll_ctl MOD` syscall overhead that occurs when alternating between read and write arming on each request.
-
-### Link Insert Path
-
-Creating a link is one synchronous call on the reactor thread that ends with a durable WAL entry.
-
-<p align="center">
-  <img src="diagrams/07-link-insert-path.svg" alt="Link Insert Path" />
-</p>
-
-> Diagram source: [`diagrams/07-link-insert-path.mmd`](diagrams/07-link-insert-path.mmd)
-
-The steps in detail:
-
-**1. Validate.** Field lengths are checked against the limits in `operations_shared.zig` (URL 64, title 128, description 256 bytes; `FieldTooLong` otherwise), then the target category must exist. `getCategory` checks the memtable first, then falls through to the `categories_by_id` B+Tree. A missing category returns `CategoryNotFound` without side effects.
-
-**2. Duplicate URL check.** Three tiers, cheapest first. The bloom filter (lock-free atomic bit reads) rejects most unique URLs immediately. On a possible hit, the `link_by_url_hash` memtable is consulted, then the B+Tree. A hash match is confirmed by comparing the stored link's URL bytes, so only a true byte-level match returns `DuplicateUrl`.
-
-**3. Allocate link ID.** `next_link_id.fetchAdd(1)`. This happens after the duplicate check, so a rejected duplicate does not burn an ID.
-
-**4. Compute the ChangeSet.** `computeLinkInsertChangeSet` produces a `link_inserted` effect carrying the `Link` record, its tokens (title, URL, description through `inverted_index.TokenIterator`: lowercase ASCII alphanumeric runs of length 2–64) and the ancestor count updates.
-
-**5. Commit.** `db.commit(cs)` appends the encoded ChangeSet to the WAL, then applies it under the apply mutex:
-`link_by_category`, `link_by_url_hash`, `link_by_submitter` (when `submitter_id != 0`) and `links_by_id` receive memtable puts; the token rows `(token ‖ link_id_be) → ""` go straight into `links_index_tree`; every ancestor's `link_count_subtree` (and the direct category's `link_count`) is rewritten through the `categories_by_id` memtable; the URL is added to the bloom filter; the status counter is bumped; the subtree cache is invalidated.
-
-**6. Wait for durability.** The handler writes `[ok][none][link_id]` into the response, and `Directory.dispatch` holds the response until the WAL flusher has `fdatasync`ed the request's last entry. A frame of many items therefore pays a few fsyncs, not one per item, and write latency is bounded below by one group-commit cycle.
-
-### Search
-
-Full-text search is served by two on-disk B+Trees: `categories_index_tree` and `links_index_tree`. Each tree's keys are `(token bytes ‖ document_id_be)` with empty values; a range scan over `(token ‖ 0) .. (token ‖ MAX)` returns every document id whose text contains the token. There is no in-memory inverted index.
-
-<p align="center">
-  <img src="diagrams/08-search-path.svg" alt="Search Path" />
-</p>
-
-> Diagram source: [`diagrams/08-search-path.mmd`](diagrams/08-search-path.mmd)
-
-**Tokenisation.** The query string runs through the same `inverted_index.TokenIterator` used at write time: lowercase ASCII alphanumeric runs of length [2, 64]. Identical tokenisation at write and search guarantees byte-identical matches.
-
-**Per-token posting list.** For each query token the search emits one B+Tree range scan, accumulating document IDs. Posting lists are sorted by ID, so results stream in order without an explicit sort.
-
-**Modes.** The mode byte picks one of three strategies:
-
-- `all_terms` (the default, used by the admin screens) intersects the posting lists, so only documents containing every token match, returned in ID order.
-- `ranked` scores every document containing any token by the sum of its tokens' IDF, `ln(1 + (N − df + 0.5)/(df + 0.5))`, highest first, ties on ascending ID. A token whose posting list passes 20,000 entries contributes nothing, which bounds the cost of tokens like `www`.
-- `hybrid` runs `ranked` for the top 200 keyword candidates and a flat int8 dot-product scan over the in-memory vector matrix for the top 200 nearest links, then fuses the two lists with reciprocal rank fusion (k = 60). If the query's model differs from the stored one, or the matrix is still loading after boot, it answers from keywords alone and clears `vector_used`.
-
-**Vectors.** The web tier embeds text with `bge-small-en-v1.5` (int8 ONNX, CLS pooling, 384 dimensions) and writes link vectors with `put_link_vectors`; dmozdb never runs a model. A title or description edit, or a delete, removes the link's vector in the same apply, and a write carrying a stale text fingerprint is refused, so a stored vector always matches the link's current text. The matrix is rebuilt from `link_vectors` by a background thread after the port opens.
-
-**Graph facts.** `query_links` answers filter, count and group questions that ranking cannot ("how many sites
-are hosted on tripod.com"). An in-memory facts index, loaded after the port opens and kept in step by the
-apply path, holds per link its host, registrable domain, site and ccTLD country, and per category its parent,
-the country it is named for, its top-level branch and its place in a depth-first order, so a subtree test is
-two integer comparisons. A site is the unit a person publishes: a subdomain on hosting platforms such as
-tripod or blogspot, the leading path segments on path platforms (`members.tripod.com/{name}`,
-`angelfire.com/{area}/{name}`, `groups.yahoo.com/group/{name}`), a `~user` path on any host, and otherwise
-the registrable domain. A category named for a country ties its subtree to it, outermost name first
-(`United_States > Georgia` is the US), except under alphabet buckets and breed or food categories.
-
-**Entity facts.** The web tier reads each link's title and description for the places, religions, people and
-organisations it names (ONNX `bert-base-NER` spans, a gazetteer built from GeoNames, a religion lexicon) and writes
-them with `put_link_entities`; as with vectors, dmozdb never runs a model, and a title or description change or a
-delete drops the record. A named place is a third country edge beside the ccTLD and the category, so `query_links`
-can ask for links tied to Pakistan by any edge, about Islam, or naming Jamia Farooqia.
-
-**Asking in words.** The search page reads a query for the things `query_links` can filter on and targets them,
-so "show me links in art category under Pakistan for islam" lists links in Arts, tied to Pakistan and about Islam.
-It finds domains by shape, countries by name, alias or nationality, and religions by name, using the extractor's
-own lexicons. `match_names` finds categories and people or organisations. A category is targeted when the
-sentence points at it ("in jazz", "the arts category") or its name has a word that is not in the corpus's
-common lowercase words ("pink floyd"); a person or organisation needs two or more words, one of them uncommon,
-so "web design" stays words. Each target shows as a chip that removes it, the words left over must appear in a
-link, and when nothing matches the page offers the count with each target dropped. `site:`, `country:`, `in:`,
-`religion:` and `name:` state a target outright and are what the chips link to.
-
-**Materialisation.** The first `limit` (at most 50) IDs are hydrated via `get_link` / `get_category` (memtable → primary B+Tree). Documents that no longer exist (deleted between indexing and search) are silently skipped. Each link row carries a `match_field` byte telling the client whether the title, URL or description matched, or that only the vector half found it.
-
-**What the search does not do.** No term frequency or document length (IDF over binary postings measured within noise of BM25 on this corpus), no field boosting, no phrase queries or fuzzy matching. Non-ASCII characters are not lowercased; a search for "blüm" will not match a document containing "Blüm" because the tokeniser only handles ASCII case folding.
-
----
-
-## Operational Guide
-
-### Data Files
-
-The server creates these files in `DMOZDB_DATA_DIR`:
-
-| File            | Purpose                                                                 |
-|-----------------|-------------------------------------------------------------------------|
-| `store.dat`     | Main data file (16 KB pages: header + B+Tree nodes)                     |
-| `wal.bin`       | Write-ahead log (append-only; truncated at every checkpoint)            |
-| `checkpoint.journal` | Page images of the checkpoint in progress; empty between checkpoints, redone on open if a crash left it complete |
-| `snapshot.meta` | 64-byte superblock written by op 22 / `dmoz_import`; records the WAL sequence at that point |
-
-### Monitoring
-
-Use the `stats` binary protocol op (op=15) to query runtime metrics, and `op_latency_stats` (op=23) for per-op percentiles:
-
-| Metric                          | What to watch                                                            |
-|---------------------------------|--------------------------------------------------------------------------|
-| `cache_hits` / `cache_misses`   | Compute hit rate; below 80% means cache is too small                     |
-| `page_count`                    | Total pages allocated; growth rate reflects write volume                 |
-| `wal_pending`                   | Entries waiting to flush; consistently high means writes outpace flushes |
-| `category_count` / `link_count` | Total stored objects                                                     |
-
-### Graceful Shutdown
-
-The server handles `SIGINT` and `SIGTERM` via a self-pipe that wakes the epoll loop:
-
-1. Signal handler sets an atomic flag and writes a byte to the self-pipe
-2. Epoll loop wakes, detects the shutdown fd, and exits
-3. Background workers (checkpointer, memtable flusher, verifier, repair worker) are stopped
-4. A final checkpoint runs: memtables drain into the B+Trees, every dirty page and the header go through
-   `checkpoint.journal` into `store.dat`, and `wal.bin` is truncated only after the header is durable; if any step
-   fails the WAL is kept for replay on the next boot
-5. All connections are closed
-
-### Backup
-
-There is no online backup. Either stop the server, or take a snapshot (op 22, a full checkpoint) and copy `store.dat`
-immediately after it returns, before the next checkpoint starts; `snapshot.meta` on its own is not a backup.
-
-```bash
-# Stop the server for a consistent backup
-kill -TERM $(pidof dmozdb)
-cp /var/lib/dmozdb/store.dat /var/lib/dmozdb/wal.bin /backup/dmozdb-$(date +%Y%m%d)/
-```
-
----
-
-## Contributing
-
-### Build and Test Workflow
-
-```bash
-zig fmt src/ bench/
-zig build test
-zig build -Dtools=true
-```
-
-### Design Decisions
-
-The following decisions shape the architecture and implementation of dmozdb. Each was made deliberately to favour
-simplicity, predictability and raw throughput over generality.
-
-#### One dependency: zigstore
-
-The engine is the public library zigstore, pinned by URL and hash in `build.zig.zon`. Everything else compiles against
-the Zig 0.16 standard library. There is no vendored C code and no build system beyond `build.zig`. Upgrading the engine
-is a one-line change to the pinned tag; schema and operations stay here.
-
-#### Binary protocol only
-
-dmozdb exposes a single binary TCP protocol. There is no HTTP layer, no JSON serialisation and no REST surface. Every
-request is an 8-byte header followed by a typed payload; every response is a 10-byte header followed by a typed payload.
-This eliminates the parsing overhead of text protocols, avoids allocation for header maps and enables pipelining
-without framing ambiguity. The web frontend (Deno Fresh) translates between the user-facing HTTP surface and the binary
-protocol over a persistent TCP connection, using the generated client in `web/lib/dmoz-protocol.gen.ts`.
-
-Adding a new operation requires one enum variant, one switch arm and one handler function. The `BatchCreateHandler`
-uses Zig comptime to generate the field parsing loop from a declarative spec, ensuring that the wire format and the
-struct definition cannot drift apart.
-
-#### Extern structs for on disk types
-
-`Category` (1,288 bytes), `Link` (1,888 bytes) and `RepairTask` (2,080 bytes) are declared as `extern struct` with
-explicit padding fields. This guarantees a deterministic, platform-independent memory layout that can be written to
-disk and read back without serialisation. The page cache stores these structs as raw byte slices and the binary
-protocol copies them directly into response buffers. Comptime assertions enforce the expected sizes at build time; if a
-field is added or reordered, the build fails immediately.
-
-The tradeoff is wasted space. A `FixedString(256)` always occupies 258 bytes (256 data + 2 byte length) regardless of
-the actual string length. This is acceptable for a directory application where record counts are in the tens of
-thousands rather than billions, and the benefit of zero-copy reads and writes dominates the cost of padding.
-
-#### Big endian composite keys
-
-B+Tree keys are compared lexicographically as byte slices. For composite keys such as `(parent_id, child_id)`, we encode
-each component in big endian so that the natural byte ordering matches the logical sort order. A range scan for "all
-children of parent 5" becomes a prefix scan on `\x00\x00\x00\x00\x00\x00\x00\x05` without any custom comparator. This
-simplifies the B+Tree implementation considerably because it can treat all keys as opaque `[]const u8` slices.
-
-#### WAL before mutation, ack after fsync
-
-Every write appends its ChangeSet to the WAL before touching a memtable or B+Tree. On crash recovery the whole log is
-replayed from sequence 0 through the same `apply()` that served the live request, so recovery is pure replay with no
-business logic of its own.
-
-Group commit amortises `fdatasync` across up to `DMOZDB_WAL_BATCH_SIZE` entries, and a request waits once for its
-last entry rather than once per entry, outside `write_mutex`, so other writers keep appending while it waits. A client that receives `ok` has a durable write. The cost is write latency bounded
-below by one flusher cycle; the benefit is that there is no window in which an acknowledged write can be lost.
-
-#### Inline processing on the epoll thread
-
-Binary protocol operations execute directly on the epoll reactor thread. There is no thread pool, no task queue and no
-completion callback. This eliminates context switch overhead, simplifies memory ownership (no cross-thread buffer
-handoff) and avoids the head-of-line blocking that occurs when a slow operation holds a thread pool slot.
-
-The tradeoff is that a slow operation (a large range scan that misses the cache, or a write waiting on fsync) blocks
-that reactor for its duration. Reads are mitigated by the page cache: hot data stays in memory and the working set of a
-directory application is small relative to available RAM. Writes pay the group-commit latency by design.
-
-#### Edge triggered epoll with two pass event loop
-
-The event loop follows the Redis model. Each iteration calls `epoll_wait` once, then processes all returned events in
-two passes. The first pass handles all readable events: accepting connections, reading request data and executing
-protocol frames. The second pass flushes all pending response buffers. This batches write syscalls and eliminates the
-need to toggle between `EPOLLIN` and `EPOLLOUT` on every request, saving one `epoll_ctl` syscall per round trip.
-
-Edge triggered mode (`EPOLLET`) requires the application to drain all available data on each wake. The read loop
-continues calling `read()` until it returns `EAGAIN`. This is more complex than level triggered mode but avoids
-redundant wake ups when data arrives faster than the application can process it.
-
-#### Sharded memtable with background drain
-
-Writes to the six primary and secondary-key indexes go first to a 32-shard in-memory memtable, then drain to the
-underlying B+Tree in the background every 5 ms. Sharding reduces lock contention because each shard has its own mutex.
-
-The memtable acts as a write buffer but not as a read cache. Point lookups check the memtable first and fall through to
-the B+Tree on miss, so reads always see the latest write. Handlers that need a complete range (`browse_path`,
-`list_subtree_links`, `stats`) drain the relevant memtable on entry.
-
-#### Lock free bloom filter for duplicate detection
-
-URL deduplication uses a bloom filter with seven probes derived from two Wyhash seeds. The filter provides lock-free
-reads via atomic bit operations, so duplicate checks on the hot path do not contend with writers. False positives are
-acceptable because a bloom filter hit triggers a secondary lookup in the `link_by_url_hash` index, which is
-authoritative. The filter is sized at startup to the larger of 1,000,000 and twice the stored link count and seeded from
-`links_by_id` by a background thread after the port opens; until `url_bloom_ready` is set every duplicate check goes to
-the index.
-
-#### Hybrid in-line / queued slug-path repair
-
-Renaming or moving a non-leaf category invalidates every descendant's slug-path entry. The naive append-only rebuild
-leaves stale entries as orphans; a strict in-line rewrite holds the apply mutex for seconds on a 10⁵-descendant subtree.
-
-dmozdb takes a hybrid path: subtrees up to `DMOZDB_RENAME_INLINE_THRESHOLD` (default 5000) descendants get rewritten
-atomically inside the rename's ChangeSet; larger subtrees enqueue a single durable repair task into the
-`slug_path_repair_queue` B+Tree, drained by a dedicated background worker (`src/repair/repair_worker.zig`). A read-side
-validation gate hides stale entries during the repair window. The whole pipeline is WAL-covered, so a crash mid-walk
-is idempotent on recover.
-
-The trade-off is a brief window where descendants of a giant-subtree rename appear `not_found` via their old slug
-paths until the worker repairs them. Choosing strict-in-the-window over best-effort means clients never resolve stale
-paths to live IDs, at the cost of an O(depth) extra read per resolve while the queue is non-empty.
-
-#### Single reactor per thread, no shared mutable state between reactors
-
-Each reactor thread owns its own epoll instance, connection table and buffer pool. The kernel distributes incoming
-connections across reactors via `SO_REUSEPORT`. Reactors share the database (the page cache, memtables and B+Trees are
-internally synchronised, and commits serialise on the apply mutex) but never share connection state. This eliminates
-inter-reactor locking and makes the connection handling path entirely single threaded within each reactor.
-
-#### Comptime assertions as a safety net
-
-Struct sizes, page layout offsets and protocol constants are validated at compile time using `comptime` blocks. If a
-developer adds a field to `Category` without updating the padding, the build fails with a clear error message. This
-catches a class of subtle bugs (layout drift, alignment violations, protocol version mismatch) that would otherwise
-surface as silent data corruption at runtime.
-
-#### Page size and cache configuration
-
-Pages are 16 KB (`page.PAGE_SIZE` in zigstore). The default page cache is 256 MB, which holds 16,384 pages. For a
-directory with 100,000 links, the entire dataset fits comfortably in cache. The cache uses LRU eviction with pin
-counting; pages held by an active B+Tree traversal cannot be evicted.
-
-The page cache is split into 64 shards by page ID to reduce lock contention. Each shard has its own LRU list. Dirty
-pages are written back on snapshot, on shutdown, or when a shard evicts a dirty page to make room for a new one.
-
-#### Error handling philosophy
-
-Errors on the request path (malformed protocol frames, missing records, constraint violations) are reported to the
-client as `status` / `sub_status` in the response header. The server continues processing subsequent frames on the same
-connection.
-
-Errors on the durability path are not retried. A failed WAL `fdatasync` sets a sticky `fsync_failed` flag and every
-later commit fails with `error.WalFlushFailed` (reported as `status=err`) until the process restarts. A failed memtable
-drain panics, because continuing would leave the B+Trees behind the WAL with no way to tell.
-
-#### Protected mode
-
-The binary protocol has no application-level authentication, no TLS and no challenge-response handshake. This is a
-deliberate design choice. Adding a pre-shared key without TLS provides no meaningful security because the key travels in
-plaintext and can be captured by a passive observer on the network path.
-
-The security model follows the same approach as Redis (since 3.2) and TigerBeetle: network isolation is the primary
-control, enforced at the application layer as a safety net. The server binds to `127.0.0.1` by default. If the operator
-sets `DMOZDB_BIND=0.0.0.0` without configuring `DMOZDB_TRUSTED`, the server enters protected mode. In protected mode it
-accepts connections on the wildcard address but rejects any connection from a non-loopback IP at accept time, before
-allocating a buffer or processing any frames. The check uses `getpeername` on the accepted socket and compares the
-source IPv4 address against the configured trusted addresses and CIDR ranges. Loopback addresses (`127.0.0.0/8`) are
-always permitted.
-
-This provides three levels of defence:
-
-1. **Default bind** (loopback only). The listen socket is never reachable from the network. This is the correct
-   configuration when the client runs on the same host or pod.
-2. **Explicit trusted IPs and CIDRs**. The operator sets `DMOZDB_TRUSTED=10.0.0.5,10.244.0.0/16` to allow specific
-   addresses or ranges (the Kubernetes manifests pass the pod and node CIDRs). All other non-loopback sources are
-   rejected at accept time with a log warning.
-3. **Protected mode fallback**. If the operator binds to `0.0.0.0` but forgets to configure trusted IPs, the server logs
-   a warning at startup and rejects non-loopback connections. This prevents accidental exposure, which is the failure
-   mode that led to the Redis and MongoDB incidents of 2016 and 2017 respectively.
-
-The tradeoff is that this does not protect against a compromised host on the trusted network. For deployments where the
-network path crosses the public internet, the operator should add a WireGuard tunnel or equivalent encrypted overlay and
-restrict `DMOZDB_TRUSTED` to the tunnel peer address.
-
-#### What dmozdb is not
-
-dmozdb is not a general-purpose database. It has no query language, no multi-record transactions and no secondary index
-creation at runtime. zigstore ships a replication module, but dmozdb does not wire it: there is one writer process. It is
-purpose-built for the DMOZ directory use case: a modest number of hierarchically organised categories and links,
-read-heavy workloads with occasional writes.
-
-### Adding a New Binary Op
-
-1. Add the op code to the `Op` enum in `src/binary_protocol.zig`
-2. Add a case to the `dispatch` switch and write the handler (reuse `handleGet` / `handleDelete` / `handleBitmaskUpdate`
-   / `writeRowList` where they fit)
-3. Implement the business logic in `src/operations/`; a mutation gets a `compute*ChangeSet` function and, if it needs a
-   new effect, a `changeset.zig` variant plus its `apply/` handler
-4. Add tests next to the handler and, for a workflow, in `src/e2e_test.zig`
-5. Run `zig build gen-client-ts` and commit the regenerated `web/lib/dmoz-protocol.gen.ts` in the same commit
-
-To extend an existing op without breaking older callers, append optional trailing bytes (the status filter and
-`after_id` on the list ops do this) rather than forking a new op number.
-
-### Adding a New Index
-
-1. Add one entry to the `.indexes` tuple of the `zigstore.schema(...)` literal in `src/directory.zig`; add its name to
-   `.memtable_indexes` if writes should be buffered
-2. Add the `tree()` (and `memtable()`) accessor on `Directory`
-3. Write to it from the relevant `apply/` handler and read it from `src/operations/`
-4. The page-0 header gains a root/count slot for the new index automatically; the engine validates `magic` and
-   `format_version` on open, so bump `format_version` when an existing `store.dat` must be rejected rather than opened
-
-### Code Style
-
-All Zig follows [TigerStyle](https://tigerstyle.dev); the repo's rule file is `.claude/rules/zig.md`
-and `src/tidy.zig` enforces the mechanical part inside `zig build test` (also runnable alone with
-`zig test src/tidy.zig`).
-
-- `snake_case` functions, variables, files and constants with the qualifier last (`subtree_offset_max`);
-  `PascalCase` types; a type-returning function ends in `Type`
-- Assert arguments, return values and invariants (`const assert = std.debug.assert;`), two per
-  function on average; bytes from the network, the WAL or the disk are validated with errors, never asserted
-- Every loop has a declared bound, no recursion, no `while (true)`; `u32`/`u64` for domain values,
-  `usize` only at the slice boundary
-- Functions at most 70 lines, lines at most 100 columns, `zig fmt` clean
-- Memory is allocated at startup; the request path works in preallocated buffers
-- Comments say why (and tests say how); they are sentences with a capital letter and a full stop
-- Use `std.log.scoped(.module_name)` for logging (not `std.debug.print`)
-- Use `comptime` assertions to validate struct sizes and alignment
-- Prefix padding/reserved fields with `_`
-- Use comptime generics to eliminate handler duplication
+## Licence
+
+The code is under the [MIT licence](LICENSE). [NOTICE.md](NOTICE.md) lists the third-party data and models the project
+uses and what each source says about its licence. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to send a change,
+[SECURITY.md](SECURITY.md) how to report a vulnerability and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) how people are
+expected to treat each other.
