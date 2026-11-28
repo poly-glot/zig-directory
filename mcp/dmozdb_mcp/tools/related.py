@@ -17,12 +17,12 @@ type RelatedKind = Literal["site", "category", "entity"]
 
 def _site_line(neighbour: JSON) -> str:
     shared = formatting.counted(neighbour["shared"], "category", "categories")
-    return f"{neighbour['name']} — filed together in {shared}"
+    return f"{formatting.single_line(neighbour['name'])} — filed together in {shared}"
 
 
 def _entity_line(neighbour: JSON) -> str:
     shared = formatting.counted(neighbour["shared"], "link", "links")
-    return f"{neighbour['name']} — named together on {shared}"
+    return f"{formatting.single_line(neighbour['name'])} — named together on {shared}"
 
 
 def _category_line(neighbour: JSON) -> str:

@@ -3,8 +3,10 @@ import { contentWords } from "./targets.ts";
 
 const REGEX_SPECIALS = /[.*+?^${}()|[\]\\]/g;
 
+export const HIGHLIGHT_TOKENS_MAX = 32;
+
 export function tokensFor(q: string): string[] {
-  return contentWords(q);
+  return contentWords(q).slice(0, HIGHLIGHT_TOKENS_MAX);
 }
 
 // Wraps each whole-word occurrence of any token in <mark>; keeps the

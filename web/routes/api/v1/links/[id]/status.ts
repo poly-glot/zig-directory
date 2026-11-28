@@ -1,13 +1,9 @@
 import { define } from "../../../../../utils.ts";
 import { getClient } from "../../../../../lib/dmoz-client.ts";
 import { verifyBearerToken } from "../../../../../lib/oauth.ts";
-import { errorResponse, linkJson } from "../../_lib/api.ts";
-
-function bearerToken(req: Request): string | null {
-  const header = req.headers.get("authorization") ?? "";
-  const [scheme, token] = header.split(" ");
-  return scheme?.toLowerCase() === "bearer" && token ? token : null;
-}
+import { bearerToken } from "../../../../../lib/session.ts";
+import { parseEntityId } from "../../../../../lib/utils.ts";
+import { badRequest, errorResponse, linkJson } from "../../_lib/api.ts";
 
 export const handler = define.handlers({
   async POST(ctx) {
@@ -20,10 +16,8 @@ export const handler = define.handlers({
       return Response.json({ error: "forbidden" }, { status: 403 });
     }
 
-    const id = parseInt(ctx.params.id, 10);
-    if (!Number.isFinite(id) || id <= 0) {
-      return Response.json({ error: "invalid link id" }, { status: 400 });
-    }
+    const id = parseEntityId(ctx.params.id);
+    if (id === undefined) return badRequest("invalid link id");
 
     let body: { status?: unknown };
     try {

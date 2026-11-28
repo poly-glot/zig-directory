@@ -2,19 +2,21 @@ import { page } from "fresh";
 import { define } from "../../../utils.ts";
 import {
   createAuthorizationCode,
+  MCP_SCOPE,
   type OAuthClient,
   redirectUriMatches,
   resolveClient,
 } from "../../../lib/oauth.ts";
+import { clientAddress, consumeAttempt } from "../../../lib/rate-limit.ts";
 import { oauthError } from "./_lib/errors.ts";
 
 interface Data {
   clientName: string;
   clientId: string;
   redirectUri: string;
+  redirectHost: string;
   codeChallenge: string;
   resource: string;
-  scope: string;
   state: string;
 }
 
@@ -39,9 +41,17 @@ function redirectWithError(
 async function resolveClientAndRedirect(
   clientId: string,
   redirectUri: string,
+  address: string,
 ): Promise<
   { ok: true; client: OAuthClient } | { ok: false; response: Response }
 > {
+  if (!(await consumeAttempt("authorize", address))) {
+    return {
+      ok: false,
+      response: oauthError("temporarily_unavailable", "Too many requests", 429),
+    };
+  }
+
   const client = clientId ? await resolveClient(clientId) : null;
   if (!client) {
     return {
@@ -67,7 +77,11 @@ export const handler = define.handlers<Data>({
     const clientId = params.get("client_id") ?? "";
     const redirectUri = params.get("redirect_uri") ?? "";
 
-    const resolved = await resolveClientAndRedirect(clientId, redirectUri);
+    const resolved = await resolveClientAndRedirect(
+      clientId,
+      redirectUri,
+      clientAddress(ctx.req, ctx.info),
+    );
     if (!resolved.ok) return resolved.response;
     const { client } = resolved;
 
@@ -76,16 +90,18 @@ export const handler = define.handlers<Data>({
     const codeChallenge = params.get("code_challenge") ?? "";
     const codeChallengeMethod = params.get("code_challenge_method");
     const resource = params.get("resource") ?? "";
-    const scope = params.get("scope") ?? "mcp";
 
     if (responseType !== "code") {
-      return redirectWithError(redirectUri, state, "unsupported_response_type");
+      return oauthError(
+        "unsupported_response_type",
+        "response_type must be code",
+      );
     }
     if (codeChallengeMethod !== "S256" || !codeChallenge) {
-      return redirectWithError(redirectUri, state, "invalid_request");
+      return oauthError("invalid_request", "PKCE with S256 is required");
     }
     if (resource !== expectedResource()) {
-      return redirectWithError(redirectUri, state, "invalid_target");
+      return oauthError("invalid_target", "Unknown resource");
     }
 
     if (!ctx.state.user) {
@@ -103,9 +119,9 @@ export const handler = define.handlers<Data>({
       clientName: client.clientName,
       clientId,
       redirectUri,
+      redirectHost: new URL(redirectUri).host || redirectUri,
       codeChallenge,
       resource,
-      scope,
       state,
     });
   },
@@ -116,11 +132,14 @@ export const handler = define.handlers<Data>({
     const redirectUri = form.get("redirect_uri")?.toString() ?? "";
     const codeChallenge = form.get("code_challenge")?.toString() ?? "";
     const resource = form.get("resource")?.toString() ?? "";
-    const scope = form.get("scope")?.toString() ?? "mcp";
     const state = form.get("state")?.toString() ?? "";
     const action = form.get("action")?.toString();
 
-    const resolved = await resolveClientAndRedirect(clientId, redirectUri);
+    const resolved = await resolveClientAndRedirect(
+      clientId,
+      redirectUri,
+      clientAddress(ctx.req, ctx.info),
+    );
     if (!resolved.ok) return resolved.response;
 
     if (!ctx.state.user) {
@@ -140,7 +159,7 @@ export const handler = define.handlers<Data>({
       redirectUri,
       codeChallenge,
       resource,
-      scope,
+      scope: MCP_SCOPE,
     });
 
     const target = new URL(redirectUri);
@@ -158,25 +177,29 @@ export default define.page<typeof handler>(function AuthorizePage(props) {
     clientName,
     clientId,
     redirectUri,
+    redirectHost,
     codeChallenge,
     resource,
-    scope,
     state,
   } = props.data;
   return (
     <div class="container">
       <h2 class="h2">Authorize access</h2>
       <p class="lede mt-16">
-        <strong>{clientName}</strong>{" "}
+        <strong>{redirectHost}</strong>{" "}
         wants to access your dmozdb account to call its MCP tools on your
         behalf.
+      </p>
+      <p class="mt-16">
+        It calls itself “{clientName}”. Allowing sends your access to{" "}
+        <strong>{redirectHost}</strong>, so only allow it if you trust that
+        site.
       </p>
       <form method="POST" class="row between mt-24">
         <input type="hidden" name="client_id" value={clientId} />
         <input type="hidden" name="redirect_uri" value={redirectUri} />
         <input type="hidden" name="code_challenge" value={codeChallenge} />
         <input type="hidden" name="resource" value={resource} />
-        <input type="hidden" name="scope" value={scope} />
         <input type="hidden" name="state" value={state} />
         <button type="submit" name="action" value="deny" class="btn link">
           Deny

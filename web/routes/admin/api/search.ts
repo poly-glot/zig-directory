@@ -21,6 +21,7 @@ export const handler = define.handlers({
       const { categories, links } = await getClient().search(q, {
         limit,
         scope,
+        status: "any",
       });
       return Response.json({ query: q, scope, categories, links });
     } catch (e) {

@@ -367,7 +367,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=4.0.3,<5" },
     { name = "httpx2", specifier = ">=2.13,<3" },
     { name = "mcp-types", specifier = ">=2.2,<3" },
-    { name = "prefab-ui", specifier = ">=0.20.2" },
+    { name = "prefab-ui", specifier = ">=0.20.2,<1" },
     { name = "pydantic", specifier = ">=2.13,<3" },
 ]
 

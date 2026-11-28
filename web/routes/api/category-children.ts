@@ -26,7 +26,10 @@ export const handler = define.handlers({
       });
     } catch (e) {
       console.error("category-children failed:", e);
-      return Response.json({ children: [], error: String(e) }, { status: 500 });
+      return Response.json(
+        { children: [], error: "Could not load subcategories" },
+        { status: 500 },
+      );
     }
   },
 });

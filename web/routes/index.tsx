@@ -34,7 +34,10 @@ async function annotateLinks(
     try {
       const cats = await client.getCategoriesByIds(uniqueIds);
       for (const c of cats) {
-        cache.set(c.id, { name: c.name, linkCountSubtree: c.linkCountSubtree });
+        cache.set(c.id, {
+          name: c.name,
+          linkCountSubtree: c.linkCountSubtreeApproved,
+        });
       }
     } catch (e) {
       console.error("annotateLinks: getCategoriesByIds failed:", e);

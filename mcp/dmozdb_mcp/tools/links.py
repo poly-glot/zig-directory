@@ -11,7 +11,7 @@ from pydantic import Field
 from dmozdb_mcp import client, formatting, views
 from dmozdb_mcp.app import mcp_app
 from dmozdb_mcp.client import JSON
-from dmozdb_mcp.formatting import DEFAULT_LIMIT, MAX_LIMIT
+from dmozdb_mcp.formatting import DEFAULT_LIMIT, MAX_AFTER_ID, MAX_LIMIT
 
 
 def _summarize(page: JSON, category_name: str) -> tuple[str, list[str]]:
@@ -19,7 +19,8 @@ def _summarize(page: JSON, category_name: str) -> tuple[str, list[str]]:
 
     Args:
         page: The API's link page, with ``links``, ``total`` and
-            ``nextAfterId``.
+            ``nextAfterId``. ``total`` is the exact count of approved links
+            under the category, the figure browse_category shows.
         category_name: The category the page was taken from.
 
     Returns:
@@ -27,8 +28,9 @@ def _summarize(page: JSON, category_name: str) -> tuple[str, list[str]]:
         and the complete summary lines including the cursor hint.
     """
     headline = (
-        f"{len(page['links'])} of {formatting.counted(page['total'], 'link', 'links')} "
-        f"under {category_name}"
+        f"{len(page['links'])} of "
+        f"{formatting.counted(page['total'], 'approved link', 'approved links')} "
+        f"under {formatting.single_line(category_name)}"
     )
     lines = [headline] + [formatting.link_summary(link) for link in page["links"]]
     lines.append(formatting.cursor_summary(page["nextAfterId"]))
@@ -66,6 +68,7 @@ async def list_links(
         int,
         Field(
             ge=0,
+            le=MAX_AFTER_ID,
             description=(
                 "Cursor for the next page: pass the after_id this tool "
                 "reported last time. 0 starts at the first page, and a "

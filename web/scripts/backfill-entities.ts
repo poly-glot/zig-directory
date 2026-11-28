@@ -34,7 +34,11 @@ async function inBatches<T, R>(
 }
 
 do {
-  const page = await client.listAllLinks({ afterId, limit: MAX_ENTITY_WRITES });
+  const page = await client.listAllLinks({
+    afterId,
+    limit: MAX_ENTITY_WRITES,
+    status: "any",
+  });
   const writes: LinkEntityWrite[] = await inBatches(
     page.links,
     CONCURRENCY,

@@ -2,6 +2,7 @@
 
 from typing import Annotated, Literal
 
+from fastmcp.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
@@ -71,12 +72,25 @@ async def review_submission(
         token=token,
         json_body={"status": status},
     )
-    ruling = f"{link['title']} — {link['url']} is now {status}."
-    domain = formatting.domain_of(link["url"])
-    if not domain:
+    title = formatting.single_line(link["title"])
+    ruling = f"{title} — {formatting.single_line(link['url'])} is now {status}."
+    try:
+        return f"{ruling}\n{await _standing(link['url'])}"
+    except (ToolError, ValueError):
         return ruling
+
+
+async def _standing(url: str) -> str:
+    """Describe how much the link's domain holds, once the ruling has landed.
+
+    The status change is already written when this runs, so a failure here must
+    not be reported as a failed ruling: the caller drops the line instead.
+    """
+    domain = formatting.domain_of(url)
+    if not domain:
+        raise ValueError("link has no domain")
 
     standing = await client.fetch("/api/v1/links/query", domain=domain, limit=0)
     links = formatting.counted(standing["total"], "approved link", "approved links")
     categories = formatting.counted(standing["categories"], "category", "categories")
-    return f"{ruling}\n{domain} holds {links} in {categories}."
+    return f"{domain} holds {links} in {categories}."

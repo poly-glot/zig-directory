@@ -34,7 +34,7 @@ export default function CatHero({ category, ancestors, childrenCount }: Props) {
         <MetaRow label="Subcategories" value={String(childrenCount)} />
         <MetaRow
           label="Indexed links"
-          value={category.linkCountSubtree.toLocaleString()}
+          value={category.linkCountSubtreeApproved.toLocaleString()}
         />
         <MetaRow
           label="Direct links"

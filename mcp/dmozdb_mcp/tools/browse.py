@@ -55,7 +55,8 @@ async def browse_category(
     """
     browsed = await client.category_at(path)
     breadcrumb = " / ".join(
-        [ancestor["name"] for ancestor in browsed.ancestors]
+        formatting.single_line(name)
+        for name in [ancestor["name"] for ancestor in browsed.ancestors]
         + [browsed.category["name"]]
     )
 

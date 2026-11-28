@@ -3,10 +3,12 @@ kind: Deployment
 metadata:
   name: mcp
 spec:
-  # One replica. The transport is session-oriented (Mcp-Session-Id), and there
-  # is no shared session store, so a second replica would strand every session
-  # that did not land back on its own pod. Give it an HPA only alongside a
-  # shared session backend.
+  # One replica. The transport is session-oriented (Mcp-Session-Id) because
+  # the Prefab views need the capabilities a client sends in initialize, and
+  # there is no shared session store, so a second replica would strand every
+  # session that did not land back on its own pod. Sessions expire after
+  # SESSION_IDLE_TIMEOUT_S and at most SESSIONS_MAX are held (server.py),
+  # which keeps an anonymous initialize flood inside the memory limit below.
   replicas: 1
   selector:
     matchLabels:

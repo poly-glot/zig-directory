@@ -41,7 +41,7 @@ function Suggestions({ categories }: { categories: Category[] }) {
               num={pad2(i + 1)}
               href={`/category/${cat.slug || cat.id}`}
               name={cat.name}
-              count={cat.linkCountSubtree ?? cat.linkCount ?? 0}
+              count={cat.linkCountSubtreeApproved}
             />
           ))}
         </ul>

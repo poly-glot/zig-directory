@@ -12,6 +12,7 @@ interface CacheEntry {
 const CACHE_TTL = 10 * 60 * 1000;
 const FETCH_TIMEOUT = 5000;
 const MAX_DOCUMENT_BYTES = 64 * 1024;
+export const CACHE_ENTRIES_MAX = 256;
 const PUBLIC_AUTH_METHODS = new Set(["none"]);
 
 const cache = new Map<string, CacheEntry>();
@@ -87,6 +88,7 @@ function validateRedirectUris(raw: unknown): string[] | null {
     const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(entry);
     if (!scheme) return null;
     if (!entry.startsWith("urn:") && !entry.includes("//")) return null;
+    if (URL.parse(entry)?.hostname.includes("*")) return null;
     uris.push(entry);
   }
   return uris;
@@ -115,6 +117,38 @@ function toClient(
   };
 }
 
+function cachedClient(clientId: string): CimdClient | null {
+  const cached = cache.get(clientId);
+  if (!cached) return null;
+  if (cached.expiresAt > Date.now()) return cached.client;
+
+  cache.delete(clientId);
+  return null;
+}
+
+function cacheClient(client: CimdClient): void {
+  cache.delete(client.clientId);
+  if (cache.size >= CACHE_ENTRIES_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(client.clientId, { client, expiresAt: Date.now() + CACHE_TTL });
+}
+
+async function readDocumentBody(response: Response): Promise<string | null> {
+  if (!response.body) return null;
+
+  const decoder = new TextDecoder();
+  let text = "";
+  let receivedBytes = 0;
+  for await (const chunk of response.body) {
+    receivedBytes += chunk.byteLength;
+    if (receivedBytes > MAX_DOCUMENT_BYTES) return null;
+    text += decoder.decode(chunk, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
 export function isCimdClientId(clientId: string): boolean {
   return clientId.startsWith("https://");
 }
@@ -122,8 +156,8 @@ export function isCimdClientId(clientId: string): boolean {
 export async function resolveCimdClient(
   clientId: string,
 ): Promise<CimdClient | null> {
-  const cached = cache.get(clientId);
-  if (cached && cached.expiresAt > Date.now()) return cached.client;
+  const cached = cachedClient(clientId);
+  if (cached) return cached;
 
   const url = await validateDocumentUrl(clientId);
   if (!url) return null;
@@ -143,11 +177,10 @@ export async function resolveCimdClient(
     return null;
   }
 
-  const body = await response.text();
-  if (body.length > MAX_DOCUMENT_BYTES) return null;
-
   let document: unknown;
   try {
+    const body = await readDocumentBody(response);
+    if (body === null) return null;
     document = JSON.parse(body);
   } catch {
     return null;
@@ -155,8 +188,6 @@ export async function resolveCimdClient(
   if (typeof document !== "object" || document === null) return null;
 
   const client = toClient(clientId, document as Record<string, unknown>);
-  if (client) {
-    cache.set(clientId, { client, expiresAt: Date.now() + CACHE_TTL });
-  }
+  if (client) cacheClient(client);
   return client;
 }

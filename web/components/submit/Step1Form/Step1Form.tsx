@@ -2,6 +2,7 @@ import Eyebrow from "../../common/Eyebrow/Eyebrow.tsx";
 import {
   type FormState,
   TITLE_MAX,
+  URL_MAX_BYTES,
 } from "../../../routes/submit/_lib/types.ts";
 import { ErrorBanner, FieldError } from "../Banners/Banners.tsx";
 
@@ -25,6 +26,7 @@ export default function Step1Form({ state, errors }: Props) {
           name="url"
           type="url"
           required
+          maxLength={URL_MAX_BYTES}
           placeholder="https://example.org"
           value={state.url}
         />

@@ -50,3 +50,9 @@ export function userIdToSubmitterId(userId: string): number {
   const n = ((hi >>> 0) * 0x10000 + (lo >>> 0)) >>> 0;
   return n === 0 ? 1 : n;
 }
+
+const ENTITY_ID = /^[1-9]\d{0,14}$/;
+
+export function parseEntityId(raw: string): number | undefined {
+  return ENTITY_ID.test(raw) ? Number(raw) : undefined;
+}

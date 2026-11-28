@@ -7,7 +7,7 @@ dependencies = [
     "fastmcp>=4.0.3,<5",
     "httpx2>=2.13,<3",
     "mcp-types>=2.2,<3",
-    "prefab-ui>=0.20.2",
+    "prefab-ui>=0.20.2,<1",
     "pydantic>=2.13,<3",
 ]
 

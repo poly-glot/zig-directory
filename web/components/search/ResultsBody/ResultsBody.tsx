@@ -37,7 +37,7 @@ function CatRow(
       num={num}
       href={`/category/${c.slug || c.id}`}
       name={path && path.length > 0 ? path : c.name}
-      count={c.linkCountSubtree ?? c.linkCount}
+      count={c.linkCountSubtreeApproved}
     />
   );
 }

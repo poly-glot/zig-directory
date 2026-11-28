@@ -22,6 +22,7 @@ export const EMPTY_STATE: FormState = {
   affiliated: false,
 };
 
+export const URL_MAX_BYTES = 64;
 export const TITLE_MAX = 128;
 export const DESCRIPTION_MIN = 30;
 export const DESCRIPTION_MAX = 256;

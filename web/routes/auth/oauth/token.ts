@@ -8,6 +8,7 @@ import {
   signAccessToken,
   verifyPkce,
 } from "../../../lib/oauth.ts";
+import { clientAddress, consumeAttempt } from "../../../lib/rate-limit.ts";
 import { oauthError } from "./_lib/errors.ts";
 
 async function authorizationCodeGrant(form: FormData): Promise<Response> {
@@ -88,6 +89,10 @@ async function refreshTokenGrant(form: FormData): Promise<Response> {
 
 export const handler = define.handlers({
   async POST(ctx) {
+    if (!(await consumeAttempt("token", clientAddress(ctx.req, ctx.info)))) {
+      return oauthError("temporarily_unavailable", "Too many requests", 429);
+    }
+
     const form = await ctx.req.formData();
     const grantType = form.get("grant_type")?.toString();
     const clientId = form.get("client_id")?.toString() ?? "";

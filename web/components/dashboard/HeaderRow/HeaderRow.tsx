@@ -13,7 +13,9 @@ export default function HeaderRow({ user }: Props) {
         <h1 class="display mt-16">Dashboard.</h1>
       </div>
       <div class="row gap-16">
-        <a class="btn ghost" href="/auth/logout">Sign out →</a>
+        <form method="POST" action="/auth/logout">
+          <button class="btn ghost" type="submit">Sign out →</button>
+        </form>
         <a class="btn" href="/submit">Submit a link →</a>
       </div>
     </div>

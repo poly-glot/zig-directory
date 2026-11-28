@@ -13,6 +13,8 @@ from dmozdb_mcp.app import mcp_app
 from dmozdb_mcp.client import JSON
 from dmozdb_mcp.formatting import DEFAULT_LIMIT, MAX_LIMIT
 
+QUERY_CHARS_MAX = 256
+
 
 def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[str]:
     """Turn a result set into its text summary, grouped by kind.
@@ -37,7 +39,8 @@ def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[st
         for link in links:
             lines.append(formatting.link_summary(link))
             if link.get("moreFromSite"):
-                lines.append(f"  +{link['moreFromSite']} more from {link['site']}")
+                site = formatting.single_line(link["site"])
+                lines.append(f"  +{link['moreFromSite']} more from {site}")
     if not categories and not links:
         lines.append("No matches.")
     return lines
@@ -50,7 +53,8 @@ def _summarize(query: str, categories: list[JSON], links: list[JSON]) -> list[st
         "category names and on link titles, URLs and descriptions. Results "
         "are ranked by relevance and need not contain every word, so a "
         "natural-language description of what you want works. Use it to "
-        "find an entry point when you do not know the category path."
+        "find an entry point when you do not know the category path, then "
+        "pass a returned path to browse_category or list_links."
     ),
     annotations=ToolAnnotations(
         title="Search the directory",
@@ -65,10 +69,13 @@ async def search_directory(
         str,
         Field(
             min_length=2,
+            max_length=QUERY_CHARS_MAX,
+            pattern=r"\S[\s\S]*\S",
             description=(
-                "What to look for, at least two characters. Matched against "
-                "category names and against link titles, URLs and "
-                "descriptions."
+                "What to look for, at least two characters once surrounding "
+                f"whitespace is trimmed and at most {QUERY_CHARS_MAX}. "
+                "Matched against category names and against link titles, "
+                "URLs and descriptions."
             ),
         ),
     ],
@@ -95,7 +102,7 @@ async def search_directory(
 
     Args:
         ctx: Tool context, used to decide whether to build a view.
-        q: The query, at least two characters.
+        q: The query, two to 256 characters.
         search_in: Which kinds of entry to return.
         limit: How many of each kind to return.
 
